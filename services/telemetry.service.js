@@ -7,6 +7,7 @@ const TELEMETRY_SKIPPED_EVENTS = new Set([
   'connection:ready',
 ]);
 
+
 function isTelemetryEnabled() {
   const raw = process.env.GAME_TELEMETRY_ENABLED;
   if (raw === undefined || raw === '') return true;
