@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Socket Pregame Tester</title>
+  <script src="https://cdn.socket.io/4.8.3/socket.io.min.js"></script>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 20px;
+      max-width: 900px;
+    }
+
+    h1 {
+      margin-bottom: 12px;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 2fr;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    input,
+    textarea,
+    button,
+    select {
+      width: 100%;
+      padding: 10px;
+      font-size: 14px;
+    }
+
+    textarea {
+      min-height: 110px;
+      font-family: ui-monospace, Menlo, monospace;
+    }
+
+    #logs {
+      min-height: 320px;
+      white-space: pre-wrap;
+      background: #111;
+      color: #e7e7e7;
+    }
+
+    .btns {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Socket Pregame Tester</h1>
+
+  <div class="row">
+    <label>Socket Base URL</label>
+    <input id="baseUrl" value="http://localhost:3000" />
+  </div>
+
+  <div class="row">
+    <label>Bearer Token (without "Bearer ")</label>
+    <textarea id="token" placeholder="Paste JWT token here"></textarea>
+  </div>
+
+  <div class="btns">
+    <button id="connectBtn">Connect</button>
+    <button id="disconnectBtn">Disconnect</button>
+    <button id="clearBtn">Clear Logs</button>
+  </div>
+
+  <hr />
+
+  <h3>Manual Emit (Next Step Fill Yourself)</h3>
+  <div class="row">
+    <label>Event Name</label>
+    <input id="eventName" value="session:join" />
+  </div>
+
+  <div class="row">
+    <label>Payload JSON</label>
+    <textarea id="payload">{ "session_id": 1 }</textarea>
+  </div>
+
+  <button id="emitBtn">Emit Event (with ack)</button>
+
+  <hr />
+
+  <h3>Quick Events</h3>
+  <div class="btns">
+    <button id="noticeBtn">notice:get</button>
+    <button id="rejoinPendingBtn">rejoin_pending_game:get</button>
+    <button id="joinBtn">session:join</button>
+    <button id="watchBtn">session:watch</button>
+    <button id="readyBtn">player:ready</button>
+  </div>
+
+  <h3>Pregame Events (Server Controlled)</h3>
+  <div class="btns">
+    <button id="pregameHelpBtn">Show Expected Flow</button>
+    <button id="phaseGetBtn">notice:get (ping)</button>
+    <button id="allEventsBtn">Enable onAny Logs</button>
+  </div>
+  <div class="row">
+    <label>Session ID</label>
+    <input id="sessionId" value="1" />
+  </div>
+  <div class="row">
+    <label>Ready</label>
+    <select id="readyVal">
+      <option value="true" selected>true</option>
+      <option value="false">false</option>
+    </select>
+  </div>
+
+  <h3>Gameplay Actions (Active Phase)</H3>
+  <div class="btns">
+    <button id="autogroupBtn">player:autogroup (Best Group)</button>
+    <button id="finishBtn">player:finish</button>
+    <button id="discardBtn">player:discard</button>
+    <button id="pickClosedBtn">player:pick (available)</button>
+    <button id="pickDiscardBtn">player:pick (discard)</button>
+    <button id="declareBtn">player:declare</button>
+    <button id="declareResponseBtn">player:declare:response</button>
+    <button id="turnTimerCheckBtn">Check Turn Timer</button>
+    <button id="turnTimerHelpBtn">Turn Timer Info</button>
+  </div>
+
+  <h3>Transition Actions</h3>
+  <div class="btns">
+    <button id="dropSwitchBtn">player:drop_and_switch</button>
+    <button id="playNowBtn">table:play_again</button>
+    <button id="backTableBtn">table:back</button>
+    <button id="leaveTableBtn">table:leave</button>
+  </div>
+
+  <div class="row">
+    <label>Discard Card UID</label>
+    <input id="discardCardUid" placeholder="e.g. D1_spades_7_6" />
+  </div>
+
+  <div class="row">
+    <label>Finish Card UID</label>
+    <input id="finishCardUid" placeholder="e.g. D1_spades_7_6" />
+  </div>
+
+  <div class="row">
+    <label>Declare Groups JSON (optional)</label>
+    <textarea id="declareGroups" placeholder='[ { "cards": ["card_uid_1", "card_uid_2", "card_uid_3"] } ]'>[]</textarea>
+  </div>
+
+  <h3>Turn Timer Display</h3>
+  <div id="turnTimerDisplay" style="background: #f0f0f0; padding: 10px; border-radius: 4px; margin-bottom: 10px;">
+    <strong>Current Turn:</strong> <span id="currentTurnUser">-</span><br />
+    <strong>Turn Started At:</strong> <span id="turnStartedAt">-</span><br />
+    <strong>Turn Ends At:</strong> <span id="turnEndsAt">-</span><br />
+    <strong>Timer Seconds:</strong> <span id="timerSeconds">-</span><br />
+    <strong>Seconds Left:</strong> <span id="secondsLeft">-</span>
+  </div>
+
+  <h3>Best Groups Response</h3>
+  <textarea id="groupsOutput" readonly style="min-height: 150px;"></textarea>
+
+  <h3>Logs (Full Responses)</h3>
+  <textarea id="logs" readonly></textarea>
+
+  <script>
+    let socket = null;
+    let onAnyEnabled = false;
+    let currentGameDealData = null;
+    let timerCountdownInterval = null;
+
+    const logs = document.getElementById("logs");
+    function log(title, data) {
+      const ts = new Date().toISOString();
+      const body = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+      logs.value += `[${ts}] ${title}\n${body}\n\n`;
+      logs.scrollTop = logs.scrollHeight;
+    }
+
+    function parseJson(text) {
+      try { return JSON.parse(text); }
+      catch (e) { throw new Error("Invalid JSON payload: " + e.message); }
+    }
+
+    function syncSessionIdFromPayload(payload) {
+      const sessionId = payload?.session?.id;
+      if (typeof sessionId === "undefined" || sessionId === null) return;
+      document.getElementById("sessionId").value = String(sessionId);
+      log("Session ID synced", { session_id: sessionId });
+    }
+
+    document.getElementById("clearBtn").onclick = () => { logs.value = ""; };
+
+    document.getElementById("connectBtn").onclick = () => {
+      const baseUrl = document.getElementById("baseUrl").value.trim();
+      const token = document.getElementById("token").value.trim();
+      if (!baseUrl || !token) return;
+
+      if (socket && socket.connected) {
+        return;
+      }
+
+      socket = io(baseUrl, { auth: { token }, transports: ["websocket"] });
+
+      socket.on("connect", () => log("connect", { socketId: socket.id }));
+      socket.on("disconnect", (reason) => log("disconnect", { reason }));
+      socket.on("connect_error", (err) => log("connect_error", { message: err.message }));
+
+      socket.on("connection:ready", (data) => log("connection:ready", data));
+      socket.on("notice:list", (data) => log("notice:list", data));
+      socket.on("rejoin_pending_game", (data) => {
+        log("rejoin_pending_game", data);
+        if (data && data.has_pending_game === true) {
+          syncSessionIdFromPayload(data);
+        }
+      });
+      socket.on("player:status", (data) => log("player:status", data));
+      // socket.on("session:state", (data) => log("session:state", data));
+      socket.on("match:filled", (data) => log("match:filled", data));
+      socket.on("game:countdown", (data) => log("game:countdown", data));
+      socket.on("game:toss", (data) => log("game:toss", data));
+      socket.on("game:deal", (data) => {
+        log("game:deal", data);
+        currentGameDealData = data;
+        updateTurnTimerDisplay(data);
+        startTurnCountdown(data);
+      });
+      socket.on("game:pick", (data) => {
+        log("game:pick", data);
+      });
+      socket.on("game:turn", (data) => {
+        log("game:turn", data);
+        if (data && data.turn) {
+          currentGameDealData = {
+            ...(currentGameDealData || {}),
+            turn: data.turn,
+            game_state: {
+              ...((currentGameDealData && currentGameDealData.game_state) || {}),
+              current_turn_user_id: data.turn.user_id,
+              turn_started_at: data.turn.started_at,
+              turn_ends_at: data.turn.ends_at,
+              turn_timer_seconds: data.turn.turn_timer_seconds,
+            },
+          };
+          updateTurnTimerDisplay(currentGameDealData);
+          startTurnCountdown(currentGameDealData);
+        }
+      });
+      socket.on("game:declare:requested", (data) => {
+        log("game:declare:requested", data);
+      });
+      socket.on("game:finish", (data) => {
+        log("game:finish", data);
+      });
+      socket.on("game:declare:countdown", (data) => {
+        log("game:declare:countdown", data);
+      });
+      socket.on("game:declare:submitted", (data) => {
+        log("game:declare:submitted", data);
+      });
+      socket.on("game:discard", (data) => {
+        log("game:discard", data);
+      });
+      socket.on("game:result", (data) => {
+        log("game:result", data);
+      });
+
+      socket.onAny((event, ...args) => {
+        if (onAnyEnabled) {
+          log("onAny -> " + event, args);
+        }
+      });
+    };
+
+    document.getElementById("disconnectBtn").onclick = () => {
+      if (!socket) return;
+      socket.disconnect();
+    };
+
+    document.getElementById("emitBtn").onclick = () => {
+      if (!socket || !socket.connected) return;
+      const eventName = document.getElementById("eventName").value.trim();
+      if (!eventName) return;
+
+      let payload = {};
+      try { payload = parseJson(document.getElementById("payload").value.trim() || "{}"); }
+      catch (e) { return; }
+
+      socket.emit(eventName, payload, (ack) => {
+        log("ACK <- " + eventName, ack);
+        if (
+          eventName === "session:join"
+          && ack
+          && ack.success === true
+          && ack.session
+          && typeof ack.session.id !== "undefined"
+        ) {
+          document.getElementById("sessionId").value = String(ack.session.id);
+          log("Session ID synced", { session_id: ack.session.id });
+        }
+      });
+    };
+
+    document.getElementById("joinBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      if (!socket || !socket.connected) return;
+      socket.emit("session:join", { session_id: sessionId }, (ack) => {
+        log("ACK <- session:join", ack);
+        if (ack && ack.success === true && ack.session && typeof ack.session.id !== "undefined") {
+          document.getElementById("sessionId").value = String(ack.session.id);
+          log("Session ID synced", { session_id: ack.session.id });
+        }
+      });
+    };
+
+    document.getElementById("noticeBtn").onclick = () => {
+      if (!socket || !socket.connected) return;
+      socket.emit("notice:get", {}, (ack) => log("ACK <- notice:get", ack));
+    };
+
+    document.getElementById("rejoinPendingBtn").onclick = () => {
+      if (!socket || !socket.connected) return;
+      socket.emit("rejoin_pending_game:get", {}, (ack) => {
+        log("ACK <- rejoin_pending_game:get", ack);
+        if (ack && ack.success === true && ack.has_pending_game === true) {
+          syncSessionIdFromPayload(ack);
+        }
+      });
+    };
+
+    document.getElementById("phaseGetBtn").onclick = () => {
+      if (!socket || !socket.connected) return;
+      socket.emit("notice:get", {}, (ack) => log("ACK <- notice:get", ack));
+    };
+
+    document.getElementById("pregameHelpBtn").onclick = () => {
+      log("Expected Pregame Flow", {
+        flow: [
+          "1. session:join (last required player joins)",
+          "2. match:filled",
+          "3. game:countdown (10..0)",
+          "4. game:toss (contains deal_starts_at)",
+          "5. game:deal (after 5 sec server delay)",
+          "6. session:state (status becomes active)"
+        ]
+      });
+    };
+
+    document.getElementById("allEventsBtn").onclick = () => {
+      onAnyEnabled = !onAnyEnabled;
+      log("onAny logging", { enabled: onAnyEnabled });
+    };
+
+    document.getElementById("watchBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      if (!socket || !socket.connected) return;
+      socket.emit("session:watch", { session_id: sessionId }, (ack) => log("ACK <- session:watch", ack));
+    };
+
+    document.getElementById("readyBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      const ready = document.getElementById("readyVal").value === "true";
+      if (!socket || !socket.connected) return;
+      socket.emit("player:ready", { session_id: sessionId, ready }, (ack) => log("ACK <- player:ready", ack));
+    };
+
+    document.getElementById("autogroupBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      if (!socket || !socket.connected) return;
+      socket.emit("player:autogroup", { session_id: sessionId }, (ack) => {
+        log("ACK <- player:autogroup", ack);
+        if (ack && ack.success && ack.data) {
+          displayBestGroups(ack.data);
+        }
+      });
+    };
+
+    document.getElementById("finishBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      const cardUid = document.getElementById("finishCardUid").value.trim();
+      if (!socket || !socket.connected) return;
+      if (!cardUid) {
+        log("Finish validation", { message: "Finish Card UID is required" });
+        return;
+      }
+
+      let groups = [];
+      try {
+        groups = parseJson(document.getElementById("declareGroups").value.trim() || "[]");
+      } catch (e) {
+        log("Finish validation", { message: e.message });
+        return;
+      }
+
+      socket.emit("player:finish", { session_id: sessionId, card_uid: cardUid, groups }, (ack) => {
+        log("ACK <- player:finish", ack);
+        if (ack && ack.success && ack.data) {
+          displayBestGroups(ack.data);
+        }
+      });
+    };
+
+    document.getElementById("discardBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      const cardUid = document.getElementById("discardCardUid").value.trim();
+      if (!socket || !socket.connected) return;
+      if (!cardUid) {
+        log("Discard validation", { message: "Discard Card UID is required" });
+        return;
+      }
+
+      socket.emit("player:discard", { session_id: sessionId, card_uid: cardUid }, (ack) => {
+        log("ACK <- player:discard", ack);
+      });
+    };
+
+    document.getElementById("pickClosedBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      if (!socket || !socket.connected) return;
+
+      socket.emit("player:pick", { session_id: sessionId, source: "available" }, (ack) => {
+        log("ACK <- player:pick (available)", ack);
+      });
+    };
+
+    document.getElementById("pickDiscardBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      if (!socket || !socket.connected) return;
+
+      socket.emit("player:pick", { session_id: sessionId, source: "discard" }, (ack) => {
+        log("ACK <- player:pick (discard)", ack);
+      });
+    };
+
+    document.getElementById("declareBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      if (!socket || !socket.connected) return;
+
+      let groups = [];
+      try {
+        groups = parseJson(document.getElementById("declareGroups").value.trim() || "[]");
+      } catch (e) {
+        log("Declare validation", { message: e.message });
+        return;
+      }
+
+      socket.emit("player:declare", { session_id: sessionId, groups }, (ack) => {
+        log("ACK <- player:declare", ack);
+      });
+    };
+
+    document.getElementById("declareResponseBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      if (!socket || !socket.connected) return;
+
+      let groups = [];
+      try {
+        groups = parseJson(document.getElementById("declareGroups").value.trim() || "[]");
+      } catch (e) {
+        log("Declare response validation", { message: e.message });
+        return;
+      }
+
+      socket.emit("player:declare:response", { session_id: sessionId, groups }, (ack) => {
+        log("ACK <- player:declare:response", ack);
+      });
+    };
+
+    document.getElementById("dropSwitchBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      if (!socket || !socket.connected) return;
+      socket.emit("player:drop_and_switch", { source_session_id: sessionId }, (ack) => {
+        log("ACK <- player:drop_and_switch", ack);
+        if (ack && ack.success && ack.data && ack.data.target_session) {
+          document.getElementById("sessionId").value = String(ack.data.target_session.id);
+        }
+      });
+    };
+
+    document.getElementById("playNowBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      if (!socket || !socket.connected) return;
+      socket.emit("table:play_again", { source_session_id: sessionId }, (ack) => {
+        log("ACK <- table:play_again", ack);
+        if (ack && ack.success && ack.data && ack.data.target_session) {
+          document.getElementById("sessionId").value = String(ack.data.target_session.id);
+        }
+      });
+    };
+
+    document.getElementById("backTableBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      if (!socket || !socket.connected) return;
+      socket.emit("table:back", { source_session_id: sessionId }, (ack) => {
+        log("ACK <- table:back", ack);
+        if (ack && ack.success && ack.data && ack.data.target_session) {
+          document.getElementById("sessionId").value = String(ack.data.target_session.id);
+        }
+      });
+    };
+
+    document.getElementById("leaveTableBtn").onclick = () => {
+      const sessionId = Number(document.getElementById("sessionId").value);
+      if (!socket || !socket.connected) return;
+      socket.emit("table:leave", { source_session_id: sessionId }, (ack) => {
+        log("ACK <- table:leave", ack);
+      });
+    };
+
+    document.getElementById("turnTimerCheckBtn").onclick = () => {
+      if (currentGameDealData) {
+        log("Current Turn Timer Info", {
+          turn: currentGameDealData.turn,
+          game_state: currentGameDealData.game_state,
+          timestamp: new Date().toISOString(),
+        });
+      } else {
+        log("No game:deal data yet. Wait for game to start.", {});
+      }
+    };
+
+    document.getElementById("turnTimerHelpBtn").onclick = () => {
+      log("Turn Timer Guide", {
+        info: [
+          "1. Turn timer starts when game:deal is received",
+          "2. turn.started_at = when turn began (ISO)",
+          "3. turn.ends_at = when turn should end (ISO)",
+          "4. turn.turn_timer_seconds = countdown duration",
+          "5. Frontend counts down from ends_at - now()",
+          "6. Next player turn when time expires"
+        ],
+        example: {
+          turn_started_at: "2025-03-26T15:30:00.000Z",
+          turn_ends_at: "2025-03-26T15:30:30.000Z",
+          turn_timer_seconds: 30
+        }
+      });
+    };
+
+    function updateTurnTimerDisplay(gameDealData) {
+      const turn = gameDealData?.turn;
+      const gameState = gameDealData?.game_state;
+      if (!turn) return;
+
+      document.getElementById("currentTurnUser").textContent = turn.user_id || "-";
+      document.getElementById("turnStartedAt").textContent = turn.started_at || "-";
+      document.getElementById("turnEndsAt").textContent = turn.ends_at || "-";
+      document.getElementById("timerSeconds").textContent = turn.turn_timer_seconds || "-";
+    }
+
+    function startTurnCountdown(gameDealData) {
+      if (timerCountdownInterval) {
+        clearInterval(timerCountdownInterval);
+      }
+
+      const turn = gameDealData?.turn;
+      if (!turn || !turn.ends_at) return;
+
+      timerCountdownInterval = setInterval(() => {
+        const now = new Date();
+        const endsAt = new Date(turn.ends_at);
+        const secondsLeft = Math.max(0, Math.ceil((endsAt.getTime() - now.getTime()) / 1000));
+        document.getElementById("secondsLeft").textContent = secondsLeft;
+
+        if (secondsLeft <= 0) {
+          clearInterval(timerCountdownInterval);
+          log("Turn Timer Expired", { user_id: turn.user_id, ended_at: new Date().toISOString() });
+        }
+      }, 1000);
+    }
+
+    function displayBestGroups(bestGroupingData) {
+      const grouping = bestGroupingData?.grouping || bestGroupingData || {};
+      const output = {
+        groups: grouping.groups,
+        summary: grouping.summary,
+      };
+      document.getElementById("groupsOutput").value = JSON.stringify(output, null, 2);
+    }
+  </script>
+</body>
+
+</html>

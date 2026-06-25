@@ -1,0 +1,462 @@
+{
+    "success": true,
+    "message": "Config retrieved successfully",
+    "config": {
+        "avatars": [
+            {
+                "id": 1,
+                "url": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/avatar/avtar_1_without_border.png",
+                "sort_order": 1
+            },
+            {
+                "id": 2,
+                "url": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/avatar/avtar_2_without_border.png",
+                "sort_order": 2
+            },
+            {
+                "id": 3,
+                "url": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/avatar/avtar_3_without_border.png",
+                "sort_order": 3
+            },
+            {
+                "id": 4,
+                "url": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/avatar/avtar_4_without_border.png",
+                "sort_order": 4
+            },
+            {
+                "id": 5,
+                "url": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/avatar/avtar_5_without_border.png",
+                "sort_order": 5
+            },
+            {
+                "id": 6,
+                "url": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/avatar/avtar_6_without_border.png",
+                "sort_order": 6
+            },
+            {
+                "id": 7,
+                "url": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/avatar/avtar_7_without_border.png",
+                "sort_order": 7
+            }
+        ],
+        "states": [
+            {
+                "id": 1,
+                "name": "Andaman and Nicobar Islands",
+                "active": true
+            },
+            {
+                "id": 2,
+                "name": "Andhra Pradesh",
+                "active": true
+            },
+            {
+                "id": 3,
+                "name": "Arunachal Pradesh",
+                "active": true
+            },
+            {
+                "id": 4,
+                "name": "Assam",
+                "active": true
+            },
+            {
+                "id": 5,
+                "name": "Bihar",
+                "active": true
+            },
+            {
+                "id": 6,
+                "name": "Chandigarh",
+                "active": true
+            },
+            {
+                "id": 7,
+                "name": "Chhattisgarh",
+                "active": true
+            },
+            {
+                "id": 8,
+                "name": "Dadra and Nagar Haveli and Daman and Diu",
+                "active": true
+            },
+            {
+                "id": 9,
+                "name": "Delhi",
+                "active": true
+            },
+            {
+                "id": 10,
+                "name": "Goa",
+                "active": true
+            },
+            {
+                "id": 11,
+                "name": "Gujarat",
+                "active": true
+            },
+            {
+                "id": 12,
+                "name": "Haryana",
+                "active": true
+            },
+            {
+                "id": 13,
+                "name": "Himachal Pradesh",
+                "active": true
+            },
+            {
+                "id": 14,
+                "name": "Jammu and Kashmir",
+                "active": true
+            },
+            {
+                "id": 15,
+                "name": "Jharkhand",
+                "active": true
+            },
+            {
+                "id": 16,
+                "name": "Karnataka",
+                "active": true
+            },
+            {
+                "id": 17,
+                "name": "Kerala",
+                "active": true
+            },
+            {
+                "id": 18,
+                "name": "Ladakh",
+                "active": true
+            },
+            {
+                "id": 19,
+                "name": "Lakshadweep",
+                "active": true
+            },
+            {
+                "id": 20,
+                "name": "Madhya Pradesh",
+                "active": true
+            },
+            {
+                "id": 21,
+                "name": "Maharashtra",
+                "active": true
+            },
+            {
+                "id": 22,
+                "name": "Manipur",
+                "active": true
+            },
+            {
+                "id": 23,
+                "name": "Meghalaya",
+                "active": true
+            },
+            {
+                "id": 24,
+                "name": "Mizoram",
+                "active": true
+            },
+            {
+                "id": 25,
+                "name": "Nagaland",
+                "active": true
+            },
+            {
+                "id": 26,
+                "name": "Odisha",
+                "active": true
+            },
+            {
+                "id": 27,
+                "name": "Puducherry",
+                "active": true
+            },
+            {
+                "id": 28,
+                "name": "Punjab",
+                "active": true
+            },
+            {
+                "id": 29,
+                "name": "Rajasthan",
+                "active": true
+            },
+            {
+                "id": 30,
+                "name": "Sikkim",
+                "active": true
+            },
+            {
+                "id": 31,
+                "name": "Tamil Nadu",
+                "active": true
+            },
+            {
+                "id": 32,
+                "name": "Telangana",
+                "active": true
+            },
+            {
+                "id": 33,
+                "name": "Tripura",
+                "active": true
+            },
+            {
+                "id": 34,
+                "name": "Uttar Pradesh",
+                "active": true
+            },
+            {
+                "id": 35,
+                "name": "Uttarakhand",
+                "active": true
+            },
+            {
+                "id": 36,
+                "name": "West Bengal",
+                "active": true
+            }
+        ],
+        "addCashOptions": [
+            {
+                "id": 1,
+                "base_amount": 100,
+                "instant_cash": 0,
+                "bonus": 10,
+                "is_hot": true,
+                "active": true
+            },
+            {
+                "id": 2,
+                "base_amount": 200,
+                "instant_cash": 10,
+                "bonus": 20,
+                "is_hot": false,
+                "active": true
+            },
+            {
+                "id": 3,
+                "base_amount": 500,
+                "instant_cash": 20,
+                "bonus": 40,
+                "is_hot": false,
+                "active": true
+            },
+            {
+                "id": 4,
+                "base_amount": 1000,
+                "instant_cash": 40,
+                "bonus": 50,
+                "is_hot": false,
+                "active": true
+            },
+            {
+                "id": 5,
+                "base_amount": 2000,
+                "instant_cash": 50,
+                "bonus": 60,
+                "is_hot": false,
+                "active": true
+            }
+        ],
+        "withdrawOptions": [
+            {
+                "id": 1,
+                "amount": 50,
+                "min_kyc_level": "none",
+                "is_hot": false,
+                "active": true
+            },
+            {
+                "id": 2,
+                "amount": 100,
+                "min_kyc_level": "none",
+                "is_hot": true,
+                "active": true
+            },
+            {
+                "id": 3,
+                "amount": 500,
+                "min_kyc_level": "basic",
+                "is_hot": false,
+                "active": true
+            },
+            {
+                "id": 4,
+                "amount": 1000,
+                "min_kyc_level": "basic",
+                "is_hot": false,
+                "active": true
+            },
+            {
+                "id": 5,
+                "amount": 5000,
+                "min_kyc_level": "full",
+                "is_hot": false,
+                "active": true
+            },
+            {
+                "id": 6,
+                "amount": 10000,
+                "min_kyc_level": "full",
+                "is_hot": false,
+                "active": true
+            },
+            {
+                "id": 7,
+                "amount": 15000,
+                "min_kyc_level": "full",
+                "is_hot": false,
+                "active": true
+            }
+        ],
+        "accountStatementFilters": [
+            {
+                "key": "all",
+                "label": "All",
+                "enabled": true,
+                "default": true
+            },
+            {
+                "key": "won",
+                "label": "Won",
+                "enabled": true,
+                "default": false
+            },
+            {
+                "key": "lost",
+                "label": "Lost",
+                "enabled": true,
+                "default": false
+            },
+            {
+                "key": "money_add",
+                "label": "Money Add",
+                "enabled": true,
+                "default": false
+            }
+        ],
+        "faqs": [
+            {
+                "id": 1,
+                "question": "How do I add cash to my account?",
+                "answer": "Go to Wallet > Add Cash and choose an amount. You can pay via UPI, card, or net banking. Minimum add cash is ₹100.",
+                "sort_order": 1
+            },
+            {
+                "id": 2,
+                "question": "How do I withdraw my winnings?",
+                "answer": "Go to Wallet > Withdraw, select an amount, and complete KYC if required. Withdrawals are processed within 24–48 hours.",
+                "sort_order": 2
+            },
+            {
+                "id": 3,
+                "question": "Why is KYC required?",
+                "answer": "KYC (Know Your Customer) is required by law for cash withdrawals. It helps us verify your identity and keep the platform secure. Higher KYC levels allow larger withdrawal limits.",
+                "sort_order": 3
+            },
+            {
+                "id": 4,
+                "question": "How do I claim daily rewards?",
+                "answer": "Log in daily and visit the Daily Rewards section. Claim your reward each day to progress through the 7-day ladder. Rewards are credited to your wallet instantly.",
+                "sort_order": 4
+            },
+            {
+                "id": 5,
+                "question": "What Rummy games can I play?",
+                "answer": "We offer Points Rummy, 101 Pool, 201 Pool, Deals, Spin & Go, and Practice. Each has different rules and contest types. Check the Games section for details.",
+                "sort_order": 5
+            },
+            {
+                "id": 6,
+                "question": "How does the entry fee work?",
+                "answer": "Each contest has an entry fee. Pay the fee to join; winners share the prize pool. Check contest details for entry amount and win potential before joining.",
+                "sort_order": 6
+            },
+            {
+                "id": 7,
+                "question": "When do I receive my winnings?",
+                "answer": "Winnings from games are credited to your wallet immediately after the contest ends. You can withdraw them after completing KYC if required.",
+                "sort_order": 7
+            },
+            {
+                "id": 8,
+                "question": "Is my money and data safe?",
+                "answer": "Yes. We use secure payment gateways and follow industry standards. Your personal and financial data is encrypted and never shared with third parties.",
+                "sort_order": 8
+            },
+            {
+                "id": 9,
+                "question": "What payment methods do you accept?",
+                "answer": "We accept UPI, debit cards, credit cards, and net banking for add cash. Withdrawal is processed to your verified bank account or UPI.",
+                "sort_order": 9
+            },
+            {
+                "id": 10,
+                "question": "Is there a withdrawal limit?",
+                "answer": "Withdrawal limits depend on your KYC level. Basic KYC allows moderate limits; full KYC enables higher withdrawal amounts. Check Wallet > Withdraw for options.",
+                "sort_order": 10
+            },
+            {
+                "id": 11,
+                "question": "Can I play for free?",
+                "answer": "Yes. Practice games let you play Rummy without real money. Use them to learn rules and improve your skills before joining cash contests.",
+                "sort_order": 11
+            },
+            {
+                "id": 12,
+                "question": "How can I change my profile or avatar?",
+                "answer": "Go to Profile/Settings and select an avatar from the available options. You can also update your display name and other details there.",
+                "sort_order": 12
+            },
+            {
+                "id": 13,
+                "question": "I added cash but it did not reflect. What do I do?",
+                "answer": "Add cash usually reflects within minutes. If it does not, check your transaction status in Wallet > Recharge History. If the payment succeeded but balance did not update, contact support with your order ID.",
+                "sort_order": 13
+            },
+            {
+                "id": 14,
+                "question": "Which states can play on OG Rummy?",
+                "answer": "OG Rummy is available in Indian states where online Rummy is permitted. Please ensure you are of legal age (18+) and in a permitted state before playing.",
+                "sort_order": 14
+            }
+        ],
+        "supports": [
+            {
+                "id": 1,
+                "key": "whatsapp",
+                "title": "WhatsApp",
+                "image_url": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/social_support/whatsapp.png",
+                "metadata": {
+                    "redirect_url": "https://wa.me/"
+                }
+            },
+            {
+                "id": 2,
+                "key": "telegram",
+                "title": "Telegram",
+                "image_url": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/social_support/telegram.webp",
+                "metadata": {
+                    "redirect_url": "https://t.me/"
+                }
+            }
+        ],
+        "maintenanceMode": {
+            "enabled": false,
+            "title": "Scheduled Maintenance",
+            "message": "We are currently under maintenance. Please try again shortly.",
+            "start_at": null,
+            "end_at": null,
+            "server_time": "2026-04-30T10:28:15.297Z",
+            "starts_in_seconds": 0,
+            "ends_in_seconds": 0,
+            "timing_message": "Maintenance is not active.",
+            "metadata": {}
+        }
+    }
+}

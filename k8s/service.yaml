@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: og-rummy-api
+  namespace: og-rummy
+  labels:
+    app: og-rummy-api
+spec:
+  type: LoadBalancer
+  selector:
+    app: og-rummy-api
+  ports:
+    - port: 80
+      targetPort: 3000
+      protocol: TCP
+      name: http

@@ -1,0 +1,53 @@
+services:
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=development
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/og_rummy
+      - AWS_REGION=${AWS_REGION}
+      - AWS_S3_BUCKET=${AWS_S3_BUCKET}
+      - AWS_S3_BASE_URL=${AWS_S3_BASE_URL}
+      - BOT_ENGINE_ENABLED=${BOT_ENGINE_ENABLED:-true}
+      - BOT_INJECT_AFTER_SECONDS=${BOT_INJECT_AFTER_SECONDS:-30}
+      - BOT_SCAN_EVERY_MS=${BOT_SCAN_EVERY_MS:-5000}
+      - BOT_SCAN_BATCH_LIMIT=${BOT_SCAN_BATCH_LIMIT:-25}
+      - BOT_POOL_SIZE=${BOT_POOL_SIZE:-50}
+      - BOT_AUTO_READY=${BOT_AUTO_READY:-true}
+      - BOT_NAME_PREFIX=${BOT_NAME_PREFIX:-RummyBot-}
+      - BOT_PHONE_PREFIX=${BOT_PHONE_PREFIX:-98999}
+      - BOT_SESSION_LOCK_TTL_SECONDS=${BOT_SESSION_LOCK_TTL_SECONDS:-20}
+      - BOT_ACTION_DELAY_MIN_MS=${BOT_ACTION_DELAY_MIN_MS:-5000}
+      - BOT_ACTION_DELAY_MAX_MS=${BOT_ACTION_DELAY_MAX_MS:-28000}
+      - BOT_ACTION_DELAY_MS=${BOT_ACTION_DELAY_MS:-0}
+      - BOT_POST_PICK_DELAY_MIN_MS=${BOT_POST_PICK_DELAY_MIN_MS:-1500}
+      - BOT_POST_PICK_DELAY_MAX_MS=${BOT_POST_PICK_DELAY_MAX_MS:-4500}
+      - BOT_POST_PICK_DELAY_MS=${BOT_POST_PICK_DELAY_MS:-0}
+      - BOT_DECLARE_RESPONSE_DELAY_MS=${BOT_DECLARE_RESPONSE_DELAY_MS:-1500}
+      - POOL_SPLIT_ENABLED=true
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: og_rummy
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+
+volumes:
+  postgres_data:

@@ -1,0 +1,55 @@
+body {
+    font-family: Arial, sans-serif;
+    background: #f4f4f4;
+    margin: 0;
+    padding: 0;
+}
+#app {
+    max-width: 800px;
+    margin: 40px auto;
+    background: #fff;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    padding: 24px;
+}
+#table {
+    display: flex;
+    justify-content: space-around;
+    margin: 24px 0;
+}
+.player {
+    background: #e3eaff;
+    border-radius: 6px;
+    padding: 16px;
+    min-width: 120px;
+    text-align: center;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+}
+.card-group {
+    margin: 8px 0;
+    padding: 8px;
+    background: #f9f9f9;
+    border-radius: 4px;
+    display: inline-block;
+}
+.card {
+    display: inline-block;
+    margin: 0 2px;
+    padding: 4px 8px;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    font-size: 14px;
+}
+#controls {
+    margin-bottom: 16px;
+}
+#debug {
+    background: #f8f8e1;
+    border: 1px solid #e1e1b8;
+    border-radius: 4px;
+    padding: 12px;
+    font-size: 13px;
+    color: #555;
+    min-height: 40px;
+}

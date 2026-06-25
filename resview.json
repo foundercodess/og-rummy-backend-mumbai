@@ -1,0 +1,728 @@
+{
+  "session_id": 73,
+  "server_time": "2026-04-28T07:24:48.594Z",
+  "event": "game:result",
+  "status": "completed",
+  "is_final": true,
+  "reason": "all_submitted",
+  "declare_by_user_id": 2,
+  "declare_valid": false,
+  "winner_user_id": 3,
+  "tie_break_policy": "lowest_points_then_lowest_seat_no",
+  "finish_card": {
+    "rank": "10",
+    "suit": "spades",
+    "value": 10,
+    "card_id": "S10",
+    "card_uid": "D1_spades_10_10",
+    "is_joker": false
+  },
+  "auto_declared_user_ids": [],
+  "results": [
+    {
+      "user_id": 2,
+      "seat_no": 1,
+      "points": 80,
+      "grouped_points": 88,
+      "ungrouped_points": 0,
+      "valid_for_declare": false,
+      "invalid_group_count": 3,
+      "all_cards_grouped": true,
+      "submission_mode": "manual",
+      "submission_status": "manual",
+      "dropped": false,
+      "is_winner": false,
+      "player_status": "invalid_declaration",
+      "status_color": "#EA580C"
+    },
+    {
+      "user_id": 3,
+      "seat_no": 2,
+      "points": 42,
+      "grouped_points": 39,
+      "ungrouped_points": 42,
+      "valid_for_declare": false,
+      "invalid_group_count": 3,
+      "all_cards_grouped": false,
+      "submission_mode": "auto",
+      "submission_status": "auto",
+      "dropped": false,
+      "is_winner": true,
+      "player_status": "won",
+      "status_color": "#16A34A"
+    }
+  ],
+  "deal_no": null,
+  "total_deals": null,
+  "pool_round_no": null,
+  "deal_scores": null,
+  "deal_base_score": null,
+  "deal_score_totals_by_user": null,
+  "settlement": {
+    "point_value": 0.05,
+    "winner_user_id": 3,
+    "winner_gain": 3.52,
+    "per_player": [
+      {
+        "user_id": 2,
+        "seat_no": 1,
+        "points": 80,
+        "is_winner": false,
+        "amount": -4
+      },
+      {
+        "user_id": 3,
+        "seat_no": 2,
+        "points": 42,
+        "is_winner": true,
+        "amount": 3.52,
+        "commission": 0.48
+      }
+    ]
+  },
+  "players": [
+    {
+      "user_id": 2,
+      "name": "ashu",
+      "phone": "6390404429",
+      "avatar": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/avatar/avtar_7_without_border.png",
+      "view_id": "165895",
+      "seat_no": 1,
+      "submitted": true,
+      "submission_mode": "manual",
+      "submission_status": "manual",
+      "declare_status": "manual",
+      "cards": [
+        {
+          "rank": "A",
+          "suit": "diamonds",
+          "value": 10,
+          "card_id": "DA",
+          "card_uid": "D2_diamonds_A_80",
+          "is_joker": false
+        },
+        {
+          "rank": "5",
+          "suit": "diamonds",
+          "value": 5,
+          "card_id": "D5",
+          "card_uid": "D1_diamonds_5_31",
+          "is_joker": false
+        },
+        {
+          "rank": "K",
+          "suit": "hearts",
+          "value": 10,
+          "card_id": "HK",
+          "card_uid": "D2_hearts_K_79",
+          "is_joker": false
+        },
+        {
+          "rank": "7",
+          "suit": "hearts",
+          "value": 7,
+          "card_id": "H7",
+          "card_uid": "D1_hearts_7_20",
+          "is_joker": false
+        },
+        {
+          "rank": "5",
+          "suit": "hearts",
+          "value": 5,
+          "card_id": "H5",
+          "card_uid": "D2_hearts_5_71",
+          "is_joker": false
+        },
+        {
+          "rank": "8",
+          "suit": "diamonds",
+          "value": 8,
+          "card_id": "D8",
+          "card_uid": "D2_diamonds_8_87",
+          "is_joker": false
+        },
+        {
+          "rank": "K",
+          "suit": "hearts",
+          "value": 10,
+          "card_id": "HK",
+          "card_uid": "D1_hearts_K_26",
+          "is_joker": false
+        },
+        {
+          "rank": "8",
+          "suit": "clubs",
+          "value": 8,
+          "card_id": "C8",
+          "card_uid": "D1_clubs_8_47",
+          "is_joker": false
+        },
+        {
+          "rank": "4",
+          "suit": "diamonds",
+          "value": 4,
+          "card_id": "D4",
+          "card_uid": "D2_diamonds_4_83",
+          "is_joker": false
+        },
+        {
+          "rank": "6",
+          "suit": "hearts",
+          "value": 6,
+          "card_id": "H6",
+          "card_uid": "D2_hearts_6_72",
+          "is_joker": false
+        },
+        {
+          "rank": "7",
+          "suit": "diamonds",
+          "value": 7,
+          "card_id": "D7",
+          "card_uid": "D2_diamonds_7_86",
+          "is_joker": false
+        },
+        {
+          "rank": "6",
+          "suit": "hearts",
+          "value": 6,
+          "card_id": "H6",
+          "card_uid": "D1_hearts_6_19",
+          "is_joker": false
+        },
+        {
+          "rank": "2",
+          "suit": "diamonds",
+          "value": 2,
+          "card_id": "D2",
+          "card_uid": "D1_diamonds_2_28",
+          "is_joker": false
+        }
+      ],
+      "grouping": {
+        "groups": [
+          {
+            "group_id": 1,
+            "type": "pure_sequence",
+            "cards": [
+              {
+                "rank": "5",
+                "suit": "hearts",
+                "value": 5,
+                "card_id": "H5",
+                "card_uid": "D2_hearts_5_71",
+                "is_joker": false
+              },
+              {
+                "rank": "6",
+                "suit": "hearts",
+                "value": 6,
+                "card_id": "H6",
+                "card_uid": "D1_hearts_6_19",
+                "is_joker": false
+              },
+              {
+                "rank": "7",
+                "suit": "hearts",
+                "value": 7,
+                "card_id": "H7",
+                "card_uid": "D1_hearts_7_20",
+                "is_joker": false
+              }
+            ],
+            "group_points": 18,
+            "is_valid_meld": true
+          },
+          {
+            "group_id": 2,
+            "type": "invalid_sequence_candidate",
+            "cards": [
+              {
+                "rank": "2",
+                "suit": "diamonds",
+                "value": 2,
+                "card_id": "D2",
+                "card_uid": "D1_diamonds_2_28",
+                "is_joker": false
+              },
+              {
+                "rank": "4",
+                "suit": "diamonds",
+                "value": 4,
+                "card_id": "D4",
+                "card_uid": "D2_diamonds_4_83",
+                "is_joker": false
+              },
+              {
+                "rank": "5",
+                "suit": "diamonds",
+                "value": 5,
+                "card_id": "D5",
+                "card_uid": "D1_diamonds_5_31",
+                "is_joker": false
+              },
+              {
+                "rank": "7",
+                "suit": "diamonds",
+                "value": 7,
+                "card_id": "D7",
+                "card_uid": "D2_diamonds_7_86",
+                "is_joker": false
+              },
+              {
+                "rank": "8",
+                "suit": "diamonds",
+                "value": 8,
+                "card_id": "D8",
+                "card_uid": "D2_diamonds_8_87",
+                "is_joker": false
+              },
+              {
+                "rank": "A",
+                "suit": "diamonds",
+                "value": 10,
+                "card_id": "DA",
+                "card_uid": "D2_diamonds_A_80",
+                "is_joker": false
+              }
+            ],
+            "group_points": 36,
+            "is_valid_meld": false
+          },
+          {
+            "group_id": 3,
+            "type": "invalid_sequence_candidate",
+            "cards": [
+              {
+                "rank": "6",
+                "suit": "hearts",
+                "value": 6,
+                "card_id": "H6",
+                "card_uid": "D2_hearts_6_72",
+                "is_joker": false
+              },
+              {
+                "rank": "K",
+                "suit": "hearts",
+                "value": 10,
+                "card_id": "HK",
+                "card_uid": "D1_hearts_K_26",
+                "is_joker": false
+              },
+              {
+                "rank": "K",
+                "suit": "hearts",
+                "value": 10,
+                "card_id": "HK",
+                "card_uid": "D2_hearts_K_79",
+                "is_joker": false
+              }
+            ],
+            "group_points": 26,
+            "is_valid_meld": false
+          },
+          {
+            "group_id": 4,
+            "type": "invalid_single",
+            "cards": [
+              {
+                "rank": "8",
+                "suit": "clubs",
+                "value": 8,
+                "card_id": "C8",
+                "card_uid": "D1_clubs_8_47",
+                "is_joker": false
+              }
+            ],
+            "group_points": 8,
+            "is_valid_meld": false
+          }
+        ],
+        "ungrouped_cards": [],
+        "summary": {
+          "valid_for_declare": false,
+          "all_cards_grouped": true,
+          "invalid_group_count": 3,
+          "pure_sequence_count": 1,
+          "sequence_count": 1,
+          "grouped_cards_count": 13,
+          "ungrouped_cards_count": 0,
+          "grouped_points": 88,
+          "ungrouped_points": 0,
+          "display_point": 88,
+          "hand_points": 88
+        }
+      },
+      "score": 80,
+      "points": 80,
+      "round_points": 80,
+      "total_score": null,
+      "score_model": null,
+      "grouped_points": 88,
+      "ungrouped_points": 0,
+      "valid_for_declare": false,
+      "invalid_group_count": 3,
+      "all_cards_grouped": true,
+      "won_amount": -4,
+      "is_winner": false,
+      "player_status": "invalid_declaration",
+      "status_color": "#EA580C",
+      "dropped": false,
+      "rank": 2
+    },
+    {
+      "user_id": 3,
+      "name": "XVAd9odW6g",
+      "phone": "98999000001",
+      "avatar": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/avatar/avtar_5_without_border.png",
+      "view_id": null,
+      "seat_no": 2,
+      "submitted": true,
+      "submission_mode": "auto",
+      "submission_status": "auto",
+      "declare_status": "auto",
+      "cards": [
+        {
+          "rank": "4",
+          "suit": "diamonds",
+          "value": 4,
+          "card_id": "D4",
+          "card_uid": "D1_diamonds_4_30",
+          "is_joker": false
+        },
+        {
+          "rank": "6",
+          "suit": "clubs",
+          "value": 6,
+          "card_id": "C6",
+          "card_uid": "D2_clubs_6_98",
+          "is_joker": false
+        },
+        {
+          "rank": "Q",
+          "suit": "spades",
+          "value": 10,
+          "card_id": "SQ",
+          "card_uid": "D2_spades_Q_65",
+          "is_joker": false
+        },
+        {
+          "rank": "7",
+          "suit": "hearts",
+          "value": 7,
+          "card_id": "H7",
+          "card_uid": "D2_hearts_7_73",
+          "is_joker": false
+        },
+        {
+          "rank": "8",
+          "suit": "hearts",
+          "value": 8,
+          "card_id": "H8",
+          "card_uid": "D1_hearts_8_21",
+          "is_joker": false
+        },
+        {
+          "rank": "4",
+          "suit": "clubs",
+          "value": 4,
+          "card_id": "C4",
+          "card_uid": "D2_clubs_4_96",
+          "is_joker": false
+        },
+        {
+          "rank": "10",
+          "suit": "clubs",
+          "value": 10,
+          "card_id": "C10",
+          "card_uid": "D2_clubs_10_102",
+          "is_joker": false
+        },
+        {
+          "rank": "7",
+          "suit": "spades",
+          "value": 7,
+          "card_id": "S7",
+          "card_uid": "D1_spades_7_7",
+          "is_joker": false
+        },
+        {
+          "rank": "2",
+          "suit": "spades",
+          "value": 2,
+          "card_id": "S2",
+          "card_uid": "D2_spades_2_55",
+          "is_joker": false
+        },
+        {
+          "rank": "6",
+          "suit": "clubs",
+          "value": 6,
+          "card_id": "C6",
+          "card_uid": "D1_clubs_6_45",
+          "is_joker": false
+        },
+        {
+          "rank": "8",
+          "suit": "spades",
+          "value": 8,
+          "card_id": "S8",
+          "card_uid": "D2_spades_8_61",
+          "is_joker": false
+        },
+        {
+          "rank": "9",
+          "suit": "hearts",
+          "value": 9,
+          "card_id": "H9",
+          "card_uid": "D1_hearts_9_22",
+          "is_joker": false
+        },
+        {
+          "rank": "10",
+          "suit": "diamonds",
+          "value": 10,
+          "card_id": "D10",
+          "card_uid": "D1_diamonds_10_36",
+          "is_joker": false
+        }
+      ],
+      "grouping": {
+        "groups": [
+          {
+            "group_id": 1,
+            "type": "pure_sequence",
+            "cards": [
+              {
+                "rank": "7",
+                "suit": "hearts",
+                "value": 7,
+                "card_id": "H7",
+                "card_uid": "D2_hearts_7_73",
+                "is_joker": false
+              },
+              {
+                "rank": "8",
+                "suit": "hearts",
+                "value": 8,
+                "card_id": "H8",
+                "card_uid": "D1_hearts_8_21",
+                "is_joker": false
+              },
+              {
+                "rank": "9",
+                "suit": "hearts",
+                "value": 9,
+                "card_id": "H9",
+                "card_uid": "D1_hearts_9_22",
+                "is_joker": false
+              }
+            ],
+            "group_points": 24,
+            "is_valid_meld": true
+          },
+          {
+            "group_id": 2,
+            "type": "impure_sequence",
+            "cards": [
+              {
+                "rank": "7",
+                "suit": "spades",
+                "value": 7,
+                "card_id": "S7",
+                "card_uid": "D1_spades_7_7",
+                "is_joker": false
+              },
+              {
+                "rank": "8",
+                "suit": "spades",
+                "value": 8,
+                "card_id": "S8",
+                "card_uid": "D2_spades_8_61",
+                "is_joker": false
+              },
+              {
+                "rank": "Q",
+                "suit": "spades",
+                "value": 10,
+                "card_id": "SQ",
+                "card_uid": "D2_spades_Q_65",
+                "is_joker": false
+              }
+            ],
+            "group_points": 15,
+            "is_valid_meld": true
+          },
+          {
+            "group_id": 3,
+            "type": "invalid_sequence_candidate",
+            "cards": [
+              {
+                "rank": "4",
+                "suit": "clubs",
+                "value": 4,
+                "card_id": "C4",
+                "card_uid": "D2_clubs_4_96",
+                "is_joker": false
+              },
+              {
+                "rank": "6",
+                "suit": "clubs",
+                "value": 6,
+                "card_id": "C6",
+                "card_uid": "D1_clubs_6_45",
+                "is_joker": false
+              },
+              {
+                "rank": "6",
+                "suit": "clubs",
+                "value": 6,
+                "card_id": "C6",
+                "card_uid": "D2_clubs_6_98",
+                "is_joker": false
+              },
+              {
+                "rank": "10",
+                "suit": "clubs",
+                "value": 10,
+                "card_id": "C10",
+                "card_uid": "D2_clubs_10_102",
+                "is_joker": false
+              }
+            ],
+            "group_points": 26,
+            "is_valid_meld": false
+          },
+          {
+            "group_id": 4,
+            "type": "invalid_sequence_candidate",
+            "cards": [
+              {
+                "rank": "4",
+                "suit": "diamonds",
+                "value": 4,
+                "card_id": "D4",
+                "card_uid": "D1_diamonds_4_30",
+                "is_joker": false
+              },
+              {
+                "rank": "10",
+                "suit": "diamonds",
+                "value": 10,
+                "card_id": "D10",
+                "card_uid": "D1_diamonds_10_36",
+                "is_joker": false
+              }
+            ],
+            "group_points": 14,
+            "is_valid_meld": false
+          },
+          {
+            "group_id": 5,
+            "type": "invalid_single",
+            "cards": [
+              {
+                "rank": "2",
+                "suit": "spades",
+                "value": 2,
+                "card_id": "S2",
+                "card_uid": "D2_spades_2_55",
+                "is_joker": false
+              }
+            ],
+            "group_points": 2,
+            "is_valid_meld": false
+          }
+        ],
+        "ungrouped_cards": [],
+        "summary": {
+          "valid_for_declare": false,
+          "all_cards_grouped": true,
+          "invalid_group_count": 3,
+          "pure_sequence_count": 1,
+          "sequence_count": 2,
+          "grouped_cards_count": 13,
+          "ungrouped_cards_count": 0,
+          "grouped_points": 81,
+          "ungrouped_points": 0,
+          "display_point": 42,
+          "hand_points": 81
+        }
+      },
+      "score": 42,
+      "points": 42,
+      "round_points": 42,
+      "total_score": null,
+      "score_model": null,
+      "grouped_points": 39,
+      "ungrouped_points": 42,
+      "valid_for_declare": false,
+      "invalid_group_count": 3,
+      "all_cards_grouped": false,
+      "won_amount": 3.52,
+      "is_winner": true,
+      "player_status": "won",
+      "status_color": "#16A34A",
+      "dropped": false,
+      "rank": 1
+    }
+  ]
+}
+
+{
+  "server_time": "2026-04-28T11:12:28.860Z",
+  "event": "rejoin_pending_game",
+  "reason": "connect",
+  "has_pending_game": true,
+  "session": {
+    "id": 115,
+    "session_code": "61659895",
+    "game_id": 3,
+    "contest_id": 198,
+    "host_user_id": 2,
+    "status": "active",
+    "phase": "active",
+    "current_turn_user_id": 3,
+    "started_at": "2026-04-28T10:30:42.983Z",
+    "updated_at": "2026-04-28T10:30:42.984Z",
+    "game": {
+      "id": 3,
+      "name": "Points",
+      "dashboard_banner": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/dashboard_images/point.png",
+      "side_banner": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/sidebar_game_images/points_logo.png",
+      "badge": null
+    },
+    "contest": {
+      "id": 198,
+      "player_count": 2,
+      "point_value": "0.05",
+      "entry": "4",
+      "win_upto": null
+    },
+    "player": {
+      "user_id": 2,
+      "seat_no": 1,
+      "status": "joined",
+      "player_status": "active",
+      "connection_status": "connected"
+    },
+    "players": [
+      {
+        "user_id": 2,
+        "seat_no": 1,
+        "name": "ashu",
+        "avatar": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/avatar/avtar_7_without_border.png",
+        "player_status": "active",
+        "connection_status": "connected"
+      },
+      {
+        "user_id": 3,
+        "seat_no": 2,
+        "name": "XVAd9odW6g",
+        "avatar": "https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/avatar/avtar_5_without_border.png",
+        "player_status": "active",
+        "connection_status": "connected"
+      }
+    ],
+    "can_rejoin": true
+  }
+}

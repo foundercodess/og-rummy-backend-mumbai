@@ -1,0 +1,18 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: og-rummy-cluster
+  region: us-east-1
+
+managedNodeGroups:
+  - name: og-rummy-nodes
+    instanceType: t3.small
+    desiredCapacity: 1
+    minSize: 1
+    maxSize: 2
+
+    instancesDistribution:
+      instanceTypes: ["t3.small"]
+      onDemandBaseCapacity: 1
+      onDemandPercentageAboveBaseCapacity: 100

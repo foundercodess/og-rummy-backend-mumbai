@@ -1,0 +1,52 @@
+# name: Deploy to App Runner
+
+# on:
+#   push:
+#     branches: [main]
+#   workflow_dispatch:
+
+# env:
+#   AWS_REGION: ${{ secrets.AWS_REGION }}
+#   ECR_REPOSITORY: og-rummy-backend
+
+# jobs:
+#   deploy:
+#     runs-on: ubuntu-latest
+#     permissions:
+#       contents: read
+
+#     steps:
+#       - name: Checkout
+#         uses: actions/checkout@v4
+
+#       - name: Configure AWS
+#         uses: aws-actions/configure-aws-credentials@v4
+#         with:
+#           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#           aws-region: ${{ secrets.AWS_REGION }}
+
+#       - name: Login to ECR
+#         id: ecr
+#         uses: aws-actions/amazon-ecr-login@v2
+
+#       - name: Build and push image
+#         env:
+#           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+#           IMAGE_TAG: ${{ github.sha }}
+#         run: |
+#           docker build --no-cache --platform linux/amd64 -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+#           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+#           docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+#           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+#       - name: Deploy to App Runner
+#         env:
+#           APP_RUNNER_SERVICE_ARN: ${{ secrets.APP_RUNNER_SERVICE_ARN }}
+#         run: |
+#           if [ -n "$APP_RUNNER_SERVICE_ARN" ]; then
+#             aws apprunner start-deployment --service-arn "$APP_RUNNER_SERVICE_ARN" --region ${{ secrets.AWS_REGION }}
+#             echo "App Runner deployment started."
+#           else
+#             echo "APP_RUNNER_SERVICE_ARN not set. Image pushed to ECR. Create/update App Runner service manually or add the secret."
+#           fi

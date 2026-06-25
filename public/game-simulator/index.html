@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Game Table Simulator</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <h1>Game Table Simulator</h1>
+        <div id="table"></div>
+        <div id="controls">
+            <!-- Load Socket.IO client from CDN -->
+            <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+            <script src="socket.js"></script>
+            <button onclick="emitSimulateStep()">Simulate Step (Real-time)</button>
+            <button onclick="emitResetGame()">Reset Game (Real-time)</button>
+        </div>
+        <div id="debug"></div>
+    </div>
+    <script src="simulator.js"></script>
+</body>
+</html>

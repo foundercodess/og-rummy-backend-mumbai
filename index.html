@@ -1,0 +1,646 @@
+<!-- <!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cruise Seat Booking UI</title>
+
+<style>
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: #000;
+  display: flex;
+  justify-content: center;
+}
+
+/* Container */
+.wrapper {
+  width: 260px;
+  background: #e6e6e6;
+  border-radius: 30px;
+  padding: 15px;
+  margin: 20px 0;
+  overflow-y: auto;
+  height: 95vh;
+}
+
+/* Ship Shape Top */
+.ship-top {
+  height: 80px;
+  background: #dcdcdc;
+  border-radius: 40px 40px 0 0;
+  margin-bottom: 10px;
+}
+
+/* Deck Layout */
+.deck {
+  display: grid;
+  grid-template-columns: 1fr 80px 1fr;
+  gap: 10px;
+}
+
+/* Columns */
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Seats */
+.seat {
+  height: 26px;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  border: 1px solid #999;
+  cursor: pointer;
+}
+
+/* Types */
+.available {
+  background: #d9d98c;
+}
+
+.premium {
+  background: #b7a7ff;
+}
+
+.sold {
+  background: #c96;
+  color: white;
+  cursor: not-allowed;
+}
+
+/* Selected */
+.selected {
+  background: orange !important;
+}
+
+/* Center */
+.center {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  align-items: center;
+}
+
+.center-box {
+  width: 100%;
+  height: 60px;
+  background: #ccc;
+  border-radius: 6px;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Bottom (Stage area like green) */
+.bottom {
+  margin-top: 20px;
+  background: #2f5f2f;
+  border-radius: 0 0 30px 30px;
+  padding: 10px;
+  text-align: center;
+  color: white;
+  font-size: 12px;
+}
+</style>
+</head>
+
+<body>
+
+<div class="wrapper">
+
+  <div class="ship-top"></div>
+
+  <div class="deck">
+
+    LEFT COLUMN
+    <div class="column" id="leftColumn"></div>
+
+    CENTER
+    <!-- <div class="center">
+      <div class="center-box">Lift</div>
+      <div class="center-box">Lobby</div>
+      <div class="center-box">Corridor</div>
+    </div> -->
+
+    <!-- RIGHT COLUMN -->
+    <!-- <div class="column" id="rightColumn"></div>
+
+  </div>
+
+  <div class="bottom">ENTERTAINMENT AREA</div>
+
+</div>
+
+<script> -->
+
+// Sample sold seats
+// const soldSeats = ["11510","11514","11006","11020"];
+
+// Generate seats
+// function generateSeats(start, end, columnId) {
+//   const column = document.getElementById(columnId);
+
+//   for (let i = start; i <= end; i += 2) {
+//     const seat = document.createElement("div");
+
+//     let type = Math.random() > 0.7 ? "premium" : "available";
+
+//     seat.className = "seat " + type;
+//     seat.innerText = i + "+";
+
+//     // Mark sold
+//     if (soldSeats.includes(i.toString())) {
+//       seat.className = "seat sold";
+//       seat.innerText = "SOLD";
+//     }
+
+//     // Click
+//     seat.addEventListener("click", () => {
+//       if (seat.classList.contains("sold")) return;
+//       seat.classList.toggle("selected");
+//     });
+
+//     column.appendChild(seat);
+//   }
+// }
+
+// // Left and Right seat generation
+// generateSeats(11500, 11640, "leftColumn");
+// generateSeats(11000, 11140, "rightColumn");
+
+<!-- </script>
+
+</body> -->
+<!-- </html> -->
+
+
+<!-- <!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cruise Layout</title>
+
+<style>
+body {
+  margin: 0;
+  background: #000;
+  display: flex;
+  justify-content: center;
+  font-family: Arial;
+}
+
+.wrapper {
+  position: relative;
+  width: 800px;
+  height: 95vh;
+  background: #e6e6e6;
+  border-radius: 30px;
+  overflow-y: auto;
+  padding-top: 20px;
+}
+
+/* SVG ship outline */
+.ship-outline {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+}
+
+/* Layout grid */
+.layout {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 90px 1fr;
+  gap: 6px;
+  padding: 20px 10px;
+}
+
+/* Seat columns */
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Seats */
+.seat {
+  height: 22px;
+  font-size: 9px;
+  border-radius: 3px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  border: 1px solid #888;
+  cursor: pointer;
+}
+
+/* Types */
+.available { background: #d9d98c; }
+.premium { background: #b7a7ff; }
+.sold {
+  background: #c96;
+  color: #fff;
+  cursor: not-allowed;
+}
+.selected {
+  background: orange !important;
+}
+
+/* Center structure */
+.center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.box {
+  width: 100%;
+  height: 50px;
+  background: #d0d0d0;
+  border: 1px solid #999;
+  border-radius: 4px;
+  font-size: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Small divider (like your mid bars) */
+.divider {
+  width: 100%;
+  height: 20px;
+  background: repeating-linear-gradient(
+    90deg,
+    #aaa,
+    #aaa 2px,
+    #ddd 2px,
+    #ddd 6px
+  );
+  border: 1px solid #999;
+}
+
+/* Bottom stage */
+.stage {
+  margin: 10px;
+  background: #2f5f2f;
+  border-radius: 20px;
+  color: white;
+  text-align: center;
+  padding: 10px;
+  font-size: 11px;
+}
+</style>
+</head>
+
+<body>
+
+<div class="wrapper">
+
+  <!-- Ship outline using SVG -->
+  <!-- <svg class="ship-outline" viewBox="0 0 280 120">
+    <path d="M20 80 L20 60 L80 40 L110 10 L170 10 L200 40 L260 60 L260 80 Z"
+          fill="#dcdcdc" stroke="#888" stroke-width="2"/>
+  </svg>
+
+  <div class="layout">
+
+    <!-- LEFT -->
+    <!-- <div class="column" id="left"></div> --> -->
+
+    <!-- CENTER -->
+    <!-- <div class="center">
+      <div class="box">Lobby</div>
+      <div class="divider"></div>
+      <div class="box">Lift</div>
+      <div class="divider"></div>
+      <div class="box">Stairs</div>
+    </div> -->
+
+    <!-- RIGHT -->
+    <!-- <div class="column" id="right"></div> -->
+
+  <!-- </div> -->
+
+  <!-- <div class="stage">ENTERTAINMENT AREA</div> -->
+
+<!-- </div> -->
+
+<!-- <script> -->
+
+<!-- // Sold seats -->
+<!-- const sold = ["11510","11514","11006","11020"];
+
+function createSeats(start, end, containerId) {
+  const container = document.getElementById(containerId);
+
+  for (let i = start; i <= end; i += 2) {
+    const el = document.createElement("div");
+
+    let type = Math.random() > 0.75 ? "premium" : "available";
+    el.className = "seat " + type;
+    el.innerText = i + "+";
+
+    if (sold.includes(i.toString())) {
+      el.className = "seat sold";
+      el.innerText = "SOLD";
+    }
+
+    el.onclick = () => {
+      if (el.classList.contains("sold")) return;
+      el.classList.toggle("selected");
+    };
+
+    container.appendChild(el);
+  }
+} -->
+
+// Generate
+<!-- createSeats(11500, 11640, "left");
+createSeats(11000, 11140, "right"); -->
+
+<!-- </script>
+
+</body> -->
+<!-- </html> --> 
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cruise Deck UI</title>
+
+<style>
+body {
+  margin: 0;
+  background: #000;
+  display: flex;
+  justify-content: center;
+  font-family: Arial;
+}
+
+/* MAIN WRAPPER */
+.wrapper {
+  width: 1000px;
+  height: 95vh;
+  background: #e6e6e6;
+  border-radius: 30px;
+  overflow-y: auto;
+}
+
+/* SHIP HEAD */
+/* .ship-head {
+  height: 120px;
+  background: #dcdcdc;
+  clip-path: polygon(20% 100%, 20% 70%, 40% 60%, 50% 20%, 70% 20%, 80% 60%, 100% 70%, 100% 100%);
+  border-bottom: 2px solid #888;
+} */
+
+.ship-head {
+  height: 70px;
+  width: 100%;
+  background: #dcdcdc;
+
+  /* CENTERED symmetric shape */
+  clip-path: polygon(
+    0% 100%, 
+    10% 70%, 
+    35% 55%, 
+    50% 10%, 
+    65% 55%, 
+    90% 70%, 
+    90% 100%
+  );
+
+  border-bottom: 2px solid #888;
+}
+
+/* DECK */
+.deck {
+  padding: 10px;
+}
+
+/* SECTION BLOCK (IMPORTANT) */
+.section {
+  display: grid;
+  grid-template-columns: 1fr 80px 1fr;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+/* COLUMNS */
+.column {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* SEATS */
+.seat {
+  height: 22px;
+  font-size: 9px;
+  border-radius: 3px;
+  border: 1px solid #888;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.available { background: #d9d98c; }
+.premium { background: #b7a7ff; }
+.sold {
+  background: #c96;
+  color: #fff;
+  cursor: not-allowed;
+}
+.selected { background: orange !important; }
+
+/* CENTER BLOCKS */
+.center {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.center-box {
+  height: 50px;
+  background: #d0d0d0;
+  border: 1px solid #999;
+  border-radius: 4px;
+  font-size: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* SMALL GRID BOX (like your mid tiny rectangles) */
+.mini-grid {
+  height: 20px;
+  border: 1px solid #999;
+  background: repeating-linear-gradient(
+    90deg,
+    #aaa,
+    #aaa 2px,
+    #ddd 2px,
+    #ddd 6px
+  );
+}
+
+/* DARK ROOM BLOCKS */
+.room {
+  background: #555;
+  color: white;
+  font-size: 9px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* SOLD TAG */
+.sold-tag {
+  height: 22px;
+  background: #c96;
+  color: white;
+  font-size: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* BOTTOM STAGE */
+.stage {
+  margin: 10px;
+  background: #2f5f2f;
+  border-radius: 20px;
+  color: white;
+  text-align: center;
+  padding: 12px;
+  font-size: 11px;
+}
+</style>
+</head>
+
+<body>
+
+<div class="wrapper">
+
+  <div class="ship-head"></div>
+
+  <div class="deck" id="deck"></div>
+
+  <div class="stage">ENTERTAINMENT AREA</div>
+
+</div>
+
+<script>
+
+const deck = document.getElementById("deck");
+
+/* Helper to create seats */
+function createSeat(num, type="available") {
+  const el = document.createElement("div");
+  el.className = "seat " + type;
+  el.innerText = type === "sold" ? "SOLD" : num + "+";
+
+  el.onclick = () => {
+    if (el.classList.contains("sold")) return;
+    el.classList.toggle("selected");
+  };
+
+  return el;
+}
+
+/* SECTION BUILDER */
+function createSection(leftSeats, rightSeats, centerType="lobby") {
+
+  const section = document.createElement("div");
+  section.className = "section";
+
+  const left = document.createElement("div");
+  left.className = "column";
+
+  const right = document.createElement("div");
+  right.className = "column";
+
+  const center = document.createElement("div");
+  center.className = "center";
+
+  leftSeats.forEach(s => left.appendChild(createSeat(s.num, s.type)));
+  rightSeats.forEach(s => right.appendChild(createSeat(s.num, s.type)));
+
+  /* Center variations */
+  if (centerType === "lobby") {
+    center.innerHTML = `
+      <div class="center-box">Lobby</div>
+      <div class="mini-grid"></div>
+      <div class="center-box">Lift</div>
+    `;
+  }
+
+  if (centerType === "rooms") {
+    center.innerHTML = `
+      <div class="room">11519 | 11019</div>
+      <div class="room">11521 | 11021</div>
+    `;
+  }
+
+  if (centerType === "grid") {
+    center.innerHTML = `<div class="mini-grid"></div>`;
+  }
+
+  section.appendChild(left);
+  section.appendChild(center);
+  section.appendChild(right);
+
+  deck.appendChild(section);
+}
+
+/* DATA (structured like your UI) */
+
+createSection(
+  [
+    {num:11500},{num:11502},{num:11504,"type":"premium"},
+    {num:11506,"type":"premium"},{num:11508},{num:11510,"type":"sold"}
+  ],
+  [
+    {num:11002},{num:11004},{num:11006,"type":"premium"},
+    {num:11008},{num:11010},{num:11012}
+  ],
+  "lobby"
+);
+
+createSection(
+  [
+    {num:11514},{num:11516},{num:11518,"type":"sold"}
+  ],
+  [
+    {num:11014},{num:11016},{num:11018,"type":"sold"}
+  ],
+  "rooms"
+);
+
+createSection(
+  [
+    {num:11520},{num:11522},{num:11524,"type":"sold"}
+  ],
+  [
+    {num:11020},{num:11022},{num:11024,"type":"sold"}
+  ],
+  "grid"
+);
+
+/* Add more sections similarly to fully match your screenshot */
+
+</script>
+
+</body>
+</html>

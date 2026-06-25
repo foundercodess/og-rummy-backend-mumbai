@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: og-rummy-config
+  namespace: og-rummy
+data:
+  PORT: "3000"
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+  CORS_ORIGIN: "*"
+  API_BASE_PATH: "/api"
+  HEALTH_PATH: "/health"
+  BOT_ENGINE_ENABLED: "true"
+  BOT_INJECT_AFTER_SECONDS: "30"
+  BOT_SCAN_EVERY_MS: "5000"
+  BOT_SCAN_BATCH_LIMIT: "25"
+  BOT_POOL_SIZE: "50"
+  BOT_AUTO_READY: "true"
+  BOT_NAME_PREFIX: "RummyBot-"
+  BOT_PHONE_PREFIX: "98999"
+  BOT_SESSION_LOCK_TTL_SECONDS: "20"
+  BOT_ACTION_DELAY_MIN_MS: "5000"
+  BOT_ACTION_DELAY_MAX_MS: "28000"
+  BOT_ACTION_DELAY_MS: "0"
+  BOT_DECLARE_RESPONSE_DELAY_MS: "1500"
+  # Kafka - update with your Kafka bootstrap servers (kafka-bootstrap.og-rummy.svc:9092 when using in-cluster Kafka)
+  KAFKA_BROKERS: "kafka-bootstrap.og-rummy.svc:9092"

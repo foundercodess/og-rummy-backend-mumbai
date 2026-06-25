@@ -1,0 +1,1639 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>🃏 Rummy Mock Game Simulator</title>
+  <script src="https://cdn.socket.io/4.8.3/socket.io.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --border: #2a2f45;
+      --muted: #64748b;
+      --text: #e2e8f0;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; font-size: 13px; }
+
+    button { cursor: pointer; border: none; border-radius: 5px; font-size: 11px; font-weight: 600; padding: 5px 10px; transition: opacity .15s; white-space: nowrap; }
+    button:disabled { opacity: .3; cursor: not-allowed; }
+    button:hover:not(:disabled) { opacity: .8; }
+    input, textarea { background: #090c18; border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 5px 9px; font-size: 12px; font-family: monospace; outline: none; }
+    input:focus, textarea:focus { border-color: #4f6fba; }
+    textarea { resize: none; }
+
+    .btn-blue   { background: #2563eb; color: #fff; }
+    .btn-green  { background: #16a34a; color: #fff; }
+    .btn-red    { background: #dc2626; color: #fff; }
+    .btn-yellow { background: #ca8a04; color: #fff; }
+    .btn-purple { background: #7c3aed; color: #fff; }
+    .btn-cyan   { background: #0e7490; color: #fff; }
+    .btn-ghost  { background: #1e2435; color: var(--text); border: 1px solid var(--border); }
+
+    /* ── Config bar ── */
+    #config-bar {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 14px;
+      display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
+    }
+    .cfg-col { display: flex; flex-direction: column; gap: 3px; }
+    .cfg-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+    .cfg-actions { display: flex; gap: 5px; align-items: flex-end; flex-wrap: wrap; }
+
+    /* ── Token bar ── */
+    #token-bar {
+      background: #111520;
+      border-bottom: 1px solid var(--border);
+      padding: 8px 14px;
+      display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;
+    }
+    .tok-slot { display: flex; flex-direction: column; gap: 3px; }
+    .tok-name { font-size: 10px; font-weight: 700; letter-spacing: .03em; }
+    .tok-slot textarea { width: 210px; height: 46px; font-size: 9.5px; }
+    .tok-btns { display: flex; gap: 4px; }
+
+    /* ── Board bar ── */
+    #board-bar {
+      background: #0a0d1a;
+      border-bottom: 2px solid var(--border);
+      padding: 8px 14px;
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      position: sticky; top: 0; z-index: 20;
+    }
+    .bc { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+    .bc-label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+    .sep { width: 1px; height: 50px; background: var(--border); flex-shrink: 0; }
+    #phase-badge { font-size: 10px; padding: 3px 9px; border-radius: 10px; background: rgba(255,255,255,.06); color: var(--muted); }
+    #turn-badge { font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 10px; background: rgba(255,255,255,.06); }
+    #timer-el { font-size: 28px; font-weight: 800; min-width: 52px; text-align: right; font-variant-numeric: tabular-nums; }
+
+    /* ── Cards ── */
+    .card {
+      width: 40px; height: 58px;
+      background: #f8fafc; color: #111;
+      border: 2px solid #ccc; border-radius: 6px;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      cursor: pointer; flex-shrink: 0; position: relative;
+      user-select: none; transition: transform .12s, box-shadow .12s;
+    }
+    .card:hover { transform: translateY(-7px); box-shadow: 0 8px 22px rgba(0,0,0,.55); z-index: 4; }
+    .card.red  { color: #c00; }
+    .card.jkr  { background: linear-gradient(135deg,#fefce8,#fde68a); color: #78350f; border-color: #f59e0b; }
+    .card.sel  { border-color: #f97316; border-width: 2.5px; transform: translateY(-11px); box-shadow: 0 8px 22px rgba(249,115,22,.45); z-index: 5; }
+    .card.grp  { border-color: #16a34a; background: #f0fdf4; }
+    .card.pkd  { border-color: #2563eb; box-shadow: 0 0 10px rgba(37,99,235,.4); }
+    .card .cr  { font-size: 13px; font-weight: 800; line-height: 1; }
+    .card .cs  { font-size: 17px; line-height: 1; }
+    .card .cd  { font-size: 7px; color: #aaa; position: absolute; bottom: 2px; right: 3px; }
+
+    /* Mini pile card in board */
+    .pile-card {
+      width: 36px; height: 52px;
+      background: #f8fafc; color: #111;
+      border: 1.5px solid #888; border-radius: 5px;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; flex-shrink: 0;
+    }
+    .pile-card.red { color: #c00; }
+    .pile-card.jkr { background: linear-gradient(135deg,#fefce8,#fde68a); color: #78350f; border-color: #f59e0b; }
+    .pile-card .cr { font-size: 12px; font-weight: 800; }
+    .pile-card .cs { font-size: 14px; }
+    .closed-vis {
+      width: 36px; height: 52px; background: #1d4ed8; border: 1.5px solid #3b82f6;
+      border-radius: 5px; display: flex; flex-direction: column; align-items: center;
+      justify-content: center; color: #93c5fd; font-weight: 700; gap: 0;
+    }
+    .closed-vis span:first-child { font-size: 13px; }
+    .closed-vis span:last-child  { font-size: 8px; }
+
+    /* ── Player grid ── */
+    #table-wrap {
+      padding: 18px 14px 8px;
+    }
+    .table-stage {
+      position: relative;
+      min-height: 720px;
+      border-radius: 28px;
+      background:
+        radial-gradient(circle at 50% 50%, rgba(34,197,94,.18), rgba(2,6,23,.92) 62%),
+        linear-gradient(180deg, #0a1a12, #081019 58%, #05070d);
+      border: 1px solid rgba(148,163,184,.18);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.02), 0 20px 80px rgba(0,0,0,.35);
+      overflow: hidden;
+    }
+    .table-stage::before {
+      content: '';
+      position: absolute;
+      inset: 30px 90px;
+      border-radius: 999px;
+      border: 2px solid rgba(255,255,255,.06);
+      box-shadow: inset 0 0 60px rgba(34,197,94,.08);
+      pointer-events: none;
+    }
+    .table-center {
+      position: absolute;
+      left: 50%; top: 50%; transform: translate(-50%, -50%);
+      width: min(420px, 68vw);
+      background: rgba(3,7,18,.72);
+      border: 1px solid rgba(148,163,184,.18);
+      border-radius: 22px;
+      padding: 18px 20px;
+      text-align: center;
+      backdrop-filter: blur(10px);
+    }
+    .table-center h2 {
+      font-size: 24px;
+      letter-spacing: .03em;
+      margin-bottom: 8px;
+    }
+    .table-center p {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .table-meta {
+      margin-top: 12px;
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .table-chip {
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+      font-size: 11px;
+      font-weight: 700;
+    }
+    #seat-layer {
+      position: absolute;
+      inset: 0;
+    }
+    .seat {
+      position: absolute;
+      width: 270px;
+      min-height: 128px;
+      padding: 10px 12px;
+      border-radius: 18px;
+      border: 1px solid rgba(148,163,184,.16);
+      background: rgba(3,7,18,.66);
+      box-shadow: 0 12px 30px rgba(0,0,0,.22);
+      backdrop-filter: blur(8px);
+    }
+    .seat.is-turn {
+      border-color: #f97316;
+      box-shadow: 0 0 0 2px rgba(249,115,22,.22), 0 12px 30px rgba(0,0,0,.28);
+    }
+    .seat.seat-0 { left: 50%; top: 22px; transform: translateX(-50%); }
+    .seat.seat-1 { right: 24px; top: 128px; }
+    .seat.seat-2 { right: 46px; bottom: 118px; }
+    .seat.seat-3 { left: 50%; bottom: 22px; transform: translateX(-50%); }
+    .seat.seat-4 { left: 46px; bottom: 118px; }
+    .seat.seat-5 { left: 24px; top: 128px; }
+    .seat-hdr {
+      display:flex;
+      align-items:center;
+      gap:7px;
+      margin-bottom:8px;
+      font-size:12px;
+      font-weight:700;
+    }
+    .seat-meta {
+      margin-left:auto;
+      font-size:10px;
+      color: var(--muted);
+      font-family: monospace;
+    }
+    .seat-pills {
+      display:flex;
+      gap:5px;
+      flex-wrap:wrap;
+      margin-bottom:8px;
+    }
+    .seat-pill {
+      font-size:9px;
+      font-weight:700;
+      padding:2px 7px;
+      border-radius:999px;
+      background: rgba(255,255,255,.07);
+    }
+    .seat-pill.pending { color: #fbbf24; }
+    .seat-pill.submitted { color: #86efac; }
+    .seat-pill.waiting { color: #93c5fd; }
+    .seat-pill.turn { color: #fdba74; }
+    .seat-hand {
+      display:flex;
+      flex-wrap:wrap;
+      gap:3px;
+      min-height: 44px;
+    }
+    .seat-card {
+      width: 24px;
+      height: 34px;
+      border-radius: 4px;
+      background:#f8fafc;
+      color:#111;
+      border:1px solid #94a3b8;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-size:10px;
+      font-weight:800;
+      line-height:1;
+    }
+    .seat-card.red { color:#c00; }
+    .seat-card.jkr { background: linear-gradient(135deg,#fefce8,#fde68a); color:#78350f; border-color:#f59e0b; }
+    .seat-groups {
+      margin-top:8px;
+      font-size:10px;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+    #players-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+      gap: 10px; padding: 10px 14px;
+    }
+    .pp {
+      border: 2px solid var(--border); border-radius: 10px;
+      background: var(--surface); overflow: hidden;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    .pp.is-turn { border-color: #f97316; box-shadow: 0 0 22px rgba(249,115,22,.22); }
+    .pp.offline  { opacity: .45; }
+
+    .pp-head {
+      display: flex; align-items: center; gap: 7px; padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .pp-lbl { font-weight: 700; font-size: 13px; }
+    .pp-uid { font-size: 10px; color: var(--muted); margin-left: auto; font-family: monospace; }
+    .pill { font-size: 9px; font-weight: 700; padding: 2px 7px; border-radius: 8px; }
+    .pill.conn { background: rgba(22,163,74,.18); color: #86efac; }
+    .pill.disc { background: rgba(220,38,38,.18); color: #fca5a5; }
+    .pill.connecting { background: rgba(202,138,4,.18); color: #fde68a; }
+
+    .pp-actions {
+      display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .pp-hand {
+      display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 12px;
+      min-height: 76px; max-height: 220px; overflow-y: auto;
+    }
+    .nocard { color: var(--muted); font-size: 11px; align-self: center; }
+
+    .pp-foot {
+      padding: 5px 12px; border-top: 1px solid var(--border);
+      display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      font-size: 11px; color: var(--muted); min-height: 34px;
+    }
+
+    .pp-groups {
+      padding: 6px 12px; border-top: 1px solid var(--border);
+      max-height: 130px; overflow-y: auto;
+    }
+    .g-row { display: flex; align-items: center; gap: 5px; margin-bottom: 5px; flex-wrap: wrap; }
+    .g-lbl { font-size: 10px; color: var(--muted); min-width: 26px; }
+    .gbadge { font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 4px; }
+    .gbadge.pure_sequence    { background: rgba(22,163,74,.18);  color: #86efac; }
+    .gbadge.impure_sequence  { background: rgba(37,99,235,.18);  color: #93c5fd; }
+    .gbadge.set              { background: rgba(124,58,237,.18); color: #c4b5fd; }
+    .gbadge.invalid          { background: rgba(220,38,38,.18);  color: #fca5a5; }
+    .gbadge.invalid_sequence_candidate { background: rgba(234,88,12,.18); color: #fdba74; }
+    .gbadge.invalid_single   { background: rgba(148,163,184,.18); color: #cbd5e1; }
+
+    /* ── Declare modal ── */
+    #declare-modal {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,.82); z-index: 60;
+      align-items: flex-start; justify-content: center; padding: 24px;
+      overflow-y: auto;
+    }
+    #declare-modal.open { display: flex; }
+    .modal-box {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+      width: 100%; max-width: 980px; padding: 20px;
+    }
+    .modal-hdr { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; gap: 12px; }
+    .modal-title { font-size: 16px; font-weight: 700; }
+    .modal-info  { font-size: 11px; color: var(--muted); margin-top: 3px; }
+    .modal-cd    { font-size: 36px; font-weight: 800; color: #ef4444; min-width: 64px; text-align: right; }
+    .modal-grid  { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px,1fr)); gap: 10px; }
+    .mcell {
+      border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+    }
+    .mcell.is-declarer { border-color: #f97316; }
+    .mcell-hdr { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; font-weight: 700; font-size: 12px; }
+    .mcell-hand { display: flex; flex-wrap: wrap; gap: 3px; min-height: 44px; margin-bottom: 8px; }
+    .mcell-groups { font-size: 10px; color: var(--muted); margin-top: 4px; }
+
+    /* ── Result overlay ── */
+    #result-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,.9); z-index: 80;
+      align-items: center; justify-content: center;
+    }
+    #result-overlay.open { display: flex; }
+    .res-box {
+      background: var(--surface); border: 2px solid #f97316; border-radius: 14px;
+      padding: 28px; max-width: 540px; width: 90vw;
+    }
+    .res-title { font-size: 22px; font-weight: 800; text-align: center; margin-bottom: 18px; }
+    .res-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 12px; border-radius: 7px; margin-bottom: 6px;
+    }
+    .res-row.winner { background: rgba(22,163,74,.1); border: 1px solid rgba(22,163,74,.3); }
+    .res-row .pts { font-size: 20px; font-weight: 800; }
+
+    /* ── Log ── */
+    #log-bar {
+      background: #06080f; border-top: 1px solid var(--border);
+      padding: 5px 14px; display: flex; align-items: center;
+      justify-content: space-between; cursor: pointer;
+      font-size: 10px; color: var(--muted); user-select: none;
+    }
+    #log-bar:hover { color: var(--text); }
+    #log-panel {
+      background: #06080f; max-height: 200px; overflow-y: auto;
+      font-size: 10px; font-family: monospace; padding: 4px 14px;
+    }
+    #raw-bar {
+      background: #04060c; border-top: 1px solid var(--border);
+      padding: 5px 14px; display: flex; align-items: center;
+      justify-content: space-between; cursor: pointer;
+      font-size: 10px; color: var(--muted); user-select: none;
+    }
+    #raw-bar:hover { color: var(--text); }
+    #raw-panel {
+      background: #04060c; max-height: 260px; overflow-y: auto;
+      font-size: 10px; font-family: monospace; padding: 4px 14px;
+    }
+    .le { padding: 1px 0; border-bottom: 1px solid #0c1020; line-height: 1.5; }
+    .le .ts  { color: #2d3748; }
+    .le .ev  { font-weight: 700; color: #67e8f9; }
+    .le .dat { color: #4b5563; word-break: break-all; }
+    .le .kind { display:inline-block; min-width:38px; font-weight:700; }
+    .le .kind.emit { color:#fbbf24; }
+    .le .kind.ack { color:#86efac; }
+    .le .kind.event { color:#93c5fd; }
+    .le .dat.pretty { white-space: pre-wrap; word-break: break-word; color:#94a3b8; }
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════════ CONFIG BAR ═══════════════════════ -->
+<div id="config-bar">
+  <div class="cfg-col">
+    <span class="cfg-label">Base URL</span>
+    <input id="baseUrl" value="http://localhost:3000" style="width:210px" />
+  </div>
+  <div class="cfg-col">
+    <span class="cfg-label">Session ID</span>
+    <input id="sessionId" value="1" style="width:68px" />
+  </div>
+  <div class="cfg-actions">
+    <button class="btn-blue" id="connectAllBtn">⚡ Connect All</button>
+    <button class="btn-ghost" id="joinAllBtn">Join All</button>
+    <button class="btn-green" id="readyAllBtn">Ready All ✓</button>
+    <button class="btn-red" id="disconnectAllBtn">Disconnect All</button>
+    <button class="btn-ghost" id="addPlayerBtn">+ Add Player</button>
+    <button class="btn-ghost" id="clearLogBtn">Clear Log</button>
+    <button class="btn-ghost" onclick="location.href='test.html'">→ Raw Tester</button>
+  </div>
+</div>
+
+<!-- ═══════════════════════ TOKEN BAR ═══════════════════════ -->
+<div id="token-bar"><!-- player slots injected by JS --></div>
+
+<!-- ═══════════════════════ GAME BOARD BAR ═══════════════════════ -->
+<div id="board-bar">
+  <div class="bc">
+    <span class="bc-label">Wild Joker</span>
+    <span id="board-wild" style="font-size:14px;font-weight:700">—</span>
+  </div>
+  <div class="sep"></div>
+  <div class="bc">
+    <span class="bc-label">Discard Top</span>
+    <div id="board-discard"><span style="color:var(--muted)">—</span></div>
+  </div>
+  <div class="sep"></div>
+  <div class="bc">
+    <span class="bc-label">Finish Slot</span>
+    <div id="board-finish"><span style="color:var(--muted)">—</span></div>
+  </div>
+  <div class="sep"></div>
+  <div class="bc">
+    <span class="bc-label">Closed Deck</span>
+    <div id="board-closed">
+      <div class="closed-vis"><span>?</span><span>cards</span></div>
+    </div>
+  </div>
+  <div class="sep"></div>
+  <div class="bc">
+    <span class="bc-label">Current Turn</span>
+    <span id="turn-badge">—</span>
+  </div>
+  <div class="sep"></div>
+  <div class="bc">
+    <span class="bc-label">Turn Mode</span>
+    <span id="turn-mode-badge" style="font-size:11px;font-weight:700;padding:3px 8px;border-radius:8px;background:rgba(255,255,255,.06);color:#94a3b8">—</span>
+  </div>
+  <div class="sep"></div>
+  <div class="bc">
+    <span class="bc-label">Time Left</span>
+    <span id="timer-el" style="color:#22c55e">—</span>
+  </div>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+    <span id="phase-badge">idle</span>
+  </div>
+</div>
+
+<!-- ═══════════════════════ TABLE VIEW ═══════════════════════ -->
+<div id="table-wrap">
+  <div class="table-stage">
+    <div class="table-center">
+      <h2>6-Seat Mock Table</h2>
+      <p id="table-summary">Connect six players, join the same session, and use the same live sockets to simulate a full table. Seat cards and declare status update in realtime.</p>
+      <div class="table-meta">
+        <span class="table-chip" id="table-chip-phase">phase: idle</span>
+        <span class="table-chip" id="table-chip-turn">turn: —</span>
+        <span class="table-chip" id="table-chip-declare">declare: inactive</span>
+      </div>
+    </div>
+    <div id="seat-layer"></div>
+  </div>
+</div>
+
+<!-- ═══════════════════════ PLAYER PANELS ═══════════════════════ -->
+<div id="players-grid"></div>
+
+<!-- ═══════════════════════ DECLARE MODAL ═══════════════════════ -->
+<div id="declare-modal">
+  <div class="modal-box">
+    <div class="modal-hdr">
+      <div>
+        <div class="modal-title">🃏 Declaration Window</div>
+        <div class="modal-info" id="modal-info"></div>
+      </div>
+      <span class="modal-cd" id="modal-cd">—</span>
+    </div>
+    <div id="modal-grid" class="modal-grid"></div>
+    <div style="margin-top:12px;font-size:10px;color:var(--muted)">
+      Submit button emits <strong>player:declare:response</strong>. Server then broadcasts <strong>game:declare:submitted</strong> to everyone.
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════ RESULT OVERLAY ═══════════════════════ -->
+<div id="result-overlay">
+  <div class="res-box">
+    <div class="res-title">🏆 Game Result</div>
+    <div id="result-content"></div>
+    <button class="btn-blue" id="closeResultBtn" style="width:100%;padding:10px;margin-top:18px;font-size:13px;">
+      Close
+    </button>
+  </div>
+</div>
+
+<!-- ═══════════════════════ LOG ═══════════════════════ -->
+<div id="log-bar">
+  <span>▼ EVENT LOG</span>
+  <span id="log-count">0 events</span>
+</div>
+<div id="log-panel"></div>
+<div id="raw-bar">
+  <span>▼ RAW SOCKET TRAFFIC</span>
+  <span id="raw-count">0 packets</span>
+</div>
+<div id="raw-panel"></div>
+
+<script>
+// ══════════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ══════════════════════════════════════════════════════════════════════════════
+const P_COLORS = ['#3b82f6', '#22c55e', '#ef4444', '#a855f7', '#f97316', '#14b8a6'];
+const SUITS    = { spades: '♠', hearts: '♥', diamonds: '♦', clubs: '♣' };
+const MAX_P    = 6;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STATE
+// ══════════════════════════════════════════════════════════════════════════════
+let players = [];
+let g = {
+  sessionId       : null,
+  phase           : 'idle',
+  currentTurnUid  : null,
+  wildJoker       : null,
+  discardTop      : null,
+  finishCard      : null,
+  closedCount     : null,
+  turnEndsAt      : null,
+  turnType        : 'normal',
+  turnHasPicked   : false,
+  turnAttemptNo   : 0,
+  turnAttemptsLeft: null,
+  timerIv         : null,
+  dealDone        : false,   // guard so onDeal runs exactly once per game
+  declarerUid     : null,
+  declarePendingUserIds: [],
+  declareSubmittedUserIds: [],
+  declareStatePlayers: [],
+  declEndAt       : null,
+  declIv          : null,
+};
+let logCount = 0;
+let rawCount = 0;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PLAYER FACTORY
+// ══════════════════════════════════════════════════════════════════════════════
+function mkPlayer(idx) {
+  return {
+    idx,
+    color       : P_COLORS[idx],
+    label       : `P${idx + 1}`,
+    socket      : null,
+    userId      : null,
+    status      : 'disc',   // disc | connecting | conn
+    hand        : [],       // full card objects
+    selectedUid : null,     // card_uid currently selected for discard
+    pickedUid   : null,     // last picked card (highlighted in blue)
+    groups      : [],       // { group_id, type, cards: [cardObj] }
+    ungroupedGroups: [],    // display-only leftover suit clusters
+  };
+}
+
+function addPlayer() {
+  if (players.length >= MAX_P) return;
+  const p = mkPlayer(players.length);
+  players.push(p);
+  mountTokenSlot(p);
+  mountPanel(p);
+  renderTableView();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TOKEN SLOT
+// ══════════════════════════════════════════════════════════════════════════════
+function mountTokenSlot(p) {
+  const bar = document.getElementById('token-bar');
+  const el = document.createElement('div');
+  el.className = 'tok-slot';
+  el.id = `tslot-${p.idx}`;
+  el.innerHTML = `
+    <span class="tok-name" style="color:${p.color}">● ${p.label}</span>
+    <textarea id="tok-${p.idx}" placeholder="JWT token for ${p.label}…"></textarea>
+    <div class="tok-btns">
+      <button class="btn-ghost" onclick="connectPlayer(${p.idx})">Connect</button>
+      <button class="btn-ghost" onclick="disconnectPlayer(${p.idx})">✕</button>
+    </div>`;
+  bar.appendChild(el);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CARD HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+function suitClass(card) {
+  if (card.is_joker) return 'jkr';
+  return (card.suit === 'hearts' || card.suit === 'diamonds') ? 'red' : '';
+}
+
+function cardFace(card) {
+  if (card.is_joker) return { r: 'JKR', s: '★' };
+  return { r: card.rank || '?', s: SUITS[card.suit] || '?' };
+}
+
+function deckNum(card) {
+  const m = (card.card_uid || '').match(/^D(\d+)_/);
+  return m ? m[1] : '';
+}
+
+function cardEl(card, pidx, opts) {
+  const { sel, grp, pkd } = opts || {};
+  const { r, s } = cardFace(card);
+  const cls = ['card', suitClass(card), sel ? 'sel' : '', grp ? 'grp' : '', pkd ? 'pkd' : '']
+    .filter(Boolean).join(' ');
+  const title = `${card.suit || 'joker'} ${card.rank || ''} [${card.card_uid}]`;
+  return `<div class="${cls}" onclick="onCardClick(${pidx},'${card.card_uid}')" title="${title}">
+    <span class="cr">${r}</span><span class="cs">${s}</span><span class="cd">${deckNum(card)}</span>
+  </div>`;
+}
+
+function pileCardEl(card) {
+  if (!card) return '<span style="color:var(--muted);font-size:11px">—</span>';
+  const { r, s } = cardFace(card);
+  return `<div class="pile-card ${suitClass(card)}"><span class="cr">${r}</span><span class="cs">${s}</span></div>`;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PANEL RENDERING
+// ══════════════════════════════════════════════════════════════════════════════
+function mountPanel(p) {
+  const grid = document.getElementById('players-grid');
+  const el = document.createElement('div');
+  el.className = 'pp offline';
+  el.id = `pp-${p.idx}`;
+  el.innerHTML = buildPanel(p);
+  grid.appendChild(el);
+}
+
+function buildPanel(p) {
+  const isTurn = !!(g.currentTurnUid && p.userId && g.currentTurnUid === p.userId);
+  const canSubmitDeclare = g.phase === 'declaring';
+  const grpUids = new Set(
+    p.groups.flatMap(gr => (gr.cards || []).map(c => (typeof c === 'string' ? c : c.card_uid)))
+  );
+
+  const handHTML = p.hand.length
+    ? p.hand.map(c => cardEl(c, p.idx, {
+        sel: p.selectedUid === c.card_uid,
+        grp: grpUids.has(c.card_uid),
+        pkd: p.pickedUid === c.card_uid,
+      })).join('')
+    : '<span class="nocard">No cards yet</span>';
+
+  const grpHTML = buildGroupsBlock(p);
+  const statusText = { conn: 'connected', disc: 'disconnected', connecting: 'connecting' }[p.status] || p.status;
+
+  return `
+    <div class="pp-head">
+      <div class="dot" style="background:${p.color}"></div>
+      <span class="pp-lbl">${p.label}</span>
+      <span class="pill ${p.status}">${statusText}</span>
+      <span class="pp-uid">${p.userId ? `uid:${p.userId}` : ''}</span>
+    </div>
+    <div class="pp-actions">
+      <button class="btn-ghost" onclick="joinSession(${p.idx})">Join</button>
+      <button class="btn-ghost" onclick="setReady(${p.idx},true)">Ready ✓</button>
+      <button class="btn-ghost" onclick="setReady(${p.idx},false)">Not Ready</button>
+      <button class="btn-blue"   onclick="pickCard(${p.idx},'available')"  ${!isTurn ? 'disabled' : ''}>Pick Avl</button>
+      <button class="btn-cyan"   onclick="pickCard(${p.idx},'discard')"    ${!isTurn ? 'disabled' : ''}>Pick Disc</button>
+      <button class="btn-yellow" onclick="autoGroup(${p.idx})">AutoGroup</button>
+      <button class="btn-green"  onclick="finishSelected(${p.idx})" ${!isTurn || !g.turnHasPicked || !p.selectedUid ? 'disabled' : ''}>Finish</button>
+      <button class="btn-purple" onclick="declarePlayer(${p.idx})" ${canSubmitDeclare ? '' : (!isTurn ? 'disabled' : '')}>${canSubmitDeclare ? 'Submit Decl' : 'Legacy Declare'}</button>
+    </div>
+    <div class="pp-hand" id="hand-${p.idx}">${handHTML}</div>
+    <div class="pp-foot">
+      <span>${p.hand.length} card${p.hand.length !== 1 ? 's' : ''}</span>
+      ${p.selectedUid
+        ? `<button class="btn-red" onclick="discardSelected(${p.idx})" ${!isTurn ? 'disabled' : ''}>Discard ✕</button>
+           <button class="btn-ghost" onclick="clearSel(${p.idx})" style="padding:3px 7px">✕ Sel</button>
+           <code style="font-size:10px;color:var(--muted)">${p.selectedUid.substring(0, 18)}…</code>`
+        : '<span style="color:var(--muted)">tap a card to select → discard</span>'}
+    </div>
+    ${grpHTML
+      ? `<div class="pp-groups" id="grp-${p.idx}">${grpHTML}</div>`
+      : `<div class="pp-groups" id="grp-${p.idx}" style="display:none"></div>`}`;
+}
+
+function cardPoints(card) {
+  if (!card) return 0;
+  if (card.is_joker) return 0;
+  if (card.rank === 'A') return 10;
+  if (["J", "Q", "K"].includes(card.rank)) return 10;
+  const n = parseInt(card.rank, 10);
+  return isNaN(n) ? 0 : n;
+}
+
+function buildGroupsBlock(p) {
+  const allGroups = [...(p.groups || [])];
+
+  if (!allGroups.length) return '';
+
+  return allGroups.map((gr, gi) => {
+    const badge = gr.type
+      ? `<span class=\"gbadge ${gr.type}\">${gr.type.replace(/_/g, ' ')}</span>`
+      : '';
+    const cardsArr = (gr.cards || []).map(c => (typeof c === 'string' ? p.hand.find(h => h.card_uid === c) : c));
+    const cards = cardsArr.map(card => {
+      if (!card) return `<span style=\"font-size:10px;color:var(--muted)\">${typeof card === 'string' ? card.substring(0,8) : '?'}</span>`;
+      const { r, s } = cardFace(card);
+      const col = suitClass(card) === 'red'
+        ? '#f87171'
+        : suitClass(card) === 'jkr'
+          ? '#fbbf24'
+          : 'var(--text)';
+      return `<span style=\"color:${col};font-weight:700;font-size:13px\">${r}${s}</span>`;
+    }).join(' ');
+    const groupPoints = cardsArr.reduce((sum, card) => sum + cardPoints(card), 0);
+    return `<div class=\"g-row\"><span class=\"g-lbl\">G${gi + 1}</span>${badge}<span style=\"flex:1\">${cards}</span><span style=\"margin-left:10px;font-size:11px;color:#fbbf24;font-weight:700\">${groupPoints} pts</span></div>`;
+  }).join('');
+}
+
+function buildGroupsBlockFromGrouping(grouping, handCards = []) {
+  const pseudoPlayer = {
+    groups: (grouping?.groups || []).map((group, index) => ({
+      group_id: group.group_id || index + 1,
+      type: group.type,
+      cards: group.cards || [],
+    })),
+    hand: handCards || [],
+  };
+  return buildGroupsBlock(pseudoPlayer);
+}
+
+function getDeclareStateRow(userId) {
+  return (g.declareStatePlayers || []).find((player) => player.user_id === userId) || null;
+}
+
+function renderSeatCards(player, row) {
+  const cards = Array.isArray(row?.cards)
+    ? row.cards
+    : (g.phase === 'declaring' ? null : player.hand);
+
+  if (!Array.isArray(cards) || cards.length === 0) {
+    return g.phase === 'declaring'
+      ? '<span style="color:var(--muted);font-size:11px">Waiting for declaration...</span>'
+      : '<span style="color:var(--muted);font-size:11px">No hand</span>';
+  }
+
+  return cards.map((card) => {
+    const { r, s } = cardFace(card);
+    const cls = ['seat-card', suitClass(card)].filter(Boolean).join(' ');
+    return `<div class="${cls}" title="${card.card_uid}">${r}${s}</div>`;
+  }).join('');
+}
+
+function renderSeatGrouping(player, row) {
+  if (row?.grouping) {
+    return buildGroupsBlockFromGrouping(row.grouping, row.cards || []);
+  }
+  if (g.phase === 'declaring') {
+    return '<span style="color:var(--muted)">No revealed declaration yet</span>';
+  }
+  return buildGroupsBlock(player) || '<span style="color:var(--muted)">No groups</span>';
+}
+
+function syncDeclareStateUI() {
+  (g.declareStatePlayers || []).forEach((row) => {
+    const stat = document.getElementById(`mstat-${row.user_id}`);
+    if (stat) {
+      stat.textContent = row.submitted ? 'submitted ✓' : 'pending';
+      stat.style.color = row.submitted ? '#86efac' : 'var(--muted)';
+    }
+
+    const groupsEl = document.getElementById(`mgr-${row.user_id}`);
+    if (groupsEl) {
+      groupsEl.innerHTML = row.grouping
+        ? (buildGroupsBlockFromGrouping(row.grouping, row.cards || []) || '<span style="color:var(--muted)">No groups</span>')
+        : 'Run AutoGroup first, then Submit';
+    }
+
+    const handEl = document.getElementById(`mhand-${row.user_id}`);
+    if (handEl && Array.isArray(row.cards) && row.cards.length > 0) {
+      handEl.innerHTML = row.cards.map((card) => cardEl(card, 0, {})).join('');
+    }
+  });
+}
+
+function renderTableView() {
+  const layer = document.getElementById('seat-layer');
+  if (!layer) return;
+
+  document.getElementById('table-chip-phase').textContent = `phase: ${g.phase}`;
+  const turnPlayer = players.find((player) => player.userId && player.userId === g.currentTurnUid);
+  document.getElementById('table-chip-turn').textContent = `turn: ${turnPlayer?.label || '—'}`;
+  const submitted = g.declareSubmittedUserIds.length;
+  const pending = g.declarePendingUserIds.length;
+  document.getElementById('table-chip-declare').textContent = g.phase === 'declaring'
+    ? `declare: ${submitted} submitted / ${pending} pending`
+    : 'declare: inactive';
+
+  if (g.phase === 'declaring') {
+    document.getElementById('table-summary').textContent =
+      'Same window flow: seats stay visible, submitted players update live, and final points fill in when game:result arrives.';
+  } else if (g.phase === 'ended') {
+    document.getElementById('table-summary').textContent =
+      'Result emitted. Use the same table to inspect final player state, while the overlay shows the summarized result.';
+  } else {
+    document.getElementById('table-summary').textContent =
+      'Connect six players, join the same session, and use the same live sockets to simulate a full table. Seat cards and declare status update in realtime.';
+  }
+
+  layer.innerHTML = players.map((p) => {
+    const row = getDeclareStateRow(p.userId);
+    const isTurn = !!(g.currentTurnUid && p.userId && g.currentTurnUid === p.userId);
+    const connectedClass = p.status === 'conn' ? 'submitted' : p.status === 'connecting' ? 'pending' : 'waiting';
+    const isPendingDeclare = p.userId && g.declarePendingUserIds.includes(p.userId);
+    const isSubmittedDeclare = p.userId && g.declareSubmittedUserIds.includes(p.userId);
+    const declarePills = g.phase === 'declaring'
+      ? `${isSubmittedDeclare ? '<span class="seat-pill submitted">submitted</span>' : ''}${isPendingDeclare ? '<span class="seat-pill pending">pending</span>' : ''}`
+      : '';
+    const cards = renderSeatCards(p, row);
+    const groups = renderSeatGrouping(p, row);
+    const scoreHtml = row?.score != null
+      ? `<span class="seat-pill submitted">score ${row.score}</span>`
+      : '';
+    const rankHtml = row?.rank != null
+      ? `<span class="seat-pill submitted">rank ${row.rank}</span>`
+      : '';
+    const wonHtml = row?.won_amount != null
+      ? `<span class="seat-pill ${row.won_amount >= 0 ? 'submitted' : 'pending'}">won ${row.won_amount >= 0 ? '+' : ''}${Number(row.won_amount).toFixed(2)}</span>`
+      : '';
+    const winnerHtml = row?.is_winner === true ? '<span class="seat-pill submitted">winner</span>' : '';
+
+    return `
+      <div class="seat seat-${p.idx} ${isTurn ? 'is-turn' : ''}">
+        <div class="seat-hdr">
+          <div class="dot" style="background:${p.color}"></div>
+          <span>${row?.name || p.label}</span>
+          <span class="seat-meta">${p.userId ? `uid:${p.userId}` : 'not joined'}</span>
+        </div>
+        <div class="seat-pills">
+          <span class="seat-pill ${connectedClass}">${p.status}</span>
+          <span class="seat-pill waiting">${p.hand.length} cards</span>
+          ${isTurn ? '<span class="seat-pill turn">turn</span>' : ''}
+          ${declarePills}
+          ${scoreHtml}
+          ${rankHtml}
+          ${wonHtml}
+          ${winnerHtml}
+        </div>
+        <div class="seat-hand">${cards}</div>
+        <div class="seat-groups">${groups}</div>
+      </div>`;
+  }).join('');
+}
+
+function refreshPanel(p, skipTable = false) {
+  const el = document.getElementById(`pp-${p.idx}`);
+  if (!el) return;
+  const isTurn = !!(g.currentTurnUid && p.userId && g.currentTurnUid === p.userId);
+  el.classList.toggle('is-turn', isTurn);
+  el.classList.toggle('offline', p.status === 'disc');
+  el.innerHTML = buildPanel(p);
+  if (!skipTable) renderTableView();
+}
+
+function refreshAll() {
+  players.forEach(p => refreshPanel(p, true));
+  renderTableView();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SOCKET CONNECT / DISCONNECT
+// ══════════════════════════════════════════════════════════════════════════════
+function connectPlayer(idx) {
+  const p = players[idx];
+  const token = (document.getElementById(`tok-${idx}`)?.value || '').trim();
+  if (!token) { alert(`Enter JWT token for ${p.label}`); return; }
+  if (p.socket?.connected) return;
+
+  const baseUrl = document.getElementById('baseUrl').value.trim();
+  p.status = 'connecting';
+  refreshPanel(p);
+
+  const s = io(baseUrl, { auth: { token }, transports: ['websocket'] });
+  p.socket = s;
+
+  s.on('connect', () => {
+    p.status = 'conn';
+    log(p, 'connect', { socketId: s.id });
+    refreshPanel(p);
+  });
+  s.on('disconnect', reason => {
+    p.status = 'disc';
+    log(p, 'disconnect', { reason });
+    refreshPanel(p);
+  });
+  s.on('connect_error', err => {
+    p.status = 'disc';
+    log(p, 'connect_error', { msg: err.message });
+    refreshPanel(p);
+  });
+
+  function bindServerEvent(eventName, handler, summaryBuilder = null) {
+    s.on(eventName, data => {
+      rawLog('event', p, eventName, data);
+      if (summaryBuilder) {
+        log(p, eventName, summaryBuilder(data));
+      }
+      handler(data);
+    });
+  }
+
+  bindServerEvent('connection:ready', data => {
+    p.userId = data.user?.id;
+    refreshPanel(p);
+  }, data => ({ userId: data.user?.id, name: data.user?.name }));
+
+  bindServerEvent('session:state', data => {
+    g.sessionId = data.id ?? g.sessionId;
+    if (data.current_turn_user_id && !g.currentTurnUid) {
+      g.currentTurnUid = data.current_turn_user_id;
+      updateTurnBadge();
+    }
+    setPhase(data.status === 'active' ? 'active' : g.phase);
+  }, data => ({ status: data.status, turn: data.current_turn_user_id }));
+
+  bindServerEvent('match:filled', data => {
+    setPhase('pregame');
+  }, data => ({ session: data.session_id }));
+
+  bindServerEvent('game:countdown', data => {
+    setPhase('pregame');
+  }, data => ({ t: data.countdown_seconds }));
+
+  bindServerEvent('game:toss', () => {}, data => ({ winner: data.toss_winner_user_id }));
+
+  bindServerEvent('game:deal', data => {
+    if (!g.dealDone) {
+      g.dealDone = true;
+      onDeal(data);         // populate all players from this deal
+    } else {
+      applyHandFromDeal(p, data);   // if already done, still sync this player's hand
+    }
+  }, data => ({
+      turn: data.game_state?.current_turn_user_id,
+      myCards: data.distribution?.players?.find(pd => pd.user_id === p.userId)?.cards?.length,
+    }));
+
+  bindServerEvent('game:pick', data => {
+    // Only update board state — hand updated via pick ACK for the acting player
+    updateDiscardTop(data.discard_top);
+    updateClosedCount(data.closed_deck_count);
+  }, data => ({ by: data.user_id, src: data.source }));
+
+  bindServerEvent('game:turn', data => {
+    onTurnUpdate(data);
+  }, data => ({
+      server_time: data.server_time,
+      action: data.action,
+      prev: data.previous_turn_user_id,
+      next: data.turn?.user_id,
+      turn_id: data.turn?.turn_id,
+      started_at: data.turn?.started_at,
+      ends_at: data.turn?.ends_at,
+      turn_timer_seconds: data.turn?.turn_timer_seconds,
+      type: data.turn?.type,
+      attempt_no: data.turn?.attempt_no,
+      max_bonus_attempts: data.turn?.max_bonus_attempts,
+      attempts_left: data.turn?.attempts_left,
+      has_picked: data.turn?.has_picked,
+      discard: data.discarded_card?.card_uid,
+    }));
+
+  bindServerEvent('game:declare:requested', data => {
+    onDeclareRequested(data);
+  }, data => ({ by: data.declare_by_user_id, secs: data.duration_seconds, pending: data.pending_user_ids }));
+
+  bindServerEvent('game:declare:state', data => {
+    onDeclareState(data);
+  }, data => ({
+    final: data.is_final,
+    pending: data.pending_count,
+    submitted: (data.submitted_user_ids || []).length,
+  }));
+
+  bindServerEvent('game:finish', data => {
+    onFinishUpdate(data);
+  }, data => ({ by: data.declare_by_user_id, finish: data.finish_card?.card_uid }));
+
+  bindServerEvent('game:declare:countdown', data => {
+    updateDeclareCountdown(data.seconds_left);
+  }, data => ({ left: data.seconds_left }));
+
+  bindServerEvent('game:declare:submitted', data => {
+    markModalSubmitted(data.user_id);
+  }, data => ({ by: data.user_id, pending: data.pending_count }));
+
+  bindServerEvent('game:result', data => {
+    if (idx === 0) onResult(data);   // show result overlay once
+  }, data => ({ winner: data.winner_user_id, declare_valid: data.declare_valid }));
+}
+
+function disconnectPlayer(idx) {
+  const p = players[idx];
+  if (p.socket) { p.socket.disconnect(); p.socket = null; }
+  p.userId = null; p.hand = []; p.selectedUid = null;
+  p.pickedUid = null; p.groups = []; p.ungroupedGroups = []; p.status = 'disc';
+  refreshPanel(p);
+}
+
+function connectAll()    { players.forEach(p => connectPlayer(p.idx)); }
+function disconnectAll() { players.forEach(p => disconnectPlayer(p.idx)); }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GAME ACTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+function sid() { return Number(document.getElementById('sessionId').value) || g.sessionId; }
+
+function joinSession(idx) {
+  const p = players[idx];
+  if (!p.socket?.connected) { alert(`${p.label} is not connected`); return; }
+  emitWithTrace(p, 'session:join', { session_id: sid() }, ack => {
+    log(p, 'ACK:join', { ok: ack.success, msg: ack.message });
+    if (ack.success && ack.session?.id) {
+      g.sessionId = ack.session.id;
+      document.getElementById('sessionId').value = ack.session.id;
+    }
+  });
+}
+
+function setReady(idx, ready) {
+  const p = players[idx];
+  if (!p.socket?.connected) return;
+  emitWithTrace(p, 'player:ready', { session_id: sid(), ready }, ack =>
+    log(p, 'ACK:ready', { ok: ack.success, ready }));
+}
+
+
+
+function pickCard(idx, source) {
+  const p = players[idx];
+  if (!p.socket?.connected) return;
+  emitWithTrace(p, 'player:pick', { session_id: sid(), source, groups: buildGroupsPayload(p) }, ack => {
+    log(p, 'ACK:pick', { ok: ack.success, src: source, card: ack.data?.picked_card?.card_uid, msg: ack.message });
+    if (ack.success && ack.data?.picked_card) {
+      p.hand.push(ack.data.picked_card);
+      p.pickedUid = ack.data.picked_card.card_uid;
+      updateDiscardTop(ack.data.discard_top);
+      updateClosedCount(ack.data.closed_deck_count);
+      applyGroupingData(p, ack.data);
+      refreshPanel(p);
+    }
+  });
+}
+
+function discardSelected(idx) {
+  const p = players[idx];
+  if (!p.socket?.connected || !p.selectedUid) return;
+  const uid = p.selectedUid;
+  emitWithTrace(p, 'player:discard', {
+    session_id: sid(),
+    card_uid: uid,
+    from_group_id: findGroupIdForCard(p, uid),
+    groups: buildGroupsPayload(p),
+  }, ack => {
+    log(p, 'ACK:discard', { ok: ack.success, card: uid, msg: ack.message });
+    if (ack.success) {
+      p.hand = p.hand.filter(c => c.card_uid !== uid);
+      p.selectedUid = null;
+      p.pickedUid = null;
+      updateDiscardTop(ack.data?.discard_top);
+      applyGroupingData(p, ack.data);
+      refreshPanel(p);
+    }
+  });
+}
+
+function autoGroup(idx) {
+  const p = players[idx];
+  if (!p.socket?.connected) return;
+  emitWithTrace(p, 'player:autogroup', { session_id: sid() }, ack => {
+    log(p, 'ACK:autogroup', { ok: ack.success, valid: ack.data?.summary?.valid_for_declare, pts: ack.data?.summary?.hand_points });
+    if (ack.success && ack.data) {
+      applyGroupingData(p, ack.data);
+      refreshPanel(p);
+    }
+  });
+}
+
+function declarePlayer(idx) {
+  const p = players[idx];
+  if (!p.socket?.connected) return;
+  if (g.phase === 'declaring') {
+    submitDeclare(idx);
+    return;
+  }
+  const payload = buildGroupsPayload(p);
+  if (payload.length === 0 && !confirm(`${p.label}: no groups defined. Send empty declaration?`)) return;
+  emitWithTrace(p, 'player:declare', { session_id: sid(), groups: payload }, ack =>
+    log(p, 'ACK:declare', { ok: ack.success, valid: ack.data?.preview?.summary?.valid_for_declare, msg: ack.message }));
+}
+
+function finishSelected(idx) {
+  const p = players[idx];
+  if (!p.socket?.connected || !p.selectedUid) return;
+
+  const finishUid = p.selectedUid;
+  emitWithTrace(p, 'player:finish', {
+    session_id: sid(),
+    card_uid: finishUid,
+  }, ack => {
+    log(p, 'ACK:finish', {
+      ok: ack.success,
+      finish: finishUid,
+      valid: ack.data?.preview?.summary?.valid_for_declare,
+      msg: ack.message,
+    });
+    if (ack.success && ack.data?.finish_card) {
+      p.hand = p.hand.filter(c => c.card_uid !== finishUid);
+      p.selectedUid = null;
+      if (p.pickedUid === finishUid) p.pickedUid = null;
+      applyGroupingData(p, ack.data);
+      refreshPanel(p);
+    }
+  });
+}
+
+function submitDeclare(idx) {
+  const p = players[idx];
+  if (!p.socket?.connected) return;
+  const payload = buildGroupsPayload(p);
+  emitWithTrace(p, 'player:declare:response', { session_id: sid(), groups: payload }, ack => {
+    log(p, 'ACK:declare:response', {
+      ok: ack.success,
+      valid: ack.data?.preview?.summary?.valid_for_declare,
+      pending: ack.data?.pending_count,
+      msg: ack.message,
+    });
+    if (ack.success && ack.data) {
+      applyGroupingData(p, ack.data);
+      refreshPanel(p);
+      markModalSubmitted(p.userId);
+    }
+  });
+}
+
+function autoGroupModal(idx) {
+  const p = players[idx];
+  if (!p.socket?.connected) return;
+  emitWithTrace(p, 'player:autogroup', { session_id: sid() }, ack => {
+    log(p, 'ACK:autogroup[modal]', { ok: ack.success, valid: ack.data?.summary?.valid_for_declare });
+    if (ack.success && ack.data) {
+      applyGroupingData(p, ack.data);
+      const el = document.getElementById(`mgr-${p.userId}`);
+      if (el) el.innerHTML = buildGroupsBlock(p) || '<span style="color:var(--muted)">No groups found</span>';
+      // Refresh submit button state
+      const btn = document.getElementById(`msub-${p.userId}`);
+      if (btn) btn.disabled = false;
+    }
+  });
+}
+
+
+
+// Helpers
+function buildGroupsPayload(p) {
+  return p.groups.map((gr, i) => ({
+    group_id: i + 1,
+    cards: (gr.cards || []).map(c => (typeof c === 'string' ? c : c.card_uid)).filter(Boolean),
+  }));
+}
+
+function applyGroupingData(player, data) {
+  const grouping = data?.grouping || data;
+  player.groups = (grouping?.groups || []).map((gr, i) => ({
+    group_id: gr.group_id || i + 1,
+    type: gr.type,
+    cards: gr.cards || [],
+  }));
+  player.ungroupedGroups = [];
+}
+
+function findGroupIdForCard(player, cardUid) {
+  const match = (player.groups || []).find((group) =>
+    (group.cards || []).some((card) => (typeof card === 'string' ? card : card.card_uid) === cardUid)
+  );
+  return match?.group_id || null;
+}
+
+function joinAll()  { players.forEach(p => joinSession(p.idx)); }
+function readyAll() { players.forEach(p => setReady(p.idx, true)); }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CARD CLICK
+// ══════════════════════════════════════════════════════════════════════════════
+function onCardClick(idx, uid) {
+  const p = players[idx];
+  p.selectedUid = (p.selectedUid === uid) ? null : uid;
+  refreshPanel(p);
+}
+
+function clearSel(idx) {
+  players[idx].selectedUid = null;
+  refreshPanel(players[idx]);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GAME EVENT HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Called once per game when the first game:deal arrives
+function onDeal(data) {
+  setPhase('active');
+  const dist = data.distribution || {};
+
+  // Wild joker
+  if (dist.wild_joker) {
+    g.wildJoker = dist.wild_joker;
+    const { r, s } = cardFace(dist.wild_joker);
+    document.getElementById('board-wild').innerHTML = `<strong style="font-size:15px">${r}${s}</strong>`;
+  }
+
+  // Discard + deck
+  updateDiscardTop(dist.discard_pile?.[0]);
+  updateFinishCard(data?.game_state?.declaration?.finish_card || data?.declaration?.finish_card || null);
+  updateClosedCount(dist.closed_deck_count ?? dist.closed_deck?.length);
+
+  // Turn
+  const gs = data.game_state || {};
+  g.currentTurnUid = gs.current_turn_user_id || null;
+
+  if (data.turn) {
+    onTurnUpdate({ turn: data.turn, action: 'deal_start' });
+  } else {
+    // Fallback for older payloads
+    if (data.turn?.ends_at) {
+      g.turnEndsAt = new Date(data.turn.ends_at);
+      startTimer();
+    }
+    updateTurnModeBadge();
+  }
+
+  updateTurnBadge();
+
+  // Populate each connected player's hand
+  (dist.players || []).forEach(pd => {
+    const p = players.find(pl => pl.userId === pd.user_id);
+    if (p && pd.cards) {
+      p.hand = [...pd.cards];
+      p.pickedUid = null;
+      p.groups = [];
+      p.ungroupedGroups = [];
+      p.selectedUid = null;
+      // Pre-fill groups from auto_groups if server sent them
+      if (pd.auto_groups?.groups?.length) {
+        applyGroupingData(p, pd.auto_groups);
+      }
+    }
+  });
+
+  refreshAll();
+}
+
+// For subsequent sockets receiving game:deal after dealDone was already set
+function applyHandFromDeal(p, data) {
+  const pd = (data.distribution?.players || []).find(d => d.user_id === p.userId);
+  if (pd?.cards && p.hand.length === 0) {
+    p.hand = [...pd.cards];
+    refreshPanel(p);
+  }
+}
+
+// Called on every game:turn state update
+function onTurnUpdate(data) {
+  if (!data.turn) return;
+  g.currentTurnUid = data.turn.user_id;
+  g.turnEndsAt = data.turn.ends_at ? new Date(data.turn.ends_at) : null;
+  g.turnType = data.turn.type || 'normal';
+  g.turnHasPicked = data.turn.has_picked === true;
+  g.turnAttemptNo = Number(data.turn.attempt_no) || 0;
+  g.turnAttemptsLeft = Number.isFinite(Number(data.turn.attempts_left))
+    ? Number(data.turn.attempts_left)
+    : null;
+  updateDiscardTop(data.discard_top);
+  updateTurnModeBadge();
+  startTimer();
+  updateTurnBadge();
+  refreshAll();
+}
+
+// ── Board updates ──
+function updateDiscardTop(card) {
+  if (card === undefined) return;
+  g.discardTop = card;
+  document.getElementById('board-discard').innerHTML = pileCardEl(card);
+}
+
+function updateFinishCard(card) {
+  g.finishCard = card || null;
+  document.getElementById('board-finish').innerHTML = pileCardEl(card);
+}
+
+function updateClosedCount(n) {
+  if (n == null) return;
+  g.closedCount = n;
+  document.getElementById('board-closed').innerHTML =
+    `<div class="closed-vis"><span>${n}</span><span>cards</span></div>`;
+}
+
+function updateTurnBadge() {
+  const el = document.getElementById('turn-badge');
+  const uid = g.currentTurnUid;
+  if (!uid) { el.textContent = '—'; el.style.cssText = ''; return; }
+  const p = players.find(pl => pl.userId === uid);
+  el.textContent = p ? p.label : `uid:${uid}`;
+  el.style.color  = p?.color || '#94a3b8';
+  el.style.background = (p?.color || '#94a3b8') + '22';
+}
+
+function updateTurnModeBadge() {
+  const el = document.getElementById('turn-mode-badge');
+  if (!el) return;
+
+  const isBonus = g.turnType === 'bonus';
+  const mode = isBonus ? 'BONUS' : 'NORMAL';
+  const attempt = isBonus ? ` #${g.turnAttemptNo || 0}` : '';
+  const left = g.turnAttemptsLeft == null ? '' : ` (${g.turnAttemptsLeft} left)`;
+  el.textContent = `${mode}${attempt}${left}`;
+  el.style.color = isBonus ? '#fbbf24' : '#93c5fd';
+  el.style.background = isBonus ? 'rgba(251,191,36,.18)' : 'rgba(59,130,246,.18)';
+}
+
+function setPhase(phase) {
+  g.phase = phase;
+  const el = document.getElementById('phase-badge');
+  el.textContent = phase;
+  el.style.color = { active: '#86efac', pregame: '#fcd34d', declaring: '#f97316', ended: '#f87171' }[phase] || '#64748b';
+}
+
+// ── Turn countdown timer ──
+function startTimer() {
+  if (g.timerIv) clearInterval(g.timerIv);
+  const el = document.getElementById('timer-el');
+  if (!g.turnEndsAt) { el.textContent = '—'; return; }
+
+  function tick() {
+    const left = Math.max(0, Math.ceil((g.turnEndsAt - Date.now()) / 1000));
+    el.textContent = `${left}s`;
+    if (g.turnType === 'bonus') {
+      el.style.color = left <= 3 ? '#ef4444' : '#fbbf24';
+    } else {
+      el.style.color = left <= 5 ? '#ef4444' : left <= 10 ? '#f97316' : '#22c55e';
+    }
+    if (left === 0) clearInterval(g.timerIv);
+  }
+  tick();
+  g.timerIv = setInterval(tick, 500);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DECLARATION WINDOW
+// ══════════════════════════════════════════════════════════════════════════════
+function onDeclareRequested(data) {
+  // Clear any existing declare countdown
+  if (g.declIv) clearInterval(g.declIv);
+
+  g.declarerUid = data.declare_by_user_id;
+  g.declarePendingUserIds = Array.isArray(data.pending_user_ids) ? [...data.pending_user_ids] : [];
+  g.declareSubmittedUserIds = players
+    .map((player) => player.userId)
+    .filter((userId) => userId && !g.declarePendingUserIds.includes(userId));
+  g.declEndAt   = data.ends_at ? new Date(data.ends_at) : null;
+  updateFinishCard(data.finish_card || null);
+  setPhase('declaring');
+
+  document.getElementById('modal-info').textContent =
+    `Declared by uid:${data.declare_by_user_id}  •  ${data.duration_seconds}s window${data.finish_card ? `  •  finish ${data.finish_card.card_id || data.finish_card.card_uid}` : ''}`;
+
+  const grid = document.getElementById('modal-grid');
+  grid.innerHTML = '';
+
+  players.forEach(p => {
+    if (!p.userId) return;
+    const isDeclarer = p.userId === data.declare_by_user_id;
+    const cell = document.createElement('div');
+    cell.className = `mcell ${isDeclarer ? 'is-declarer' : ''}`;
+    cell.id = `mcell-${p.userId}`;
+
+    const handHTML = p.hand.map(c => cardEl(c, p.idx, {})).join('');
+
+    cell.innerHTML = `
+      <div class="mcell-hdr">
+        <div class="dot" style="background:${p.color}"></div>
+        <span>${p.label}</span>
+        ${isDeclarer ? '<span style="font-size:9px;color:#f97316;margin-left:4px">DECLARER</span>' : ''}
+        <span id="mstat-${p.userId}" style="font-size:9px;color:var(--muted);margin-left:auto">pending</span>
+      </div>
+      <div class="mcell-hand" id="mhand-${p.userId}">${handHTML}</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:6px">Submit emits <strong>player:declare:response</strong>.</div>
+      <div style="display:flex;gap:5px;margin-bottom:6px;flex-wrap:wrap;">
+        <button class="btn-yellow" onclick="autoGroupModal(${p.idx})" style="font-size:10px">AutoGroup</button>
+        <button class="btn-purple" onclick="submitDeclare(${p.idx})" id="msub-${p.userId}" style="font-size:10px">Submit Groups</button>
+      </div>
+      <div class="mcell-groups" id="mgr-${p.userId}">
+        ${buildGroupsBlock(p) || 'Run AutoGroup first, then Submit'}
+      </div>`;
+
+    grid.appendChild(cell);
+  });
+
+  // Start countdown
+  if (g.declEndAt) {
+    function tickDecl() {
+      const left = Math.max(0, Math.ceil((g.declEndAt - Date.now()) / 1000));
+      updateDeclareCountdown(left);
+      if (left === 0) {
+        clearInterval(g.declIv);
+        // Modal will auto-close when game:result arrives
+      }
+    }
+    tickDecl();
+    g.declIv = setInterval(tickDecl, 500);
+  }
+
+  document.getElementById('declare-modal').classList.add('open');
+  syncDeclareStateUI();
+  renderTableView();
+}
+
+function onDeclareState(data) {
+  g.declarePendingUserIds = Array.isArray(data.pending_user_ids) ? [...data.pending_user_ids] : [];
+  g.declareSubmittedUserIds = Array.isArray(data.submitted_user_ids) ? [...data.submitted_user_ids] : [];
+  g.declareStatePlayers = Array.isArray(data.players) ? [...data.players] : [];
+  syncDeclareStateUI();
+  renderTableView();
+}
+
+function updateDeclareCountdown(secs) {
+  const el = document.getElementById('modal-cd');
+  el.textContent = `${secs}s`;
+  el.style.color = secs <= 5 ? '#ef4444' : secs <= 10 ? '#f97316' : '#22c55e';
+}
+
+function markModalSubmitted(userId) {
+  const stat = document.getElementById(`mstat-${userId}`);
+  if (stat) { stat.textContent = 'submitted ✓'; stat.style.color = '#86efac'; }
+  const btn = document.getElementById(`msub-${userId}`);
+  if (btn) btn.disabled = true;
+  g.declarePendingUserIds = g.declarePendingUserIds.filter((id) => id !== userId);
+  if (!g.declareSubmittedUserIds.includes(userId)) {
+    g.declareSubmittedUserIds.push(userId);
+  }
+  renderTableView();
+}
+
+function onFinishUpdate(data) {
+  const finishCard = data.finish_card || null;
+  updateFinishCard(finishCard);
+
+  const declarer = players.find((player) => player.userId === data.declare_by_user_id);
+  if (declarer && finishCard?.card_uid) {
+    declarer.hand = declarer.hand.filter((card) => card.card_uid !== finishCard.card_uid);
+    declarer.selectedUid = declarer.selectedUid === finishCard.card_uid ? null : declarer.selectedUid;
+    declarer.pickedUid = declarer.pickedUid === finishCard.card_uid ? null : declarer.pickedUid;
+    refreshPanel(declarer);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// RESULT
+// ══════════════════════════════════════════════════════════════════════════════
+function onResult(data) {
+  if (g.declIv) clearInterval(g.declIv);
+  document.getElementById('declare-modal').classList.remove('open');
+  setPhase('ended');
+
+  // Reset for next game
+  g.dealDone = false;
+  g.currentTurnUid = null;
+  g.turnEndsAt = null;
+  g.turnType = 'normal';
+  g.turnHasPicked = false;
+  g.turnAttemptNo = 0;
+  g.turnAttemptsLeft = null;
+  g.finishCard = null;
+  g.declarePendingUserIds = [];
+  g.declareSubmittedUserIds = [];
+  g.declareStatePlayers = Array.isArray(data.players) ? [...data.players] : [];
+  if (g.timerIv) clearInterval(g.timerIv);
+  document.getElementById('timer-el').textContent = '—';
+  document.getElementById('turn-badge').textContent = '—';
+  document.getElementById('turn-mode-badge').textContent = '—';
+  updateFinishCard(null);
+  renderTableView();
+
+  const settlement = data.settlement || null;   // { point_value, winner_gain, per_player: [{user_id, amount, is_winner}] }
+  const pointValue = settlement?.point_value || 0;
+
+  const rows = (data.results || []).map(r => {
+    const p = players.find(pl => pl.userId === r.user_id);
+    const isWinner = r.user_id === data.winner_user_id;
+    const color = p?.color || '#94a3b8';
+
+    // Monetary amount from settlement if present
+    const settlEntry = settlement?.per_player?.find(sp => sp.user_id === r.user_id);
+    const amountRaw  = settlEntry?.amount ?? null;
+    const amountHtml = amountRaw !== null
+      ? `<div style="font-size:13px;font-weight:700;color:${amountRaw >= 0 ? '#86efac' : '#f87171'}">
+           ${amountRaw >= 0 ? '+' : ''}₹${Math.abs(amountRaw).toFixed(2)}
+         </div>`
+      : '';
+
+    return `
+      <div class="res-row ${isWinner ? 'winner' : ''}">
+        <div style="display:flex;align-items:center;gap:8px">
+          <div class="dot" style="background:${color}"></div>
+          <span>${p?.label || `uid:${r.user_id}`}</span>
+          ${isWinner ? '<span style="color:#86efac;font-weight:700">🏆 WINNER</span>' : ''}
+        </div>
+        <div style="text-align:right">
+          <div class="pts" style="color:${isWinner ? '#86efac' : '#f87171'}">${r.points} pts</div>
+          ${amountHtml}
+          <div style="font-size:9px;color:var(--muted)">${r.submission_mode || 'auto'}</div>
+        </div>
+      </div>`;
+  }).join('');
+
+  let extra = '';
+  if (pointValue > 0) {
+    extra += `<div style="font-size:11px;color:var(--muted);margin-top:10px;text-align:center">₹${pointValue}/pt  •  winner earns sum of opponents' losses</div>`;
+  }
+  if (data.tie_break_policy) {
+    extra += `<div style="font-size:10px;color:var(--muted);margin-top:4px;text-align:center">Tie-break: ${data.tie_break_policy}</div>`;
+  }
+  if (!data.declare_valid) {
+    extra += `<div style="font-size:10px;color:#f97316;margin-top:4px;text-align:center">⚠ Declarer's hand was invalid — 80pt penalty applied</div>`;
+  }
+
+  document.getElementById('result-content').innerHTML =
+    (rows || '<p style="color:var(--muted)">No result data</p>') + extra;
+
+  document.getElementById('result-overlay').classList.add('open');
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LOGGING
+// ══════════════════════════════════════════════════════════════════════════════
+function log(p, event, data) {
+  logCount++;
+  document.getElementById('log-count').textContent = `${logCount} events`;
+  const panel = document.getElementById('log-panel');
+  const entry = document.createElement('div');
+  entry.className = 'le';
+  const ts = new Date().toISOString().substring(11, 23);
+  const d  = typeof data === 'object' ? JSON.stringify(data) : String(data);
+  entry.innerHTML =
+    `<span class="ts">[${ts}]</span> ` +
+    `<span style="font-weight:700;color:${p.color}">${p.label}</span> ` +
+    `<span class="ev">${event}</span> ` +
+    `<span class="dat">${d}</span>`;
+  panel.appendChild(entry);
+  if (panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 40) {
+    panel.scrollTop = panel.scrollHeight;
+  }
+}
+
+function emitWithTrace(player, eventName, payload, onAck) {
+  rawLog('emit', player, eventName, payload);
+  player.socket.emit(eventName, payload, (ack) => {
+    rawLog('ack', player, `${eventName}:ack`, ack);
+    onAck?.(ack || {});
+  });
+}
+
+function rawLog(kind, p, event, data) {
+  rawCount++;
+  document.getElementById('raw-count').textContent = `${rawCount} packets`;
+  const panel = document.getElementById('raw-panel');
+  const entry = document.createElement('div');
+  entry.className = 'le';
+  const ts = new Date().toISOString().substring(11, 23);
+  const pretty = JSON.stringify(data ?? null, null, 2);
+  entry.innerHTML =
+    `<span class="ts">[${ts}]</span> ` +
+    `<span style="font-weight:700;color:${p.color}">${p.label}</span> ` +
+    `<span class="kind ${kind}">${kind.toUpperCase()}</span> ` +
+    `<span class="ev">${event}</span>` +
+    `<div class="dat pretty">${escapeHtml(pretty)}</div>`;
+  panel.appendChild(entry);
+  if (panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 60) {
+    panel.scrollTop = panel.scrollHeight;
+  }
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WIRE BUTTONS
+// ══════════════════════════════════════════════════════════════════════════════
+document.getElementById('connectAllBtn').onclick    = connectAll;
+document.getElementById('disconnectAllBtn').onclick = disconnectAll;
+document.getElementById('joinAllBtn').onclick       = joinAll;
+document.getElementById('readyAllBtn').onclick      = readyAll;
+document.getElementById('addPlayerBtn').onclick     = addPlayer;
+document.getElementById('clearLogBtn').onclick      = () => {
+  document.getElementById('log-panel').innerHTML = '';
+  document.getElementById('raw-panel').innerHTML = '';
+  logCount = 0;
+  rawCount = 0;
+  document.getElementById('log-count').textContent = '0 events';
+  document.getElementById('raw-count').textContent = '0 packets';
+};
+document.getElementById('closeResultBtn').onclick = () =>
+  document.getElementById('result-overlay').classList.remove('open');
+document.getElementById('log-bar').onclick = () => {
+  const lp = document.getElementById('log-panel');
+  lp.style.display = lp.style.display === 'none' ? '' : 'none';
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BOOT — start with 6 players
+// ══════════════════════════════════════════════════════════════════════════════
+for (let i = 0; i < MAX_P; i += 1) addPlayer();
+</script>
+</body>
+</html>

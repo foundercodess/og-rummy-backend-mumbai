@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: og-rummy-api
+  namespace: og-rummy
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: og-rummy-api

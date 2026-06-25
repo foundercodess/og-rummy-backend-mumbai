@@ -1,0 +1,2 @@
+UPDATE support_links SET image_url = 'https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/social_support/whatsapp.png' WHERE key = 'whatsapp';
+UPDATE support_links SET image_url = 'https://og-rummy-assets-515105386762-us-east-1-an.s3.amazonaws.com/social_support/telegram.webp' WHERE key = 'telegram';
