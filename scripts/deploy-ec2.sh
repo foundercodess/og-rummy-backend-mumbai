@@ -76,7 +76,7 @@ IMAGE_NAME="${IMAGE_NAME:-og-rummy-backend:latest}"
 APP_PORT="${APP_PORT:-80}"
 CONTAINER_PORT="${CONTAINER_PORT:-3000}"  # Not used with host networking, but kept for reference
 HEALTHCHECK_URL="${HEALTHCHECK_URL:-http://localhost:80/health}"  # Use port 80 now
-HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-18}"
+HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-40}"
 HEALTHCHECK_INTERVAL="${HEALTHCHECK_INTERVAL:-5}"
 
 # Required variables (add any others you need)
