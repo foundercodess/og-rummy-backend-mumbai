@@ -115,6 +115,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Debug SSH config
+        run: |
+          echo "USER:"
+          echo "${{ secrets.EC2_USER }}"
+
+          echo "HOST:"
+          echo "${{ secrets.EC2_HOST }}"
+
+          echo "KEY LENGTH:"
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" | wc -c
+
       - name: Copy application to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
