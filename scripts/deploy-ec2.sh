@@ -34,6 +34,12 @@ AWS_S3_BASE_URL=${AWS_S3_BASE_URL}
 ${REDIS_URL:+REDIS_URL=${REDIS_URL}}
 EOF
 
+if [ -n "${REDIS_URL:-}" ]; then
+  echo "REDIS_URL configured for deploy"
+else
+  echo "WARN: REDIS_URL not set — health check will report redis not configured"
+fi
+
 docker rm -f "$APP_NAME" >/dev/null 2>&1 || true
 docker build -t "$IMAGE_NAME" .
 docker run -d \

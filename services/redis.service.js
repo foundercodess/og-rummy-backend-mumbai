@@ -6,15 +6,24 @@ let adapterPubClient = null;
 let adapterSubClient = null;
 let adapterConnectPromise = null;
 
+function isTlsRedisUrl(url) {
+  return typeof url === 'string' && url.startsWith('rediss://');
+}
+
 function getRedisClient() {
   if (redis) return redis;
   if (!process.env.REDIS_URL) return null;
 
-  redis = new Redis(process.env.REDIS_URL, {
+  const options = {
     lazyConnect: true,
     maxRetriesPerRequest: 1,
     enableReadyCheck: true,
-  });
+  };
+  if (isTlsRedisUrl(process.env.REDIS_URL)) {
+    options.tls = {};
+  }
+
+  redis = new Redis(process.env.REDIS_URL, options);
 
   redis.on('error', (err) => {
     console.error('Redis error:', err.message);
@@ -54,7 +63,12 @@ async function getSocketAdapterRedisClients() {
     return adapterConnectPromise;
   }
 
-  adapterPubClient = createClient({ url: process.env.REDIS_URL });
+  adapterPubClient = createClient({
+    url: process.env.REDIS_URL,
+    ...(isTlsRedisUrl(process.env.REDIS_URL)
+      ? { socket: { tls: true, rejectUnauthorized: false } }
+      : {}),
+  });
   adapterSubClient = adapterPubClient.duplicate();
 
   adapterPubClient.on('error', (err) => {
