@@ -79,6 +79,9 @@ async function getSocketAdapterRedisClients() {
     console.error('Redis adapter sub client error:', err.message);
   });
 
+
+  
+
   adapterConnectPromise = (async () => {
     try {
       await Promise.all([adapterPubClient.connect(), adapterSubClient.connect()]);
