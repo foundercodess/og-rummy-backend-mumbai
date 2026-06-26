@@ -75,7 +75,6 @@ async function getSocketAdapterRedisClients() {
     console.error('Redis adapter pub client error:', err.message);
   });
 
-  
   adapterSubClient.on('error', (err) => {
     console.error('Redis adapter sub client error:', err.message);
   });
