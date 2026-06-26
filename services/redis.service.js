@@ -95,6 +95,8 @@ async function getSocketAdapterRedisClients() {
   return adapterConnectPromise;
 }
 
+
+
 module.exports = {
   getRedisClient,
   ensureRedisConnection,
