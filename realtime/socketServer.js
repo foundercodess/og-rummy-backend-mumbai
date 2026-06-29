@@ -788,6 +788,417 @@ function normalizePoolScoresByUser(metadata = {}) {
   return normalized;
 }
 
+function buildPoolRoundHistoryEntry(roundProgress = {}, payload = {}) {
+  const roundNo = Math.max(1, Number(roundProgress?.currentRoundNo) || 1);
+  const results = Array.isArray(payload?.results) ? payload.results : [];
+  const scoresByUser = {};
+  const enrichedResults = results.map((result) => {
+    const userId = Number(result?.user_id);
+    const roundPoints = Math.max(0, Number(result?.round_points ?? result?.points) || 0);
+    if (!Number.isNaN(userId)) {
+      scoresByUser[String(userId)] = roundPoints;
+    }
+    const cumulativeRaw = roundProgress?.scoresByUser?.[String(userId)];
+    const cumulativeTotal = Number.isFinite(Number(cumulativeRaw))
+      ? Number(cumulativeRaw)
+      : roundPoints;
+    return {
+      user_id: userId,
+      round_points: roundPoints,
+      cumulative_total: cumulativeTotal,
+    };
+  });
+
+  return {
+    round_no: roundNo,
+    winner_user_id: payload?.winner_user_id ?? null,
+    scores_by_user: scoresByUser,
+    cumulative_by_user: { ...(roundProgress?.scoresByUser || {}) },
+    results: enrichedResults,
+    completed_at: payload?.server_time || new Date().toISOString(),
+  };
+}
+
+function appendPoolRoundHistory(existingHistory = [], entry = null) {
+  if (!entry || !Number.isFinite(Number(entry.round_no))) {
+    return Array.isArray(existingHistory) ? existingHistory : [];
+  }
+  const history = Array.isArray(existingHistory) ? [...existingHistory] : [];
+  const roundNo = Math.floor(Number(entry.round_no));
+  const existingIndex = history.findIndex((row) => Number(row?.round_no) === roundNo);
+  if (existingIndex >= 0) {
+    history[existingIndex] = entry;
+  } else {
+    history.push(entry);
+  }
+  return history.sort((a, b) => (Number(a?.round_no) || 0) - (Number(b?.round_no) || 0));
+}
+
+function mergePoolRoundHistoryIntoMetadata(sessionMetadata = {}, roundProgress = {}, payload = {}) {
+  const entry = buildPoolRoundHistoryEntry(roundProgress, payload);
+  return appendPoolRoundHistory(sessionMetadata?.pool_round_history, entry);
+}
+
+function normalizePoolRoundHistory(metadata = {}) {
+  const raw = Array.isArray(metadata?.pool_round_history) ? metadata.pool_round_history : [];
+  return raw
+    .map((entry) => {
+      const roundNo = Number(entry?.round_no);
+      if (!Number.isFinite(roundNo) || roundNo < 1) return null;
+      return {
+        round_no: Math.floor(roundNo),
+        winner_user_id: entry?.winner_user_id ?? null,
+        scores_by_user: entry?.scores_by_user || {},
+        cumulative_by_user: entry?.cumulative_by_user || {},
+        results: Array.isArray(entry?.results) ? entry.results : [],
+        completed_at: entry?.completed_at || null,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.round_no - b.round_no);
+}
+
+function buildScoreboardPlayers(session = {}) {
+  return (Array.isArray(session?.players) ? session.players : [])
+    .slice()
+    .sort((a, b) => (Number(a?.seat_no) || 0) - (Number(b?.seat_no) || 0))
+    .map((player) => ({
+      user_id: player.user_id,
+      name: player.name || player.view_id || `Player ${player.seat_no || ''}`.trim(),
+      view_id: player.view_id || null,
+      seat_no: player.seat_no,
+      avatar: player.avatar || null,
+      status: player.status || null,
+      is_eliminated: ['eliminated', 'left'].includes(String(player?.status || '').toLowerCase()),
+    }));
+}
+
+function normalizeWildJokerCardId(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    return trimmed || null;
+  }
+  if (typeof raw === 'object') {
+    if (raw.card_id) {
+      const cardId = String(raw.card_id).trim();
+      if (cardId) return cardId;
+    }
+    if (raw.cardId) {
+      const cardId = String(raw.cardId).trim();
+      if (cardId) return cardId;
+    }
+    const rank = raw.rank != null ? String(raw.rank) : null;
+    const suit = raw.suit != null ? String(raw.suit) : null;
+    if (suit && rank) {
+      return `${suit[0].toUpperCase()}${rank}`;
+    }
+  }
+  return null;
+}
+
+function resolveWildJokerCardId(session = {}) {
+  const distribution = session?.metadata?.distribution || {};
+  return normalizeWildJokerCardId(distribution.wild_joker_card_id)
+    || normalizeWildJokerCardId(distribution.wild_joker)
+    || normalizeWildJokerCardId(distribution.wildJokerCardId)
+    || null;
+}
+
+function enrichLastDealScoreEntry(dealScores = [], enrichments = {}) {
+  if (!Array.isArray(dealScores) || dealScores.length === 0) return dealScores;
+  const next = [...dealScores];
+  const lastIndex = next.length - 1;
+  next[lastIndex] = {
+    ...next[lastIndex],
+    ...enrichments,
+  };
+  return next;
+}
+
+function enrichLastPoolRoundHistoryEntry(history = [], enrichments = {}) {
+  if (!Array.isArray(history) || history.length === 0) return history;
+  const next = [...history];
+  const lastIndex = next.length - 1;
+  next[lastIndex] = {
+    ...next[lastIndex],
+    ...enrichments,
+  };
+  return next;
+}
+
+function buildLastDealResultPayload(session = {}, enrichedDealScores = []) {
+  if (!Array.isArray(enrichedDealScores) || enrichedDealScores.length === 0) {
+    return null;
+  }
+
+  const lastDeal = enrichedDealScores[enrichedDealScores.length - 1];
+  const metadata = session.metadata || {};
+  const metaResult = metadata.result || {};
+  const dealNo = Number(lastDeal.deal_no);
+  if (!Number.isFinite(dealNo) || dealNo < 1) return null;
+
+  let players = Array.isArray(lastDeal.players) ? lastDeal.players : null;
+  let wildJokerCardId = lastDeal.wild_joker_card_id || null;
+
+  if ((!players || players.length === 0) && Number(metaResult.deal_no) === dealNo) {
+    players = Array.isArray(metaResult.players) ? metaResult.players : null;
+    wildJokerCardId = wildJokerCardId
+      || metaResult.wild_joker_card_id
+      || resolveWildJokerCardId(session);
+  }
+
+  if (!players || players.length === 0) {
+    players = buildDeclarationTablePlayers({
+      session,
+      distribution: metadata.distribution || null,
+      state: {
+        responses: new Map(),
+        declareByUserId: lastDeal.declare_by_user_id || null,
+      },
+      isFinal: true,
+      finalizedResults: lastDeal.results || [],
+      settlement: null,
+      winnerUserId: lastDeal.winner_user_id,
+      declarerValid: lastDeal.declare_valid ?? null,
+    });
+  }
+
+  return {
+    session_id: session.id,
+    session_code: session.session_code || null,
+    server_time: new Date().toISOString(),
+    status: 'completed',
+    is_final: false,
+    deal_no: dealNo,
+    total_deals: resolveTotalDeals(session),
+    winner_user_id: lastDeal.winner_user_id ?? null,
+    declare_by_user_id: lastDeal.declare_by_user_id ?? null,
+    declare_valid: lastDeal.declare_valid ?? null,
+    finish_card: lastDeal.finish_card ?? null,
+    reason: lastDeal.reason ?? null,
+    score_model: lastDeal.score_model || 'deal_base_plus_minus',
+    wild_joker_card_id: normalizeWildJokerCardId(wildJokerCardId)
+      || resolveWildJokerCardId(session),
+    players,
+    pending_count: 0,
+  };
+}
+
+function buildLastPoolRoundResultPayload(session = {}) {
+  const metadata = session.metadata || {};
+  const metaResult = metadata.result || {};
+  const history = normalizePoolRoundHistory(metadata);
+  const lastHistory = history.length > 0 ? history[history.length - 1] : null;
+  const resultRoundNo = Number(metaResult.pool_round_no);
+  const historyRoundNo = Number(lastHistory?.round_no);
+  const roundNo = Number.isFinite(historyRoundNo) && historyRoundNo >= 1
+    ? historyRoundNo
+    : (Number.isFinite(resultRoundNo) && resultRoundNo >= 1 ? resultRoundNo : null);
+
+  let players = Array.isArray(lastHistory?.players) ? lastHistory.players : null;
+  let wildJokerCardId = lastHistory?.wild_joker_card_id || null;
+  let winnerUserId = lastHistory?.winner_user_id ?? null;
+  let finalizedResults = Array.isArray(lastHistory?.results) ? lastHistory.results : [];
+
+  const metaHasRoundResult = ['round_completed', 'completed'].includes(
+    String(metaResult?.status || '').toLowerCase()
+  ) || metaResult?.is_final === true;
+
+  if (
+    metaHasRoundResult
+    && Array.isArray(metaResult.players)
+    && metaResult.players.length > 0
+    && (!roundNo || !Number.isFinite(resultRoundNo) || resultRoundNo === roundNo)
+  ) {
+    players = metaResult.players;
+    wildJokerCardId = metaResult.wild_joker_card_id || wildJokerCardId || resolveWildJokerCardId(session);
+    winnerUserId = metaResult.winner_user_id ?? winnerUserId;
+    finalizedResults = Array.isArray(metaResult.results) ? metaResult.results : finalizedResults;
+  }
+
+  if ((!players || players.length === 0) && finalizedResults.length > 0) {
+    players = buildDeclarationTablePlayers({
+      session,
+      distribution: metadata.distribution || null,
+      state: {
+        responses: new Map(),
+        declareByUserId: metaResult.declare_by_user_id || null,
+      },
+      isFinal: true,
+      finalizedResults,
+      settlement: null,
+      winnerUserId,
+      declarerValid: metaResult.declare_valid ?? null,
+    });
+  }
+
+  if (!players || players.length === 0 || !roundNo) return null;
+
+  return {
+    session_id: session.id,
+    session_code: session.session_code || null,
+    server_time: new Date().toISOString(),
+    status: 'completed',
+    is_final: false,
+    deal_no: roundNo,
+    pool_round_no: roundNo,
+    winner_user_id: winnerUserId,
+    declare_by_user_id: metaResult.declare_by_user_id ?? null,
+    declare_valid: metaResult.declare_valid ?? null,
+    finish_card: metaResult.finish_card ?? null,
+    reason: metaResult.reason ?? lastHistory?.reason ?? null,
+    score_model: 'pool_loss_cumulative',
+    wild_joker_card_id: normalizeWildJokerCardId(wildJokerCardId)
+      || resolveWildJokerCardId(session),
+    players,
+    pending_count: 0,
+  };
+}
+
+function buildLastResultFromSessionResult(session = {}, metaResult = {}, mode = 'points') {
+  const players = Array.isArray(metaResult?.players) ? metaResult.players : null;
+  if (!players || players.length === 0) return null;
+
+  const status = String(metaResult?.status || '').toLowerCase();
+  const hasCompletedResult = ['deal_completed', 'round_completed', 'completed'].includes(status)
+    || metaResult?.is_final === true;
+  if (!hasCompletedResult) return null;
+
+  const dealNo = Number(metaResult.deal_no);
+  const poolRoundNo = Number(metaResult.pool_round_no);
+  const roundNo = Number.isFinite(dealNo) && dealNo >= 1
+    ? dealNo
+    : (Number.isFinite(poolRoundNo) && poolRoundNo >= 1 ? poolRoundNo : null);
+
+  return {
+    session_id: session.id,
+    session_code: session.session_code || null,
+    server_time: metaResult.server_time || new Date().toISOString(),
+    status: 'completed',
+    is_final: false,
+    deal_no: roundNo,
+    pool_round_no: mode === 'pool' ? roundNo : null,
+    total_deals: isDealLikeMode(mode) ? resolveTotalDeals(session) : null,
+    winner_user_id: metaResult.winner_user_id ?? null,
+    declare_by_user_id: metaResult.declare_by_user_id ?? null,
+    declare_valid: metaResult.declare_valid ?? null,
+    finish_card: metaResult.finish_card ?? null,
+    reason: metaResult.reason ?? null,
+    score_model: metaResult.score_model
+      || (mode === 'pool' ? 'pool_loss_cumulative' : 'deal_base_plus_minus'),
+    wild_joker_card_id: normalizeWildJokerCardId(metaResult.wild_joker_card_id)
+      || resolveWildJokerCardId(session),
+    players,
+    pending_count: 0,
+  };
+}
+
+function buildLastRoundResultPayload(session = {}) {
+  const mode = resolveSessionGameMode(session);
+  const metadata = session.metadata || {};
+  const metaResult = metadata.result || {};
+
+  const fromSessionResult = buildLastResultFromSessionResult(session, metaResult, mode);
+  if (fromSessionResult) return fromSessionResult;
+
+  if (isDealLikeMode(mode)) {
+    const rawDealScores = normalizeDealScoreHistory(metadata);
+    const { enrichedDealScores } = computeDealScoreboardTimeline(session, rawDealScores);
+    return buildLastDealResultPayload(session, enrichedDealScores);
+  }
+
+  if (mode === 'pool') {
+    return buildLastPoolRoundResultPayload(session);
+  }
+
+  return null;
+}
+
+function buildScoreboardPayload(session = {}) {
+  const mode = resolveSessionGameMode(session);
+  const players = buildScoreboardPlayers(session);
+
+  const base = {
+    session_id: session.id,
+    session_code: session.session_code || null,
+    game_mode: mode,
+    game_name: session?.game?.name || null,
+    server_time: new Date().toISOString(),
+    players,
+  };
+
+  if (isDealLikeMode(mode)) {
+    const totalDeals = resolveTotalDeals(session);
+    const currentDeal = resolveCurrentDeal(session);
+    const rawDealScores = normalizeDealScoreHistory(session.metadata || {});
+    const {
+      dealBaseScore,
+      scoreTotalsByUser,
+      enrichedDealScores,
+    } = computeDealScoreboardTimeline(session, rawDealScores);
+
+    const rows = enrichedDealScores.map((deal) => ({
+      row_no: deal.deal_no,
+      label: mode === 'spin_go' ? 'Game' : `Deal ${deal.deal_no}`,
+      winner_user_id: deal.winner_user_id ?? null,
+      scores_by_user: Object.fromEntries(
+        (deal.results || []).map((result) => [
+          String(result.user_id),
+          Math.max(0, Number(result.round_points ?? result.points) || 0),
+        ])
+      ),
+      cumulative_by_user: deal.total_scores_by_user || {},
+      results: deal.results || [],
+    }));
+
+    return {
+      ...base,
+      scoreboard_type: 'deals',
+      current_deal: currentDeal,
+      total_deals: totalDeals,
+      deal_base_score: dealBaseScore,
+      rows,
+      cumulative_scores_by_user: scoreTotalsByUser,
+      placeholder_rows: Math.max(0, totalDeals - rows.length),
+      last_deal_result: buildLastRoundResultPayload(session),
+    };
+  }
+
+  if (mode === 'pool') {
+    const poolLimit = resolvePoolLimit(session);
+    const cumulative = normalizePoolScoresByUser(session.metadata || {});
+    const history = normalizePoolRoundHistory(session.metadata || {});
+
+    return {
+      ...base,
+      scoreboard_type: 'pool',
+      pool_limit: poolLimit,
+      current_round: Math.max(1, Number(session.metadata?.pool_round_no) || 1),
+      rows: history.map((row) => ({
+        row_no: row.round_no,
+        label: `Round ${row.round_no}`,
+        winner_user_id: row.winner_user_id,
+        scores_by_user: row.scores_by_user,
+        cumulative_by_user: row.cumulative_by_user,
+        results: row.results,
+      })),
+      cumulative_scores_by_user: cumulative,
+      eliminated_user_ids: session.metadata?.pool_eliminated_user_ids || [],
+      placeholder_rows: 0,
+      last_deal_result: buildLastRoundResultPayload(session),
+    };
+  }
+
+  return {
+    ...base,
+    scoreboard_type: 'unsupported',
+    rows: [],
+    cumulative_scores_by_user: {},
+    placeholder_rows: 0,
+  };
+}
+
 function buildPoolRoundProgress(session = {}, roundResults = []) {
   const poolLimit = resolvePoolLimit(session);
   const scoresByUser = normalizePoolScoresByUser(session?.metadata || {});
@@ -1300,6 +1711,16 @@ async function transitionToNextDeal(io, session, snapshot) {
     declarerValid: snapshot.declare_valid ?? null,
   });
 
+  const dealScoresWithDetails = enrichLastDealScoreEntry(dealScores, {
+    players: payload.players,
+    wild_joker_card_id: resolveWildJokerCardId(session),
+    finish_card: snapshot.finish_card || null,
+    declare_by_user_id: snapshot.declare_by_user_id,
+    declare_valid: snapshot.declare_valid,
+    reason: snapshot.reason,
+  });
+
+  nextMetadata.deal_scores = dealScoresWithDetails;
   nextMetadata.result = payload;
   await gameSessionModel.updateSessionStatus(sessionId, 'ready', {
     endedAt: null,
@@ -1423,13 +1844,14 @@ function buildTurnPayload({
   endsAt,
   turnTimerSeconds,
   hasPicked = false,
+  pickedCardUid = null,
 }) {
   const maxBonusAttempts = getMaxBonusAttempts(session);
   const safeAttemptNo = Math.max(0, Number(attemptNo) || 0);
   const safeAttemptsUsedCount = Math.max(0, Number(attemptsUsedCount) || 0);
   const attemptsLeft = Math.max(0, maxBonusAttempts - safeAttemptsUsedCount);
 
-  return {
+  const payload = {
     turn_id: Number(turnId) || Date.now(),
     user_id: userId,
     started_at: startedAt,
@@ -1441,6 +1863,11 @@ function buildTurnPayload({
     attempts_left: attemptsLeft,
     has_picked: hasPicked === true,
   };
+  if (hasPicked === true && pickedCardUid != null) {
+    const uid = String(pickedCardUid).trim();
+    if (uid) payload.picked_card_uid = uid;
+  }
+  return payload;
 }
 
 function emitTurn(io, sessionId, turn, extras = {}) {
@@ -4509,6 +4936,17 @@ async function transitionToNextPoolRound(io, session, payload, roundProgress) {
     });
   }));
 
+  const poolRoundHistory = mergePoolRoundHistoryIntoMetadata(
+    session.metadata || {},
+    roundProgress,
+    payload
+  );
+  const poolRoundHistoryWithPlayers = enrichLastPoolRoundHistoryEntry(poolRoundHistory, {
+    players: Array.isArray(payload?.players) ? payload.players : null,
+    wild_joker_card_id: resolveWildJokerCardId(session),
+    reason: payload?.reason ?? null,
+  });
+
   const nextMetadata = {
     ...(session.metadata || {}),
     phase: 'inter_deal',
@@ -4517,6 +4955,7 @@ async function transitionToNextPoolRound(io, session, payload, roundProgress) {
     pool_round_no: roundProgress.nextRoundNo,
     pool_scores_by_user: roundProgress.scoresByUser,
     pool_eliminated_user_ids: roundProgress.eliminatedUserIds,
+    pool_round_history: poolRoundHistoryWithPlayers,
     result: payload,
   };
 
@@ -6676,6 +7115,17 @@ async function finalizeGameByElimination(
     winnerUserId,
   });
 
+  if (completeDealScores) {
+    completeDealScores = enrichLastDealScoreEntry(completeDealScores, {
+      players: resultPayload.players,
+      wild_joker_card_id: resolveWildJokerCardId(session),
+      finish_card: dealSnapshot.finish_card || null,
+      declare_by_user_id: dealSnapshot.declare_by_user_id,
+      declare_valid: dealSnapshot.declare_valid,
+      reason,
+    });
+  }
+
   const nextMetadata = {
     ...(session.metadata || {}),
     phase: 'finished',
@@ -6778,10 +7228,10 @@ async function onTurnTimeout(io, sessionId, expectedTurnId) {
 
   const canStartBonusTurn = (turn.type || 'normal') !== 'bonus' && currentAttemptUsed < maxBonusAttempts;
 
-  // If the user has already picked a card but not discarded, do NOT start a bonus turn; auto-discard instead
-  if (canStartBonusTurn && turn.has_picked !== true) {
+  if (canStartBonusTurn) {
     const nextAttemptNo = currentAttemptUsed + 1;
     const bonusTurnWindow = buildTurnWindow(bonusTimerSeconds);
+    const keepPickedState = turn.has_picked === true;
     const nextTurn = buildTurnPayload({
       session,
       userId: currentUserId,
@@ -6792,7 +7242,8 @@ async function onTurnTimeout(io, sessionId, expectedTurnId) {
       startedAt: bonusTurnWindow.startedAt,
       endsAt: bonusTurnWindow.endsAt,
       turnTimerSeconds: bonusTimerSeconds,
-      hasPicked: false,
+      hasPicked: keepPickedState,
+      pickedCardUid: keepPickedState ? turn.picked_card_uid : null,
     });
 
     const nextMetadata = {
@@ -7971,6 +8422,12 @@ function registerSocketServer(httpServer) {
           declarerValid,
         });
 
+        const poolRoundHistory = mergePoolRoundHistoryIntoMetadata(
+          session.metadata || {},
+          poolProgress,
+          resultPayload
+        );
+
         const nextMetadata = {
           ...(session.metadata || {}),
           phase: 'finished',
@@ -7979,6 +8436,7 @@ function registerSocketServer(httpServer) {
           pool_round_no: poolProgress.currentRoundNo,
           pool_scores_by_user: poolProgress.scoresByUser,
           pool_eliminated_user_ids: poolProgress.eliminatedUserIds,
+          pool_round_history: poolRoundHistory,
           declaration: {
             ...(session.metadata?.declaration || {}),
             sequence: state.sequence,
@@ -8097,6 +8555,17 @@ function registerSocketServer(httpServer) {
         winnerUserId,
         declarerValid,
       });
+
+      if (completeDealScores) {
+        completeDealScores = enrichLastDealScoreEntry(completeDealScores, {
+          players: resultPayload.players,
+          wild_joker_card_id: resolveWildJokerCardId(session),
+          finish_card: finishCard,
+          declare_by_user_id: declarerUserId,
+          declare_valid: declarerValid,
+          reason,
+        });
+      }
 
       const nextMetadata = {
         ...(session.metadata || {}),
@@ -8689,6 +9158,36 @@ function registerSocketServer(httpServer) {
       try {
         const response = await emitPendingRejoinGame(socket, 'request');
         callback({ success: true, ...response });
+      } catch (err) {
+        callback({ success: false, message: err.message });
+      }
+    });
+
+    socket.on('scoreboard:get', async (payload = {}, callback = () => { }) => {
+      try {
+        const sessionRef = payload.session_id || payload.session_code;
+        if (!sessionRef) {
+          throw new Error('session_id is required');
+        }
+
+        const numericSessionId = Number(sessionRef);
+        const lookupSessionRef = Number.isNaN(numericSessionId) ? sessionRef : numericSessionId;
+        const session = await gameplayService.getSessionState(lookupSessionRef);
+        if (!session) {
+          throw new Error('Session not found');
+        }
+
+        const isMember = (session.players || []).some(
+          (player) => Number(player.user_id) === Number(socket.user.id)
+        );
+        if (!isMember) {
+          throw new Error('Not a session member');
+        }
+
+        callback({
+          success: true,
+          scoreboard: buildScoreboardPayload(session),
+        });
       } catch (err) {
         callback({ success: false, message: err.message });
       }
