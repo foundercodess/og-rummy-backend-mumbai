@@ -4996,7 +4996,8 @@ async function transitionToNextPoolRound(io, session, payload, roundProgress) {
     .filter((id) => !previousEliminatedSet.has(id));
   await Promise.all(
     newlyEliminatedUserIds.map(async (uid) => {
-      schedulePoolEliminationDetachAfterNextDealStart(io, sessionId, uid, 'pool_round_eliminated');
+      detachUserFromSessionRoom(io, sessionId, uid);
+      logGame(sessionId, `Detached eliminated uid=${uid} after pool round (${'pool_round_eliminated'})`);
       await emitPendingRejoinGameForUser(io, uid, 'pool_round_eliminated');
     })
   );
@@ -5181,10 +5182,6 @@ function resolveLivePlayerStatus(session, player, reason = null) {
     return 'timeout';
   }
 
-  if (player?.player_status) {
-    return player.player_status;
-  }
-
   if (
     player?.metadata?.is_dropped === true
     || player?.metadata?.drop_status === 'dropped'
@@ -5194,8 +5191,19 @@ function resolveLivePlayerStatus(session, player, reason = null) {
     return 'dropped';
   }
 
-  if (eliminatedSet.has(userId) || player?.status === 'eliminated') {
+  if (
+    eliminatedSet.has(userId)
+    || player?.status === 'eliminated'
+    || player?.metadata?.elimination_reason === 'pool_limit'
+  ) {
     return 'eliminated';
+  }
+
+  if (player?.player_status
+    && player.player_status !== 'disconnected'
+    && player.player_status !== 'connected'
+    && player.player_status !== 'joined') {
+    return player.player_status;
   }
 
   if (player?.status === 'disconnected' || player?.metadata?.connection_status === 'disconnected') {
@@ -5281,6 +5289,43 @@ async function setPlayerConnectionState(io, sessionId, userId, isConnected, reas
     return { session: await gameplayService.getSessionState(sessionId), changed: false, playerFound: false };
   }
 
+  const sessionForPresence = await gameplayService.getSessionState(sessionId);
+  const eliminatedSet = getEliminatedUserIdSet(sessionForPresence?.metadata || {});
+  const isPoolEliminated = eliminatedSet.has(Number(userId)) || player.status === 'eliminated';
+  if (isPoolEliminated) {
+    const timestamp = new Date().toISOString();
+    const nextMetadata = {
+      ...(player.metadata || {}),
+      connection_status: isConnected ? 'connected' : 'disconnected',
+      is_connected: isConnected,
+      last_presence_reason: reason,
+      last_presence_updated_at: timestamp,
+      ...(isConnected ? { connected_at: timestamp } : { disconnected_at: timestamp }),
+    };
+    const metadataChanged = player.metadata?.connection_status !== nextMetadata.connection_status
+      || player.metadata?.is_connected !== isConnected;
+    if (metadataChanged) {
+      await gameSessionModel.updatePlayerState(sessionId, userId, {
+        status: 'eliminated',
+        metadata: nextMetadata,
+      });
+    }
+    const session = await gameplayService.getSessionState(sessionId);
+    if (metadataChanged && session) {
+      emitPlayerStatusOverride(io, session, (session.players || []).find(
+        (item) => Number(item.user_id) === Number(userId)
+      ) || player, {
+        status: 'eliminated',
+        player_status: 'eliminated',
+        connection_status: nextMetadata.connection_status,
+        metadata: nextMetadata,
+        content_message: 'You reached the pool threshold and are eliminated.',
+        action_message: 'Please wait for game completion or use rejoin option if available.',
+      }, reason);
+    }
+    return { session, changed: metadataChanged, playerFound: true };
+  }
+
   const nextConnectionStatus = isConnected ? 'connected' : 'disconnected';
   const currentConnectionStatus = player.status === 'disconnected'
     || player.metadata?.connection_status === 'disconnected'
@@ -5343,14 +5388,39 @@ async function setPlayerConnectionState(io, sessionId, userId, isConnected, reas
 }
 
 function buildPhaseSyncPlayers(session) {
-  return (session?.players || []).map((player) => ({
-    user_id: player.user_id,
-    seat_no: player.seat_no,
-    name: player.name,
-    avatar: player.avatar,
-    total_score: resolvePlayerTotalScore(session, player.user_id),
-    metadata: player.metadata || {},
-  }));
+  return (session?.players || []).map((player) => {
+    const playerStatus = resolveLivePlayerStatus(session, player);
+    const connectionStatus = player.connection_status
+      || player.metadata?.connection_status
+      || (player.metadata?.is_connected === false ? 'disconnected' : 'connected');
+    const forceMiddleDrop = playerStatus === 'timeout' || playerStatus === 'disconnected';
+    const pointsToLose = (
+      playerStatus === 'dropped'
+      || playerStatus === 'disconnected'
+      || playerStatus === 'timeout'
+      || playerStatus === 'eliminated'
+    )
+      ? resolveDropLossPoints(session, player.user_id, { forceMiddleDrop })
+      : null;
+    const distributionPlayer = Array.isArray(session?.metadata?.distribution?.players)
+      ? session.metadata.distribution.players.find(
+        (row) => Number(row?.user_id) === Number(player.user_id)
+      )
+      : null;
+
+    return {
+      user_id: player.user_id,
+      seat_no: player.seat_no,
+      name: player.name,
+      avatar: player.avatar,
+      total_score: resolvePlayerTotalScore(session, player.user_id),
+      metadata: player.metadata || {},
+      player_status: playerStatus,
+      connection_status: connectionStatus,
+      points_to_lose: pointsToLose,
+      has_picked: distributionPlayer?.has_picked === true,
+    };
+  });
 }
 
 function buildCountdownSyncPayload(session) {
@@ -5483,12 +5553,19 @@ function syncSocketToSessionPhase(socket, session, reason = 'session_sync') {
   if (session.status === 'active' && session.metadata?.distribution) {
     const dealPayload = buildDealSyncPayload(session);
     if (dealPayload) {
+      log(
+        `Emitting game:deal sync reason=${reason} uid=${socket.user?.id} payload=${JSON.stringify(dealPayload)}`
+      );
       socket.emit('game:deal', dealPayload);
       socket.emit('game:discard_history:update', buildDiscardHistoryPayload(session, {
         reason: 'session_sync',
       }));
       const turnPayload = buildTurnSyncPayload(session);
       if (turnPayload) {
+        logGame(
+          session.id,
+          `Emitting game:turn after game:deal sync uid=${socket.user?.id} payload=${JSON.stringify(turnPayload)}`
+        );
         socket.emit('game:turn', turnPayload);
       }
       return { phase: 'active', event: 'game:deal', reason };

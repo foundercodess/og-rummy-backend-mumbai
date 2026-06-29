@@ -248,14 +248,14 @@ function resolvePlayerStatus(player = {}) {
   if (metadata.elimination_reason === 'timeout') {
     return 'timeout';
   }
-  if (resolveConnectionStatus(player) === 'disconnected') {
-    return 'disconnected';
-  }
-  if (player.status === 'eliminated') {
+  if (player.status === 'eliminated' || metadata.elimination_reason === 'pool_limit') {
     return 'eliminated';
   }
   if (player.status === 'left') {
     return 'left';
+  }
+  if (resolveConnectionStatus(player) === 'disconnected') {
+    return 'disconnected';
   }
   return 'active';
 }

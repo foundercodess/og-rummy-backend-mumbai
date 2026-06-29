@@ -6,6 +6,7 @@ const gameplayService = require('../services/gameplay.service');
 const gameSessionModel = require('../models/gameSession.model');
 const groupingService = require('../services/grouping.service');
 const redisLockService = require('../services/redisLock.service');
+const socketRegistry = require('./socketRegistry');
 const { pool } = require('../db');
 const { startTurnTimerFromDeal } = require('./turnSchedulerBridge');
 
@@ -34,6 +35,26 @@ const activePregameBySession = new Map();
 
 function sessionRoom(sessionId) {
   return `game-session:${sessionId}`;
+}
+
+function detachUserFromSessionRoom(io, sessionId, userId) {
+  const safeSessionId = Number(sessionId);
+  const safeUserId = Number(userId);
+  if (Number.isNaN(safeSessionId) || Number.isNaN(safeUserId)) return;
+  const roomSocketIds = io?.sockets?.adapter?.rooms?.get(sessionRoom(safeSessionId)) || new Set();
+  const socketIds = socketRegistry.getSocketIds(safeUserId);
+  socketIds.forEach((socketId) => {
+    if (!roomSocketIds.has(socketId)) return;
+    const sock = io?.sockets?.sockets?.get(socketId);
+    if (sock) {
+      sock.leave(sessionRoom(safeSessionId));
+    }
+  });
+}
+
+function detachPoolEliminatedPlayers(io, session = {}) {
+  const eliminated = resolvePoolEliminatedSet(session?.metadata || {});
+  eliminated.forEach((userId) => detachUserFromSessionRoom(io, session.id, userId));
 }
 
 function getNowIso() {
@@ -165,6 +186,96 @@ function resolvePlayerTotalScore(session = {}, userId) {
     return Number.isFinite(totalScore) ? totalScore : 0;
   }
   return null;
+}
+
+function getEliminatedUserIdSet(metadata = {}) {
+  const eliminated = [
+    ...(Array.isArray(metadata?.turn_eliminated_user_ids) ? metadata.turn_eliminated_user_ids : []),
+    ...(Array.isArray(metadata?.pool_eliminated_user_ids) ? metadata.pool_eliminated_user_ids : []),
+  ];
+  return new Set(eliminated.map((id) => Number(id)).filter((id) => !Number.isNaN(id)));
+}
+
+function getTimeoutEliminatedUserIdSet(metadata = {}) {
+  const eliminated = Array.isArray(metadata?.turn_timeout_eliminated_user_ids)
+    ? metadata.turn_timeout_eliminated_user_ids
+    : [];
+  return new Set(eliminated.map((id) => Number(id)).filter((id) => !Number.isNaN(id)));
+}
+
+function resolveDealPlayerStatus(session, player = {}) {
+  const userId = Number(player.user_id);
+  const metadata = player.metadata || {};
+  const sessionMeta = session?.metadata || {};
+
+  if (!Number.isNaN(userId) && getTimeoutEliminatedUserIdSet(sessionMeta).has(userId)) {
+    return 'timeout';
+  }
+
+  if (
+    metadata.is_dropped === true
+    || metadata.drop_status === 'dropped'
+    || metadata.status === 'dropped'
+    || metadata.elimination_reason === 'dropped'
+  ) {
+    return 'dropped';
+  }
+
+  if (
+    (!Number.isNaN(userId) && getEliminatedUserIdSet(sessionMeta).has(userId))
+    || player.status === 'eliminated'
+    || metadata.elimination_reason === 'pool_limit'
+  ) {
+    return 'eliminated';
+  }
+
+  if (player.player_status
+    && player.player_status !== 'disconnected'
+    && player.player_status !== 'connected'
+    && player.player_status !== 'joined') {
+    return player.player_status;
+  }
+
+  const connectionStatus = player.connection_status
+    || metadata.connection_status
+    || (metadata.is_connected === false ? 'disconnected' : 'connected');
+  if (connectionStatus === 'disconnected' || player.status === 'disconnected') {
+    return 'disconnected';
+  }
+
+  return 'active';
+}
+
+function mapPlayersForDealEmit(scoreSession, participants = []) {
+  const rows = Array.isArray(scoreSession?.players) && scoreSession.players.length > 0
+    ? scoreSession.players
+    : participants;
+  const distributionPlayers = Array.isArray(scoreSession?.metadata?.distribution?.players)
+    ? scoreSession.metadata.distribution.players
+    : [];
+
+  return rows.map((player) => {
+    const metadata = player.metadata || {};
+    const playerStatus = resolveDealPlayerStatus(scoreSession, player);
+    const connectionStatus = player.connection_status
+      || metadata.connection_status
+      || (metadata.is_connected === false ? 'disconnected' : 'connected');
+    const distributionPlayer = distributionPlayers.find(
+      (row) => Number(row?.user_id) === Number(player.user_id)
+    );
+
+    return {
+      user_id: player.user_id,
+      seat_no: player.seat_no,
+      name: player.name,
+      avatar: player.avatar,
+      total_score: resolvePlayerTotalScore(scoreSession, player.user_id),
+      metadata,
+      player_status: playerStatus,
+      connection_status: connectionStatus,
+      has_picked: distributionPlayer?.has_picked === true,
+    };
+  });
 }
 
 function roundCurrency(value) {
@@ -1142,8 +1253,48 @@ async function emitDealFromPregame({
   const updatedSession = await gameplayService.getSessionState(sessionId);
   const dealContext = buildDealContextFields(updatedSession || sessionForDeal || baseSession);
   const prizePoolFields = buildSessionPrizePoolFields(updatedSession || sessionForDeal || baseSession);
+  const poolEliminatedUserIds = Array.from(
+    resolvePoolEliminatedSet((updatedSession || sessionForDeal || baseSession)?.metadata || {}),
+  );
+  const dealPlayers = mapPlayersForDealEmit(
+    updatedSession || sessionForDeal || baseSession,
+    participants,
+  );
 
-  console.log(`[PREGAME][${sessionId}] Emitting game:deal — session is now ACTIVE, turn=uid:${firstTurnPlayer.user_id} timer=${turnTimerSeconds}s`);
+  detachPoolEliminatedPlayers(io, updatedSession || sessionForDeal || baseSession);
+
+  console.log(`[PREGAME][${sessionId}] Emitting game:deal — session is now ACTIVE, turn=uid:${firstTurnPlayer.user_id} timer=${turnTimerSeconds}s, entire data: ${JSON.stringify({
+    session_id: dealPayload.session_id,
+    session_code: dealPayload.session_code,
+    phase: 'active',
+    status: 'active',
+    server_time: getNowIso(),
+    event: 'game:deal',
+    ...dealContext,
+    ...prizePoolFields,
+    game_state: {
+      ...dealPayload.game_state,
+      turn_started_at: turnStartedAt,
+      turn_ends_at: turnEndsAt,
+      turn_timer_seconds: turnTimerSeconds,
+    },
+    toss: includeTossMetadata ? (tossPayload || dealPayload.toss) : null,
+    turn: {
+      turn_id: turnId,
+      user_id: firstTurnPlayer.user_id,
+      started_at: turnStartedAt,
+      ends_at: turnEndsAt,
+      turn_timer_seconds: turnTimerSeconds,
+      type: 'normal',
+      attempt_no: 0,
+      max_bonus_attempts: BONUS_ATTEMPTS_PER_PLAYER,
+      attempts_left: BONUS_ATTEMPTS_PER_PLAYER,
+    },
+    distribution: dealPayload.distribution,
+    distribution_quality: dealPayload.distribution_quality || null,
+    pool_eliminated_user_ids: poolEliminatedUserIds,
+    players: dealPlayers,
+  })}`);
 
   io.to(sessionRoom(sessionId)).emit('game:deal', {
     session_id: dealPayload.session_id,
@@ -1174,14 +1325,8 @@ async function emitDealFromPregame({
     },
     distribution: dealPayload.distribution,
     distribution_quality: dealPayload.distribution_quality || null,
-    players: (updatedSession?.players || participants || []).map((p) => ({
-      user_id: p.user_id,
-      seat_no: p.seat_no,
-      name: p.name,
-      avatar: p.avatar,
-      total_score: resolvePlayerTotalScore(updatedSession || sessionForDeal || baseSession, p.user_id),
-      metadata: p.metadata,
-    })),
+    pool_eliminated_user_ids: poolEliminatedUserIds,
+    players: dealPlayers,
   });
 
   setTimeout(() => {
