@@ -1235,6 +1235,146 @@ function buildPoolRoundProgress(session = {}, roundResults = []) {
   };
 }
 
+async function tryTransitionPoolRoundAfterSinglePlayerRemaining(
+  io,
+  session,
+  {
+    sessionId,
+    winnerUserId,
+    packedUserId,
+    outcomeType,
+    reason,
+  }
+) {
+  const mode = resolveSessionGameMode(session);
+  if (mode !== 'pool') return null;
+
+  const perRoundResults = (session.players || []).map((item) => {
+    const itemUserId = Number(item.user_id);
+    const itemIsWinner = Number(itemUserId) === Number(winnerUserId);
+    const itemIsPacked = Number(itemUserId) === Number(packedUserId);
+    let points = 0;
+    let playerStatus = 'lost';
+    if (itemIsWinner) {
+      playerStatus = 'won';
+    } else if (itemIsPacked) {
+      points = outcomeType === 'timeout'
+        ? (resolveDropLossPoints(session, itemUserId, { forceMiddleDrop: true }) || 0)
+        : (resolveDropLossPoints(session, itemUserId) || 0);
+      playerStatus = outcomeType === 'timeout' ? 'timeout' : 'dropped';
+    } else {
+      points = resolveDropLossPoints(session, itemUserId) || 0;
+    }
+    return {
+      user_id: item.user_id,
+      seat_no: item.seat_no,
+      points,
+      round_points: points,
+      grouped_points: null,
+      ungrouped_points: null,
+      valid_for_declare: null,
+      invalid_group_count: 0,
+      all_cards_grouped: null,
+      submission_mode: 'auto',
+      submission_status: 'auto',
+      player_status: playerStatus,
+      status_color: resolveStatusColor(playerStatus),
+      dropped: outcomeType === 'dropped' && itemIsPacked,
+      is_winner: itemIsWinner,
+    };
+  });
+
+  const poolProgress = buildPoolRoundProgress(session, perRoundResults);
+  const roundResultsWithPool = perRoundResults.map((item) => {
+    const uid = Number(item.user_id);
+    const cumulativePoints = Number(poolProgress.scoresByUser[String(uid)]) || 0;
+    const isEliminated = (poolProgress.eliminatedUserIds || []).some((id) => Number(id) === uid);
+    const preservePlayerStatus = item?.is_winner === true
+      || item?.dropped === true
+      || item?.player_status === 'dropped'
+      || item?.player_status === 'timeout';
+    const nextPlayerStatus = preservePlayerStatus
+      ? item.player_status
+      : (isEliminated ? 'eliminated' : item.player_status);
+    return {
+      ...item,
+      cumulative_points: cumulativePoints,
+      total_score: cumulativePoints,
+      score_model: 'pool_loss_cumulative',
+      player_status: nextPlayerStatus,
+      status_color: resolveStatusColor(nextPlayerStatus),
+    };
+  });
+
+  if ((poolProgress.activeUserIds || []).length <= 1) {
+    return null;
+  }
+
+  const rejoinContext = buildPoolRejoinContext({
+    players: session.players || [],
+    scoresByUser: poolProgress.scoresByUser,
+    eliminatedUserIds: poolProgress.eliminatedUserIds,
+    poolLimit: poolProgress.poolLimit,
+  });
+  const rejoinJoiningFee = roundCurrency(Number(session?.contest?.entry) || 0);
+  const prizePoolSummary = buildPoolPrizePoolSummary({
+    entryFee: rejoinJoiningFee,
+    baseEntryCount: resolvePoolBaseEntryCount(session),
+    rejoinEntryCount: resolvePoolRejoinEntryCount(session?.metadata || {}),
+    projectedExtraEntries: rejoinContext.can_rejoin_table ? 1 : 0,
+  });
+  const rejoinInfo = buildPoolRejoinInfoPayload({
+    rejoinContext,
+    joiningFee: rejoinJoiningFee,
+    prizePoolSummary,
+  });
+  const resultPayload = {
+    session_id: sessionId,
+    server_time: new Date().toISOString(),
+    event: 'game:result',
+    status: 'round_completed',
+    is_final: false,
+    reason,
+    declare_by_user_id: null,
+    declare_valid: null,
+    winner_user_id: winnerUserId,
+    tie_break_policy: 'pool_limit_then_lowest_points',
+    finish_card: null,
+    auto_declared_user_ids: [],
+    pool_limit: poolProgress.poolLimit,
+    pool_round_no: poolProgress.currentRoundNo,
+    pool_scores_by_user: poolProgress.scoresByUser,
+    pool_eliminated_user_ids: poolProgress.eliminatedUserIds,
+    can_rejoin_table: rejoinContext.can_rejoin_table,
+    rejoin_threshold: rejoinContext.rejoin_threshold,
+    rejoin_candidate_user_ids: rejoinContext.rejoin_candidate_user_ids,
+    rejoin_start_points_by_user: rejoinContext.rejoin_start_points_by_user,
+    rejoin_at_points_by_user: rejoinContext.rejoin_start_points_by_user,
+    joining_fee: rejoinInfo.joining_fee,
+    current_prize_pool: rejoinInfo.current_prize_pool,
+    updated_prize_pool_if_rejoin: rejoinInfo.updated_prize_pool_if_rejoin,
+    rejoin_info: rejoinInfo,
+    results: roundResultsWithPool,
+    settlement: null,
+    deal_no: null,
+    total_deals: null,
+    deal_scores: null,
+  };
+  resultPayload.players = buildDeclarationTablePlayers({
+    session,
+    distribution: session.metadata?.distribution || null,
+    state: { responses: new Map(), declareByUserId: null },
+    isFinal: true,
+    finalizedResults: roundResultsWithPool,
+    settlement: null,
+    winnerUserId,
+    declarerValid: null,
+  });
+
+  cleanupTurnState(sessionId);
+  return transitionToNextPoolRound(io, session, resultPayload, poolProgress);
+}
+
 function resolvePoolRejoinThreshold(poolLimit) {
   const numericLimit = Number(poolLimit);
   if (!Number.isFinite(numericLimit)) return null;
@@ -7422,8 +7562,25 @@ async function onTurnTimeout(io, sessionId, expectedTurnId) {
     if (winnerUserId) {
       if (shouldEliminateCurrentUser) {
         emitPlayerStatusUpdate(io, session, currentUserId, 'timeout_eliminated');
+        await emitPendingRejoinGameForUser(io, currentUserId, 'timeout_eliminated');
       }
       logGame(sessionId, `Elimination — uid=${currentUserId} removed (bonus attempts exhausted), winner uid=${winnerUserId}`);
+      if (shouldEliminateCurrentUser) {
+        const poolRoundResult = await tryTransitionPoolRoundAfterSinglePlayerRemaining(
+          io,
+          session,
+          {
+            sessionId,
+            winnerUserId,
+            packedUserId: currentUserId,
+            outcomeType: 'timeout',
+            reason: 'single_player_remaining_after_timeout',
+          }
+        );
+        if (poolRoundResult) {
+          return;
+        }
+      }
       await finalizeGameByElimination(
         io,
         session,
@@ -7721,122 +7878,22 @@ async function dropPlayerFromSession(io, sessionId, userId) {
     // emitSessionStatePayload(io, updatedSession);
 
     if (winnerUserId) {
-      const mode = resolveSessionGameMode(updatedSession);
-      if (mode === 'pool') {
-        const perRoundResults = (updatedSession.players || []).map((item) => {
-          const itemUserId = Number(item.user_id);
-          const itemIsWinner = Number(itemUserId) === Number(winnerUserId);
-          const itemIsDropped = Number(itemUserId) === Number(userId);
-          const points = itemIsWinner
-            ? 0
-            : (resolveDropLossPoints(updatedSession, itemUserId) || 0);
-          const playerStatus = itemIsWinner ? 'won' : (itemIsDropped ? 'dropped' : 'lost');
-          return {
-            user_id: item.user_id,
-            seat_no: item.seat_no,
-            points,
-            round_points: points,
-            grouped_points: null,
-            ungrouped_points: null,
-            valid_for_declare: null,
-            invalid_group_count: 0,
-            all_cards_grouped: null,
-            submission_mode: 'auto',
-            submission_status: 'auto',
-            player_status: playerStatus,
-            status_color: resolveStatusColor(playerStatus),
-            dropped: itemIsDropped,
-            is_winner: itemIsWinner,
-          };
-        });
-        const poolProgress = buildPoolRoundProgress(updatedSession, perRoundResults);
-        const roundResultsWithPool = perRoundResults.map((item) => {
-          const uid = Number(item.user_id);
-          const cumulativePoints = Number(poolProgress.scoresByUser[String(uid)]) || 0;
-          const isEliminated = (poolProgress.eliminatedUserIds || []).some((id) => Number(id) === uid);
-          const preservePlayerStatus = item?.is_winner === true
-            || item?.dropped === true
-            || item?.player_status === 'dropped'
-            || item?.player_status === 'timeout';
-          const nextPlayerStatus = preservePlayerStatus
-            ? item.player_status
-            : (isEliminated ? 'eliminated' : item.player_status);
-          return {
-            ...item,
-            cumulative_points: cumulativePoints,
-            total_score: cumulativePoints,
-            score_model: 'pool_loss_cumulative',
-            player_status: nextPlayerStatus,
-            status_color: resolveStatusColor(nextPlayerStatus),
-          };
-        });
-
-        if ((poolProgress.activeUserIds || []).length > 1) {
-          const rejoinContext = buildPoolRejoinContext({
-            players: updatedSession.players || [],
-            scoresByUser: poolProgress.scoresByUser,
-            eliminatedUserIds: poolProgress.eliminatedUserIds,
-            poolLimit: poolProgress.poolLimit,
-          });
-          const rejoinJoiningFee = roundCurrency(Number(updatedSession?.contest?.entry) || 0);
-          const prizePoolSummary = buildPoolPrizePoolSummary({
-            entryFee: rejoinJoiningFee,
-            baseEntryCount: resolvePoolBaseEntryCount(updatedSession),
-            rejoinEntryCount: resolvePoolRejoinEntryCount(updatedSession?.metadata || {}),
-            projectedExtraEntries: rejoinContext.can_rejoin_table ? 1 : 0,
-          });
-          const rejoinInfo = buildPoolRejoinInfoPayload({
-            rejoinContext,
-            joiningFee: rejoinJoiningFee,
-            prizePoolSummary,
-          });
-          const resultPayload = {
-            session_id: sessionId,
-            server_time: new Date().toISOString(),
-            event: 'game:result',
-            status: 'round_completed',
-            is_final: false,
-            reason: 'single_player_remaining_after_drop',
-            declare_by_user_id: null,
-            declare_valid: null,
-            winner_user_id: winnerUserId,
-            tie_break_policy: 'pool_limit_then_lowest_points',
-            finish_card: null,
-            auto_declared_user_ids: [],
-            pool_limit: poolProgress.poolLimit,
-            pool_round_no: poolProgress.currentRoundNo,
-            pool_scores_by_user: poolProgress.scoresByUser,
-            pool_eliminated_user_ids: poolProgress.eliminatedUserIds,
-            can_rejoin_table: rejoinContext.can_rejoin_table,
-            rejoin_threshold: rejoinContext.rejoin_threshold,
-            rejoin_candidate_user_ids: rejoinContext.rejoin_candidate_user_ids,
-            rejoin_start_points_by_user: rejoinContext.rejoin_start_points_by_user,
-            rejoin_at_points_by_user: rejoinContext.rejoin_start_points_by_user,
-            joining_fee: rejoinInfo.joining_fee,
-            current_prize_pool: rejoinInfo.current_prize_pool,
-            updated_prize_pool_if_rejoin: rejoinInfo.updated_prize_pool_if_rejoin,
-            rejoin_info: rejoinInfo,
-            results: roundResultsWithPool,
-            settlement: null,
-            deal_no: null,
-            total_deals: null,
-            deal_scores: null,
-          };
-          resultPayload.players = buildDeclarationTablePlayers({
-            session: updatedSession,
-            distribution: updatedSession.metadata?.distribution || null,
-            state: { responses: new Map(), declareByUserId: null },
-            isFinal: true,
-            finalizedResults: roundResultsWithPool,
-            settlement: null,
-            winnerUserId,
-            declarerValid: null,
-          });
-          return {
-            session: updatedSession,
-            result: await transitionToNextPoolRound(io, updatedSession, resultPayload, poolProgress),
-          };
+      const poolRoundResult = await tryTransitionPoolRoundAfterSinglePlayerRemaining(
+        io,
+        updatedSession,
+        {
+          sessionId,
+          winnerUserId,
+          packedUserId: userId,
+          outcomeType: 'dropped',
+          reason: 'single_player_remaining_after_drop',
         }
+      );
+      if (poolRoundResult) {
+        return {
+          session: updatedSession,
+          result: poolRoundResult,
+        };
       }
       return {
         session: updatedSession,

@@ -81,6 +81,7 @@ function loadTimeoutHarness(session) {
 
   const insertedEvents = [];
   const scheduledTimeouts = [];
+  const startPregameCalls = [];
   const noop = () => {};
   const module = { exports: {} };
 
@@ -108,6 +109,18 @@ function loadTimeoutHarness(session) {
     async insertEvent(event) {
       insertedEvents.push(event);
       return event;
+    },
+    async updatePlayerState(sessionId, userId, fields = {}) {
+      assert(Number(sessionId) === session.id, 'Unexpected session id in updatePlayerState');
+      const player = session.players.find((row) => Number(row.user_id) === Number(userId));
+      if (!player) return null;
+      if (Object.prototype.hasOwnProperty.call(fields, 'status')) {
+        player.status = fields.status;
+      }
+      if (Object.prototype.hasOwnProperty.call(fields, 'metadata')) {
+        player.metadata = fields.metadata;
+      }
+      return player;
     },
   };
 
@@ -162,9 +175,19 @@ function loadTimeoutHarness(session) {
         return { pool: null };
       case '../services/redis.service':
       case './socketRegistry':
-      case './pregameOrchestrator':
       case './turnSchedulerBridge':
         return {};
+      case './socketTelemetry':
+        return {
+          traceSessionBroadcast: ({ payload }) => payload,
+          traceAckResponse: (_traceId, ack) => ack,
+        };
+      case './pregameOrchestrator':
+        return {
+          startPregame: async (_io, sid) => {
+            startPregameCalls.push(Number(sid));
+          },
+        };
       case './socketAuth':
         return { socketAuth: noop };
       case './socketBus':
@@ -204,6 +227,7 @@ function loadTimeoutHarness(session) {
     session,
     insertedEvents,
     scheduledTimeouts,
+    startPregameCalls,
   };
 }
 
@@ -291,6 +315,52 @@ async function main() {
   assert(autoActionEvent, 'Expected timeout auto-action event for continuing game');
   assert(autoActionEvent.payload.next_turn_user_id === 12, 'Expected continuing game to move turn to uid=12');
   assert(continueHarness.scheduledTimeouts.length >= 1, 'Expected next turn timeout to be scheduled for continuing game');
+
+  const poolScenario = createScenarioSession({
+    sessionId: 9003,
+    currentTurnUserId: 21,
+    turnId: 300,
+    players: [
+      { user_id: 21, seat_no: 1, name: 'Timed Out Pool Player', metadata: {} },
+      { user_id: 22, seat_no: 2, name: 'Pool Winner', metadata: {} },
+    ],
+    distributionPlayers: [
+      { user_id: 21, cards: [{ card_uid: 'a1', value: 10 }], submitted_groups: [] },
+      { user_id: 22, cards: [{ card_uid: 'b1', value: 5 }], submitted_groups: [] },
+    ],
+  });
+  poolScenario.metadata.game_mode = 'pool';
+  poolScenario.metadata.pool_round_no = 1;
+  poolScenario.metadata.pool_scores_by_user = { '21': 0, '22': 0 };
+  poolScenario.metadata.pool_eliminated_user_ids = [];
+  poolScenario.contest = { entry: 50, player_count: 2 };
+  poolScenario.game = {
+    ...poolScenario.game,
+    name: 'Pool 101',
+  };
+
+  const poolIo = createIoCapture();
+  const poolHarness = loadTimeoutHarness(poolScenario);
+  await poolHarness.onTurnTimeout(poolIo, poolScenario.id, 300);
+
+  assert(poolScenario.status === 'ready', 'Expected 2-player pool timeout to transition session to ready for next round');
+  assert(poolScenario.metadata.phase === 'inter_deal', 'Expected pool timeout to move phase to inter_deal');
+  assert(poolScenario.metadata.pool_round_no === 2, 'Expected pool round to advance after timeout');
+  assert(poolScenario.metadata.pool_scores_by_user['21'] === 40, 'Expected timed-out pool player to receive middle-drop penalty');
+  assert(!poolScenario.metadata.pool_eliminated_user_ids.includes(21), 'Expected timed-out pool player to remain active when below pool limit');
+  assert(poolHarness.startPregameCalls.length === 1, 'Expected next pool round pregame after timeout');
+
+  const poolResultEvent = poolIo.emitted.find((entry) => entry.event === 'game:result');
+  assert(poolResultEvent, 'Expected intermediate game:result for pool timeout round end');
+  assert(poolResultEvent.payload.is_final === false, 'Expected pool timeout round result to be non-final');
+  assert(poolResultEvent.payload.reason === 'single_player_remaining_after_timeout', 'Expected pool timeout round reason');
+
+  const poolTimeoutRow = poolResultEvent.payload.results.find((row) => row.user_id === 21);
+  assert(poolTimeoutRow?.player_status === 'timeout', 'Expected pool timeout player status to remain timeout in round result');
+  assert(poolTimeoutRow?.total_score === 40, 'Expected pool timeout player cumulative score to be 40');
+
+  const poolCompletionEvent = poolHarness.insertedEvents.find((event) => event.eventType === 'game_completed_by_elimination');
+  assert(!poolCompletionEvent, 'Did not expect full game completion for sub-limit pool timeout');
 
   console.log('verify_timeout_elimination: PASS');
 }
