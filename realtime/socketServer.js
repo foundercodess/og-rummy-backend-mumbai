@@ -5693,7 +5693,8 @@ function syncSocketToSessionPhase(socket, session, reason = 'session_sync') {
   if (session.status === 'active' && session.metadata?.distribution) {
     const dealPayload = buildDealSyncPayload(session);
     if (dealPayload) {
-      log(
+      logGame(
+        session.id,
         `Emitting game:deal sync reason=${reason} uid=${socket.user?.id} payload=${JSON.stringify(dealPayload)}`
       );
       socket.emit('game:deal', dealPayload);
