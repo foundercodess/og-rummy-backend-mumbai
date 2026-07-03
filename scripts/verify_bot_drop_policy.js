@@ -1,4 +1,5 @@
 const assert = require('assert');
+const groupingService = require('../services/grouping.service');
 const { __testHooks } = require('../realtime/socketServer');
 
 function card(uid, rank, suit, value, is_joker = false) {
@@ -11,13 +12,23 @@ function card(uid, rank, suit, value, is_joker = false) {
   };
 }
 
-function makeSession({ mode = 'pool', entry = 10, poolScores = {}, poolLimit = 101 } = {}) {
+function makeSession({
+  mode = 'pool',
+  entry = 10,
+  poolScores = {},
+  poolLimit = 101,
+  userId = 777,
+  hasPicked = false,
+} = {}) {
   return {
     contest: { entry },
     metadata: {
       game_mode: mode,
       pool_limit: poolLimit,
       pool_scores_by_user: poolScores,
+      distribution: {
+        players: [{ user_id: userId, has_picked: hasPicked, cards: [] }],
+      },
     },
   };
 }
@@ -29,15 +40,10 @@ function makeDistribution({ discardTop = null, closedDeck = [] } = {}) {
   };
 }
 
-function run() {
-  assert(__testHooks, 'Expected socketServer __testHooks to be exported');
-  assert(typeof __testHooks.hasAnyValidMeld === 'function', 'Expected hasAnyValidMeld test hook');
-  assert(typeof __testHooks.shouldBotTakeEarlyDrop === 'function', 'Expected shouldBotTakeEarlyDrop test hook');
-
+function runEarlyDropTests() {
   const userId = 777;
   const wildJoker = null;
 
-  // Case 1: Has an existing pure sequence -> first drop must be blocked.
   const structuredHand = [
     card('h4', '4', 'hearts', 4),
     card('h5', '5', 'hearts', 5),
@@ -76,7 +82,6 @@ function run() {
     'Bot must not first-drop when a set/sequence/pure already exists'
   );
 
-  // Case 2: No current meld, but open pile can create one -> first drop must be blocked.
   const noMeldButOpenPotential = [
     card('h3', '3', 'hearts', 3),
     card('h4', '4', 'hearts', 4),
@@ -112,10 +117,9 @@ function run() {
       wildJoker
     ),
     false,
-    'Bot must not first-drop when open pile can form a meld'
+    'Bot must not first-drop when open pile can meaningfully improve the hand'
   );
 
-  // Case 3: No current meld, no open/closed potential, and projected loss >> first drop -> allow first drop.
   const deadHand = [
     card('a1', '2', 'hearts', 2),
     card('a2', '4', 'clubs', 4),
@@ -148,9 +152,114 @@ function run() {
       wildJoker
     ),
     true,
-    'Bot should first-drop only for dead hand with no one-pick meld potential and clear loss advantage'
+    'Bot should first-drop for dead hand with no meaningful pick potential and clear loss advantage'
+  );
+}
+
+function runStrategicDropTests() {
+  const userId = 888;
+  const session = makeSession({
+    mode: 'pool',
+    poolScores: { [String(userId)]: 12 },
+    poolLimit: 101,
+    userId,
+    hasPicked: true,
+  });
+  const wildJoker = { rank: '5', card_id: 'H5' };
+
+  const hopelessHand = [
+    card('h2', '2', 'hearts', 2),
+    card('h4', '4', 'hearts', 4),
+    card('h6', '6', 'hearts', 6),
+    card('h8', '8', 'hearts', 8),
+    card('h10', '10', 'hearts', 10),
+    card('hQ', 'Q', 'hearts', 10),
+    card('cA', 'A', 'clubs', 10),
+    card('c3', '3', 'clubs', 3),
+    card('c7', '7', 'clubs', 7),
+    card('c9', '9', 'clubs', 9),
+    card('cJ', 'J', 'clubs', 10),
+    card('dK', 'K', 'diamonds', 10),
+    card('s5', '5', 'spades', 5),
+    card('s5w', '5', 'diamonds', 5),
+  ];
+
+  const hopelessSummary = groupingService.buildBestGrouping(hopelessHand, wildJoker).summary;
+  assert.strictEqual(hopelessSummary.pure_sequence_count, 0, 'hopeless hand should have no pure sequence');
+  assert(
+    hopelessSummary.display_point >= 45,
+    `hopeless hand display_point should be high, got ${hopelessSummary.display_point}`
+  );
+  assert(
+    __testHooks.isHopelessHandForDrop(hopelessSummary, 5) === true,
+    'expected hopeless classification after turn 4'
   );
 
+  const weakStructureOnly = [
+    card('b1', '4', 'hearts', 4),
+    card('b2', '5', 'hearts', 5),
+    card('b3', '6', 'hearts', 6),
+    card('b4', 'A', 'clubs', 10),
+    card('b5', 'K', 'clubs', 10),
+    card('b6', 'Q', 'diamonds', 10),
+    card('b7', '2', 'spades', 2),
+    card('b8', '7', 'diamonds', 7),
+    card('b9', '8', 'clubs', 8),
+    card('b10', '9', 'spades', 9),
+    card('b11', 'J', 'hearts', 10),
+    card('b12', '3', 'diamonds', 3),
+    card('b13', '10', 'clubs', 10),
+    card('b14', '5', 'spades', 5),
+  ];
+  const weakSummary = groupingService.buildBestGrouping(weakStructureOnly, wildJoker).summary;
+  assert(
+    __testHooks.doesStructureBlockStrategicDrop(weakSummary) === false,
+    'single weak sequence with high deadwood should not block strategic drop'
+  );
+
+  assert.strictEqual(
+    __testHooks.shouldBotStrategicallyDrop(
+      session,
+      userId,
+      hopelessHand,
+      wildJoker,
+      {
+        turn: { turn_id: 5 },
+        playerDistribution: { has_picked: true },
+        decisionSeed: 'verify:hopeless-drop',
+        seededRoll: 0.2,
+      }
+    ),
+    true,
+    'Bot should strategically drop hopeless no-pure hand after turn 4'
+  );
+
+  assert.strictEqual(
+    __testHooks.shouldBotStrategicallyDrop(
+      session,
+      userId,
+      hopelessHand,
+      wildJoker,
+      {
+        turn: { turn_id: 2 },
+        playerDistribution: { has_picked: true },
+        decisionSeed: 'verify:early-turn',
+        seededRoll: 0.1,
+      }
+    ),
+    false,
+    'Bot should not strategically drop structured hopeless hand before turn gate'
+  );
+}
+
+function run() {
+  assert(__testHooks, 'Expected socketServer __testHooks to be exported');
+  assert(typeof __testHooks.hasAnyValidMeld === 'function', 'Expected hasAnyValidMeld test hook');
+  assert(typeof __testHooks.shouldBotTakeEarlyDrop === 'function', 'Expected shouldBotTakeEarlyDrop test hook');
+  assert(typeof __testHooks.shouldBotStrategicallyDrop === 'function', 'Expected shouldBotStrategicallyDrop test hook');
+
+  runEarlyDropTests();
+  runStrategicDropTests();
   console.log('verify_bot_drop_policy: PASS');
 }
 

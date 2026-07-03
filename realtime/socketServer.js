@@ -156,8 +156,20 @@ const BOT_AGGRESSIVE_PICK_DELAY_MIN_MULTIPLIER = 0.28;
 const BOT_AGGRESSIVE_PICK_DELAY_MAX_MULTIPLIER = 0.52;
 const BOT_AGGRESSIVE_DISCARD_DELAY_MIN_MULTIPLIER = 0.22;
 const BOT_AGGRESSIVE_DISCARD_DELAY_MAX_MULTIPLIER = 0.48;
-const BOT_STRATEGIC_DROP_ENABLED = String(process.env.BOT_STRATEGIC_DROP_ENABLED || 'false').trim().toLowerCase() === 'true';
-const BOT_DROP_BENEFIT_THRESHOLD = Math.max(16, Number(process.env.BOT_DROP_BENEFIT_THRESHOLD) || 42);
+const BOT_STRATEGIC_DROP_ENABLED = String(process.env.BOT_STRATEGIC_DROP_ENABLED || 'true').trim().toLowerCase() === 'true';
+const BOT_DROP_BENEFIT_THRESHOLD = Math.max(12, Number(process.env.BOT_DROP_BENEFIT_THRESHOLD) || 20);
+const BOT_STRATEGIC_DROP_EARLY_TURN_GATE = Math.max(1, Number(process.env.BOT_STRATEGIC_DROP_EARLY_TURN_GATE) || 4);
+const BOT_HOPELESS_DISPLAY_POINT = Math.max(30, Number(process.env.BOT_HOPELESS_DISPLAY_POINT) || 45);
+const BOT_HOPELESS_TURN_MIN = Math.max(1, Number(process.env.BOT_HOPELESS_TURN_MIN) || 4);
+const BOT_HOPELESS_DROP_BENEFIT_MIN = Math.max(10, Number(process.env.BOT_HOPELESS_DROP_BENEFIT_MIN) || 15);
+const BOT_EARLY_DROP_MEANINGFUL_UNGROUPED_REDUCTION = Math.max(
+  6,
+  Number(process.env.BOT_EARLY_DROP_MEANINGFUL_UNGROUPED_REDUCTION) || 10
+);
+const BOT_STRUCTURE_BLOCK_UNGROUPED_MAX = Math.max(
+  15,
+  Number(process.env.BOT_STRUCTURE_BLOCK_UNGROUPED_MAX) || 35
+);
 const BOT_SPLIT_AUTO_RESPONSE_MIN_MS = Math.max(250, Number(process.env.BOT_SPLIT_AUTO_RESPONSE_MIN_MS) || 600);
 const BOT_SPLIT_AUTO_RESPONSE_MAX_MS = Math.max(BOT_SPLIT_AUTO_RESPONSE_MIN_MS, Number(process.env.BOT_SPLIT_AUTO_RESPONSE_MAX_MS) || 1500);
 const BOT_SPLIT_MIN_GAIN_MULTIPLIER = Math.max(0.2, Number(process.env.BOT_SPLIT_MIN_GAIN_MULTIPLIER) || 0.6);
@@ -226,8 +238,11 @@ function buildGroupingTieBreakOptions(seed) {
 }
 
 function isLowConfidenceGrouping(summary = {}) {
-  const confidence = Number(summary?.grouping_confidence);
-  const margin = Number(summary?.decision_margin);
+  const confidenceRaw = summary?.grouping_confidence;
+  const marginRaw = summary?.decision_margin;
+  if (confidenceRaw == null || marginRaw == null) return false;
+  const confidence = Number(confidenceRaw);
+  const margin = Number(marginRaw);
   if (!Number.isFinite(confidence) || !Number.isFinite(margin)) return false;
   return confidence < BOT_LOW_CONFIDENCE_THRESHOLD || margin < BOT_LOW_MARGIN_THRESHOLD;
 }
@@ -1197,6 +1212,53 @@ function buildScoreboardPayload(session = {}) {
     cumulative_scores_by_user: {},
     placeholder_rows: 0,
   };
+}
+
+function appendAbsentEliminatedPoolPlayersToRoundResults(session = {}, roundResults = [], poolProgress = {}) {
+  const players = Array.isArray(session?.players) ? session.players : [];
+  const eliminatedSet = new Set(
+    (Array.isArray(poolProgress?.eliminatedUserIds) ? poolProgress.eliminatedUserIds : [])
+      .map((id) => Number(id))
+      .filter((id) => !Number.isNaN(id))
+  );
+  const presentUserIds = new Set(
+    (Array.isArray(roundResults) ? roundResults : [])
+      .map((row) => Number(row?.user_id))
+      .filter((id) => !Number.isNaN(id))
+  );
+  const scoresByUser = poolProgress?.scoresByUser
+    || normalizePoolScoresByUser(session?.metadata || {});
+
+  const appended = Array.isArray(roundResults) ? [...roundResults] : [];
+  players.forEach((player) => {
+    const userId = Number(player.user_id);
+    if (Number.isNaN(userId) || presentUserIds.has(userId)) return;
+    if (!eliminatedSet.has(userId)) return;
+
+    const cumulativePoints = Math.max(0, Number(scoresByUser[String(userId)]) || 0);
+    appended.push({
+      user_id: player.user_id,
+      seat_no: player.seat_no,
+      points: 0,
+      round_points: 0,
+      cumulative_points: cumulativePoints,
+      total_score: cumulativePoints,
+      score_model: 'pool_loss_cumulative',
+      grouped_points: null,
+      ungrouped_points: null,
+      valid_for_declare: null,
+      invalid_group_count: null,
+      all_cards_grouped: null,
+      submission_mode: 'aggregate',
+      submission_status: 'aggregate',
+      player_status: 'eliminated',
+      status_color: resolveStatusColor('eliminated'),
+      dropped: false,
+      is_winner: false,
+    });
+  });
+
+  return appended.sort((a, b) => (Number(a?.seat_no) || 0) - (Number(b?.seat_no) || 0));
 }
 
 function buildPoolRoundProgress(session = {}, roundResults = []) {
@@ -2238,14 +2300,29 @@ function buildDiscardHistoryPlayers(session = {}, timeline = []) {
     groupedByDiscarder.get(uid).push(buildDiscardHistoryEntry(entry));
   });
 
-  return Array.from(groupedByDiscarder.entries()).map(([uid, discardedCards]) => {
-    const player = playersByUserId.get(uid);
+  const orderedPlayers = [...players].sort(
+    (a, b) => (Number(a?.seat_no) || 0) - (Number(b?.seat_no) || 0),
+  );
+
+  const result = orderedPlayers.map((player) => {
+    const uid = Number(player.user_id);
     return {
       id: uid,
       name: player?.name || null,
-      discarded_cards: discardedCards,
+      discarded_cards: groupedByDiscarder.get(uid) || [],
     };
   });
+
+  groupedByDiscarder.forEach((discardedCards, uid) => {
+    if (playersByUserId.has(uid)) return;
+    result.push({
+      id: uid,
+      name: null,
+      discarded_cards: discardedCards,
+    });
+  });
+
+  return result;
 }
 
 function buildDiscardHistoryPayload(session = {}, extras = {}) {
@@ -2367,12 +2444,10 @@ function hasBotPlayer(session) {
 }
 
 function isBotSoftRiggingEnabled(session = null) {
-  // const envEnabled = String(process.env.ENABLE_BOT_SOFT_RIGGING || 'true').trim().toLowerCase() === 'true';
   const envEnabled = String('true').trim().toLowerCase() === 'true';
   const metadata = session?.metadata || {};
   const runtimeToggle = metadata?.bot_soft_rigging_enabled;
   const runtimeEnabled = runtimeToggle == null ? envEnabled : runtimeToggle === true;
-  console.log('isBotSoftRiggingEnabled', runtimeEnabled, envEnabled, runtimeToggle);
   return runtimeEnabled && hasBotPlayer(session);
 }
 
@@ -2471,6 +2546,159 @@ function tryFindBotCardInClosedDeck(closedDeck, botCards, wildJoker, options = {
 
 const FINISH_PLAN_HAND_CARD_COUNT = 14;
 const DECLARE_HAND_CARD_COUNT = 13;
+
+function getSubmittedGroupCardUids(submittedGroups = []) {
+  const uids = new Set();
+  (Array.isArray(submittedGroups) ? submittedGroups : []).forEach((group) => {
+    (Array.isArray(group?.cards) ? group.cards : []).forEach((uid) => {
+      const normalized = String(uid || '').trim();
+      if (normalized) uids.add(normalized);
+    });
+  });
+  return uids;
+}
+
+function tryBuildFinishPlanFromSubmittedGroups(cards = [], wildJoker = null, options = {}) {
+  const submittedGroups = options?.submittedGroups;
+  if (!Array.isArray(cards) || cards.length !== FINISH_PLAN_HAND_CARD_COUNT) return null;
+  if (!Array.isArray(submittedGroups) || submittedGroups.length === 0) return null;
+
+  const tieBreakSeed = String(options?.tieBreakSeed || '');
+  const groupedUids = getSubmittedGroupCardUids(submittedGroups);
+  const ungroupedCards = cards.filter((card) => {
+    const uid = String(card?.card_uid || '').trim();
+    return uid && !groupedUids.has(uid);
+  });
+
+  const candidates = [];
+  const finishPool = ungroupedCards.length > 0 ? ungroupedCards : cards;
+
+  finishPool.forEach((finishCard) => {
+    if (!finishCard?.card_uid) return;
+    const finishUid = String(finishCard.card_uid).trim();
+    const nextHandCards = cards.filter((card) => String(card?.card_uid || '').trim() !== finishUid);
+    if (nextHandCards.length !== DECLARE_HAND_CARD_COUNT) return;
+
+    let nextSubmittedGroups;
+    try {
+      nextSubmittedGroups = sanitizeSubmittedGroups(
+        removeCardFromGroups(submittedGroups, finishUid),
+        nextHandCards
+      );
+    } catch (_) {
+      return;
+    }
+
+    let nextGrouping;
+    try {
+      nextGrouping = groupingService.evaluateSubmittedGrouping(
+        nextHandCards,
+        wildJoker,
+        nextSubmittedGroups
+      );
+    } catch (_) {
+      return;
+    }
+
+    if (nextGrouping?.summary?.valid_for_declare !== true) return;
+
+    const cardValue = getCardValue(finishCard, wildJoker);
+    const isUngrouped = ungroupedCards.some(
+      (card) => String(card?.card_uid || '').trim() === finishUid
+    );
+    let utilityScore = isUngrouped ? 1500 : 0;
+    utilityScore -= cardValue * 10;
+    if (isCardIsolated(finishCard, cards, wildJoker)) utilityScore += 50;
+
+    candidates.push({
+      finishCard,
+      nextHandCards,
+      nextGrouping,
+      nextSubmittedGroups,
+      utilityScore,
+      cardValue,
+      isolated: isCardIsolated(finishCard, cards, wildJoker),
+      fromType: isUngrouped ? 'ungrouped' : 'grouped',
+      fromMeldSize: 1,
+      seededTieRoll: tieBreakSeed
+        ? deterministicRoll(tieBreakSeed, `finish:${finishUid}`)
+        : 0,
+    });
+  });
+
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => {
+    if (b.utilityScore !== a.utilityScore) return b.utilityScore - a.utilityScore;
+    if (a.cardValue !== b.cardValue) return a.cardValue - b.cardValue;
+    if (a.isolated !== b.isolated) return a.isolated ? -1 : 1;
+    if (a.seededTieRoll !== b.seededTieRoll) return b.seededTieRoll - a.seededTieRoll;
+    return String(a.finishCard?.card_uid || '').localeCompare(String(b.finishCard?.card_uid || ''));
+  });
+
+  const selected = candidates[0];
+  return {
+    finishCard: selected.finishCard,
+    nextHandCards: selected.nextHandCards,
+    submittedGroups: selected.nextSubmittedGroups,
+    preview: selected.nextGrouping,
+    explain: {
+      utility_score: selected.utilityScore,
+      from_group_type: selected.fromType,
+      from_group_size: selected.fromMeldSize,
+      card_value: selected.cardValue,
+      isolated: selected.isolated,
+      source: 'submitted_groups',
+    },
+  };
+}
+
+function tryBuildFinishPlan(cards = [], wildJoker = null, options = {}) {
+  const fromSubmitted = tryBuildFinishPlanFromSubmittedGroups(cards, wildJoker, options);
+  if (fromSubmitted) return fromSubmitted;
+
+  const submittedGroups = options?.submittedGroups;
+  if (Array.isArray(submittedGroups) && submittedGroups.length > 0) {
+    const groupedUids = getSubmittedGroupCardUids(submittedGroups);
+    const hasUngrouped = cards.some((card) => {
+      const uid = String(card?.card_uid || '').trim();
+      return uid && !groupedUids.has(uid);
+    });
+    // Manual layout with leftover cards: do not override with bot heuristic.
+    if (hasUngrouped) return null;
+  }
+
+  return tryBuildBotFinishPlan(cards, wildJoker, options);
+}
+
+function buildFinishPlanCallbackExtras(finishPlan) {
+  return {
+    finish_card_suggestion: finishPlan?.finishCard || null,
+    finish_plan: finishPlan
+      ? {
+        finish_card: finishPlan.finishCard,
+        submitted_groups: finishPlan.submittedGroups,
+        valid_for_declare_after_finish: finishPlan?.preview?.summary?.valid_for_declare === true,
+      }
+      : null,
+  };
+}
+
+function resolveFinishPlanForPlayerHand(cards, wildJoker, submittedGroups, sessionId, userId, turnId) {
+  if (!Array.isArray(cards) || cards.length !== FINISH_PLAN_HAND_CARD_COUNT) {
+    return null;
+  }
+  const turnIdForSeed = Number(turnId) || 0;
+  const decisionSeed = buildDecisionSeed(sessionId, turnIdForSeed, userId);
+  return tryBuildFinishPlan(cards, wildJoker, {
+    submittedGroups,
+    groupingOptions: buildGroupingTieBreakOptions(decisionSeed),
+    tieBreakSeed: decisionSeed,
+    sessionId,
+    userId,
+    turnId: turnIdForSeed,
+  });
+}
 
 function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
   if (!Array.isArray(cards) || cards.length !== FINISH_PLAN_HAND_CARD_COUNT) {
@@ -2700,6 +2928,61 @@ function isBotAggressionEnabled(session = {}) {
   return BOT_AGGRESSION_ENABLED;
 }
 
+function resolveProjectedDropLoss(summary = {}) {
+  const ungroupedPoints = Number(summary.ungrouped_points) || 0;
+  return Math.min(80, Math.max(0, Number(summary.display_point) || ungroupedPoints || 0));
+}
+
+function isHopelessHandForDrop(summary = {}, turnId = 0) {
+  if (Number(turnId) < BOT_HOPELESS_TURN_MIN) return false;
+  const pureCount = Number(summary.pure_sequence_count) || 0;
+  if (pureCount > 0) return false;
+  return resolveProjectedDropLoss(summary) >= BOT_HOPELESS_DISPLAY_POINT;
+}
+
+function doesStructureBlockStrategicDrop(summary = {}) {
+  const pureCount = Number(summary.pure_sequence_count) || 0;
+  const sequenceCount = Number(summary.sequence_count) || 0;
+  const groupedCardsCount = Number(summary.grouped_cards_count) || 0;
+  const ungroupedPoints = Number(summary.ungrouped_points) || 0;
+
+  if (pureCount >= 1 && ungroupedPoints <= BOT_STRUCTURE_BLOCK_UNGROUPED_MAX) return true;
+  if (sequenceCount >= 2 && ungroupedPoints <= BOT_STRUCTURE_BLOCK_UNGROUPED_MAX) return true;
+  if (groupedCardsCount >= 9 && ungroupedPoints <= 25) return true;
+  return false;
+}
+
+function resolveStrategicDropBenefitThreshold(summary = {}, turnId = 0) {
+  if (isHopelessHandForDrop(summary, turnId)) {
+    return BOT_HOPELESS_DROP_BENEFIT_MIN;
+  }
+  return BOT_DROP_BENEFIT_THRESHOLD;
+}
+
+function canMeaningfullyImproveWithPickedCard(handCards = [], pickedCard = null, wildJoker = null) {
+  if (!pickedCard?.card_uid) return false;
+  const before = groupingService.buildBestGrouping(handCards, wildJoker);
+  const after = groupingService.buildBestGrouping([...handCards, pickedCard], wildJoker);
+  const beforeSummary = before?.summary || {};
+  const afterSummary = after?.summary || {};
+
+  if (afterSummary.valid_for_declare === true) return true;
+
+  const pureDelta = (Number(afterSummary.pure_sequence_count) || 0)
+    - (Number(beforeSummary.pure_sequence_count) || 0);
+  if (pureDelta > 0) return true;
+
+  const ungroupedReduction = (Number(beforeSummary.ungrouped_points) || 0)
+    - (Number(afterSummary.ungrouped_points) || 0);
+  if (ungroupedReduction >= BOT_EARLY_DROP_MEANINGFUL_UNGROUPED_REDUCTION) return true;
+
+  const sequenceDelta = (Number(afterSummary.sequence_count) || 0)
+    - (Number(beforeSummary.sequence_count) || 0);
+  if (sequenceDelta > 0 && ungroupedReduction >= 6) return true;
+
+  return false;
+}
+
 function shouldBotStrategicallyDrop(session, userId, cards = [], wildJoker = null, options = {}) {
   if (BOT_STRATEGIC_DROP_ENABLED !== true) return false;
   const mode = resolveSessionGameMode(session);
@@ -2708,41 +2991,40 @@ function shouldBotStrategicallyDrop(session, userId, cards = [], wildJoker = nul
 
   const turnId = Number(options?.turn?.turn_id) || 0;
   const isDeadHand = !hasAnyValidMeld(cards, wildJoker);
-  // Allow earlier strategic drops for truly dead hands, but keep conservative early-turn behavior for structured hands.
-  if (turnId > 0 && turnId < 6 && !isDeadHand) return false;
+  if (turnId > 0 && turnId < BOT_STRATEGIC_DROP_EARLY_TURN_GATE && !isDeadHand) return false;
   if (options?.playerDistribution?.has_picked !== true) return false;
-  if (canFinishAfterOneDiscard(cards, wildJoker, { groupingOptions: buildGroupingTieBreakOptions(options?.decisionSeed) })) return false;
+  if (canFinishAfterOneDiscard(cards, wildJoker, { groupingOptions: buildGroupingTieBreakOptions(options?.decisionSeed) })) {
+    return false;
+  }
 
   const grouping = groupingService.buildBestGrouping(cards, wildJoker, buildGroupingTieBreakOptions(options?.decisionSeed));
   const summary = grouping?.summary || {};
   if (summary.valid_for_declare === true) return false;
   if (BOT_CONSERVATIVE_PLAY_ON_LOW_CONFIDENCE && isLowConfidenceGrouping(summary)) return false;
 
-  const sequenceCount = Number(summary.sequence_count) || 0;
-  const pureCount = Number(summary.pure_sequence_count) || 0;
-  const groupedCardsCount = Number(summary.grouped_cards_count) || 0;
-  const ungroupedPoints = Number(summary.ungrouped_points) || 0;
-  // Preserve human-like optimism: if the hand already has meaningful structure, continue playing.
-  if (sequenceCount >= 1 || pureCount >= 1 || groupedCardsCount >= 6 || ungroupedPoints <= 30) return false;
+  const hopeless = isHopelessHandForDrop(summary, turnId);
+  if (!hopeless && doesStructureBlockStrategicDrop(summary)) return false;
 
-  const projectedLoss = Math.min(80, Math.max(0, Number(summary.display_point) || ungroupedPoints || 0));
+  const projectedLoss = resolveProjectedDropLoss(summary);
   const dropLoss = Number(resolveDropLossPoints(session, userId));
   if (!Number.isFinite(dropLoss)) return false;
 
-  if (mode === 'pool') {
+  if (mode === 'pool' && !hopeless) {
     const poolLimit = resolvePoolLimit(session);
     const scoresByUser = session?.metadata?.pool_scores_by_user || {};
     const currentScore = Number(scoresByUser[String(userId)]) || 0;
     const safePoolLimit = Number.isFinite(poolLimit) ? poolLimit : 101;
     const scoreHeadroom = safePoolLimit - currentScore;
-    // In pool, only allow bot drops when risk of elimination is near and realistic.
-    if (scoreHeadroom > (dropLoss + 12)) return false;
+    if (projectedLoss < 40 && scoreHeadroom > (dropLoss + 12)) return false;
   }
 
   const benefit = projectedLoss - dropLoss;
-  if (benefit < BOT_DROP_BENEFIT_THRESHOLD) return false;
+  const benefitThreshold = resolveStrategicDropBenefitThreshold(summary, turnId);
+  if (benefit < benefitThreshold) return false;
 
-  const confidence = Math.min(0.75, Math.max(0.35, benefit / 100));
+  const confidence = hopeless
+    ? Math.min(0.85, Math.max(0.55, benefit / 80))
+    : Math.min(0.75, Math.max(0.35, benefit / 100));
   const seededRoll = Number(options?.seededRoll);
   if (Number.isFinite(seededRoll)) return seededRoll < confidence;
   return Math.random() < confidence;
@@ -2751,18 +3033,16 @@ function shouldBotStrategicallyDrop(session, userId, cards = [], wildJoker = nul
 function buildStrategicDropExplainability(session, userId, cards = [], wildJoker = null, options = {}) {
   const mode = resolveSessionGameMode(session);
   const turnId = Number(options?.turn?.turn_id) || 0;
-  const turnWindowOk = !(turnId > 0 && turnId < 6);
+  const turnWindowOk = !(turnId > 0 && turnId < BOT_STRATEGIC_DROP_EARLY_TURN_GATE);
 
   const grouping = groupingService.buildBestGrouping(cards, wildJoker, buildGroupingTieBreakOptions(options?.decisionSeed));
   const summary = grouping?.summary || {};
-  const sequenceCount = Number(summary.sequence_count) || 0;
-  const pureCount = Number(summary.pure_sequence_count) || 0;
-  const groupedCardsCount = Number(summary.grouped_cards_count) || 0;
-  const ungroupedPoints = Number(summary.ungrouped_points) || 0;
-  const projectedLoss = Math.min(80, Math.max(0, Number(summary.display_point) || ungroupedPoints || 0));
+  const hopeless = isHopelessHandForDrop(summary, turnId);
+  const projectedLoss = resolveProjectedDropLoss(summary);
   const dropLoss = Number(resolveDropLossPoints(session, userId));
   const benefit = projectedLoss - dropLoss;
-  const structureBlocksDrop = sequenceCount >= 1 || pureCount >= 1 || groupedCardsCount >= 6 || ungroupedPoints <= 30;
+  const benefitThreshold = resolveStrategicDropBenefitThreshold(summary, turnId);
+  const structureBlocksDrop = !hopeless && doesStructureBlockStrategicDrop(summary);
 
   let poolScoreHeadroom = null;
   let poolHeadroomGateOk = true;
@@ -2772,7 +3052,7 @@ function buildStrategicDropExplainability(session, userId, cards = [], wildJoker
     const currentScore = Number(scoresByUser[String(userId)]) || 0;
     const safePoolLimit = Number.isFinite(poolLimit) ? poolLimit : 101;
     poolScoreHeadroom = safePoolLimit - currentScore;
-    poolHeadroomGateOk = poolScoreHeadroom <= (dropLoss + 12);
+    poolHeadroomGateOk = hopeless || projectedLoss >= 40 || poolScoreHeadroom <= (dropLoss + 12);
   }
 
   return {
@@ -2789,16 +3069,17 @@ function buildStrategicDropExplainability(session, userId, cards = [], wildJoker
     alternative_count: Number(summary.alternative_count),
     low_confidence: isLowConfidenceGrouping(summary),
     valid_for_declare: summary.valid_for_declare === true,
+    hopeless_hand: hopeless,
     structure_blocks_drop: structureBlocksDrop,
-    sequence_count: sequenceCount,
-    pure_sequence_count: pureCount,
-    grouped_cards_count: groupedCardsCount,
-    ungrouped_points: ungroupedPoints,
+    sequence_count: Number(summary.sequence_count) || 0,
+    pure_sequence_count: Number(summary.pure_sequence_count) || 0,
+    grouped_cards_count: Number(summary.grouped_cards_count) || 0,
+    ungrouped_points: Number(summary.ungrouped_points) || 0,
     projected_loss: projectedLoss,
     drop_loss: Number.isFinite(dropLoss) ? dropLoss : null,
     benefit,
-    benefit_threshold: BOT_DROP_BENEFIT_THRESHOLD,
-    benefit_ok: benefit >= BOT_DROP_BENEFIT_THRESHOLD,
+    benefit_threshold: benefitThreshold,
+    benefit_ok: benefit >= benefitThreshold,
     pool_score_headroom: poolScoreHeadroom,
     pool_near_elim_gate_ok: poolHeadroomGateOk,
   };
@@ -2831,22 +3112,20 @@ function shouldBotTakeEarlyDrop(session, userId, handCards = [], distribution = 
   if (hasAnyValidMeld(handCards, wildJoker)) return false;
 
   const discardTop = Array.isArray(distribution?.discard_pile) ? distribution.discard_pile[0] : null;
-  if (canCreateAnyMeldWithPickedCard(handCards, discardTop, wildJoker)) {
+  if (canMeaningfullyImproveWithPickedCard(handCards, discardTop, wildJoker)) {
     return false;
   }
 
   const closedDeck = Array.isArray(distribution?.closed_deck) ? distribution.closed_deck : [];
-  const hasClosedPotential = closedDeck.some((card) => canCreateAnyMeldWithPickedCard(handCards, card, wildJoker));
+  const hasClosedPotential = closedDeck.some((card) =>
+    canMeaningfullyImproveWithPickedCard(handCards, card, wildJoker));
   if (hasClosedPotential) return false;
 
   const projectedGrouping = groupingService.buildBestGrouping(handCards, wildJoker);
   if (BOT_CONSERVATIVE_PLAY_ON_LOW_CONFIDENCE && isLowConfidenceGrouping(projectedGrouping?.summary || {})) {
     return false;
   }
-  const projectedLoss = Math.min(
-    80,
-    Math.max(0, Number(projectedGrouping?.summary?.display_point) || Number(projectedGrouping?.summary?.ungrouped_points) || 0)
-  );
+  const projectedLoss = resolveProjectedDropLoss(projectedGrouping?.summary || {});
   const dropLoss = Number(resolveDropLossPoints(session, userId));
   if (!Number.isFinite(dropLoss)) return false;
 
@@ -2857,15 +3136,7 @@ function shouldBotTakeEarlyDrop(session, userId, handCards = [], distribution = 
 function buildEarlyDropExplainability(session, userId, handCards = [], distribution, wildJoker = null) {
   const mode = resolveSessionGameMode(session);
   const projectedGrouping = groupingService.buildBestGrouping(handCards, wildJoker);
-  const projectedLoss = Math.min(
-    80,
-    Math.max(
-      0,
-      Number(projectedGrouping?.summary?.display_point)
-        || Number(projectedGrouping?.summary?.ungrouped_points)
-        || 0
-    )
-  );
+  const projectedLoss = resolveProjectedDropLoss(projectedGrouping?.summary || {});
   const dropLoss = Number(resolveDropLossPoints(session, userId));
   const discardTop = Array.isArray(distribution?.discard_pile) ? distribution.discard_pile[0] : null;
   const closedDeck = Array.isArray(distribution?.closed_deck) ? distribution.closed_deck : [];
@@ -2880,10 +3151,10 @@ function buildEarlyDropExplainability(session, userId, handCards = [], distribut
     low_confidence: isLowConfidenceGrouping(projectedGrouping?.summary || {}),
     has_any_valid_meld: hasAnyValidMeld(handCards, wildJoker),
     open_pick_would_create_meld: discardTop
-      ? canCreateAnyMeldWithPickedCard(handCards, discardTop, wildJoker)
+      ? canMeaningfullyImproveWithPickedCard(handCards, discardTop, wildJoker)
       : false,
     closed_has_potential_meld: closedDeck.some((card) =>
-      canCreateAnyMeldWithPickedCard(handCards, card, wildJoker)),
+      canMeaningfullyImproveWithPickedCard(handCards, card, wildJoker)),
     projected_loss: projectedLoss,
     drop_loss: Number.isFinite(dropLoss) ? dropLoss : null,
     passes_dead_hand_margin: Number.isFinite(dropLoss)
@@ -6639,7 +6910,7 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
   const conservativeMode = BOT_CONSERVATIVE_PLAY_ON_LOW_CONFIDENCE
     && isLowConfidenceGrouping(handStrengthBeforeDecision.summary || {});
 
-  const finishPlan = tryBuildBotFinishPlan(
+  let finishPlan = tryBuildBotFinishPlan(
     refreshedPlayer.cards,
     refreshedDistribution.wild_joker || null,
     {
@@ -6650,6 +6921,9 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
       turnId: refreshedTurn.turn_id,
     }
   );
+  if (finishPlan?.preview?.summary?.valid_for_declare !== true) {
+    finishPlan = null;
+  }
   if (finishPlan) {
     if (typeof declarationRuntime.startWindow !== 'function') {
       throw new Error('Declaration runtime is not initialized');
@@ -8445,12 +8719,19 @@ function registerSocketServer(httpServer) {
             deal_scores: null,
           };
 
+          const completeRoundResultsWithPool = appendAbsentEliminatedPoolPlayersToRoundResults(
+            session,
+            roundResultsWithPool,
+            poolProgress,
+          );
+
+          intermediatePayload.results = completeRoundResultsWithPool;
           intermediatePayload.players = buildDeclarationTablePlayers({
-            session: { ...session, players: roundPlayers },
+            session,
             distribution,
             state,
             isFinal: true,
-            finalizedResults: roundResultsWithPool,
+            finalizedResults: completeRoundResultsWithPool,
             settlement: null,
             winnerUserId,
             declarerValid,
@@ -8460,7 +8741,7 @@ function registerSocketServer(httpServer) {
             distribution,
             reason,
             isFinal: true,
-            finalizedResults: roundResultsWithPool,
+            finalizedResults: completeRoundResultsWithPool,
             settlement: null,
             winnerUserId,
             declarerValid,
@@ -9740,10 +10021,21 @@ function registerSocketServer(httpServer) {
         });
 
         const { grouping } = resolveGroupingSnapshot(handCards, wildJoker, updatedMoveGroups);
+        const finishPlan = resolveFinishPlanForPlayerHand(
+          handCards,
+          wildJoker,
+          updatedMoveGroups,
+          sessionId,
+          socket.user.id,
+          session?.metadata?.turn?.turn_id
+        );
         console.log("[SOCKET] player:group:update:", grouping.groups);
         callback({
           success: true,
-          data: buildGroupingResponseData(grouping),
+          data: {
+            ...buildGroupingResponseData(grouping),
+            ...buildFinishPlanCallbackExtras(finishPlan),
+          },
         });
       } catch (err) {
         callback({ success: false, message: err.message });
@@ -9836,10 +10128,21 @@ function registerSocketServer(httpServer) {
         });
 
         const { grouping } = resolveGroupingSnapshot(handCards, wildJoker, updatedCreateGroups);
+        const finishPlan = resolveFinishPlanForPlayerHand(
+          handCards,
+          wildJoker,
+          updatedCreateGroups,
+          sessionId,
+          socket.user.id,
+          session?.metadata?.turn?.turn_id
+        );
 
         callback({
           success: true,
-          data: buildGroupingResponseData(grouping),
+          data: {
+            ...buildGroupingResponseData(grouping),
+            ...buildFinishPlanCallbackExtras(finishPlan),
+          },
         });
       } catch (err) {
         callback({ success: false, message: err.message });
@@ -9973,7 +10276,8 @@ function registerSocketServer(httpServer) {
         );
         const turnIdForSeed = Number(session?.metadata?.turn?.turn_id) || 0;
         const decisionSeed = buildDecisionSeed(sessionId, turnIdForSeed, socket.user.id);
-        const finishPlan = tryBuildBotFinishPlan(playerDistribution.cards, wildJoker, {
+        const finishPlan = tryBuildFinishPlan(playerDistribution.cards, wildJoker, {
+          submittedGroups: updatedPickGroups,
           groupingOptions: buildGroupingTieBreakOptions(decisionSeed),
           tieBreakSeed: decisionSeed,
           sessionId,
@@ -10062,14 +10366,7 @@ function registerSocketServer(httpServer) {
             closed_deck_count: closedDeck.length,
             discard_top: discardPile[0] || null,
             deck_reshuffled: Boolean(reshufflePayload),
-            finish_card_suggestion: finishPlan?.finishCard || null,
-            finish_plan: finishPlan
-              ? {
-                finish_card: finishPlan.finishCard,
-                submitted_groups: finishPlan.submittedGroups,
-                valid_for_declare_after_finish: finishPlan?.preview?.summary?.valid_for_declare === true,
-              }
-              : null,
+            ...buildFinishPlanCallbackExtras(finishPlan),
             ...buildGroupingResponseData(grouping),
           },
         });
@@ -11361,12 +11658,18 @@ function registerSocketServer(httpServer) {
                   total_deals: null,
                   deal_scores: null,
                 };
+                const completeRoundResultsWithPool = appendAbsentEliminatedPoolPlayersToRoundResults(
+                  session,
+                  roundResultsWithPool,
+                  poolProgress,
+                );
+                intermediatePayload.results = completeRoundResultsWithPool;
                 intermediatePayload.players = buildDeclarationTablePlayers({
                   session,
                   distribution,
                   state,
                   isFinal: true,
-                  finalizedResults: roundResultsWithPool,
+                  finalizedResults: completeRoundResultsWithPool,
                   settlement: null,
                   winnerUserId,
                   declarerValid: false,
@@ -11627,10 +11930,16 @@ function registerSocketServer(httpServer) {
 module.exports = {
   registerSocketServer,
   tryBuildBotFinishPlan,
+  tryBuildFinishPlan,
   __testHooks: {
     hasAnyValidMeld,
     shouldBotTakeEarlyDrop,
+    shouldBotStrategicallyDrop,
+    canMeaningfullyImproveWithPickedCard,
+    isHopelessHandForDrop,
+    doesStructureBlockStrategicDrop,
     tryBuildBotFinishPlan,
+    tryBuildFinishPlan,
     evaluateAdminProfitProtection,
   },
 };

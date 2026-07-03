@@ -660,11 +660,11 @@ function buildBestGrouping(cards, wildJoker, options) {
     hasOnlyZeroPointUngrouped(ungrouped, wildRank);
   const validForDeclare = allGrouped && pureCount >= 1 && seqCount >= 2;
   const totalPoints = sumPoints(hand, wildRank);
-  const hasRequiredSeqs = pureCount >= 1 && seqCount >= 2;
+  const hasPureSequence = pureCount >= 1;
   const ungroupedCardPoints = ungroupedGroups.reduce((s, g) => s + g.group_points, 0);
 
   const displayPoint = validForDeclare ? 0
-    : hasRequiredSeqs ? ungroupedCardPoints
+    : hasPureSequence ? ungroupedCardPoints
       : totalPoints;
 
   return {
@@ -771,13 +771,13 @@ function evaluateSubmittedGrouping(cards, wildJoker, submittedGroups) {
     hasOnlyZeroPointUngrouped(remainingUngrouped, wildRank);
   const validForDeclare = allGrouped && invalidCount === 0 && pureCount >= 1 && seqCount >= 2;
   const totalPoints = sumPoints(handCards, wildRank);
-  const hasRequiredSeqs = pureCount >= 1 && seqCount >= 2;
+  const hasPureSequence = pureCount >= 1;
   const invalidGroupPoints =
     groups.filter(g => !g.is_valid_meld).reduce((s, g) => s + g.group_points, 0)
     + sumPoints(ungrouped, wildRank);
 
   const displayPoint = validForDeclare ? 0
-    : hasRequiredSeqs ? invalidGroupPoints
+    : hasPureSequence ? invalidGroupPoints
       : totalPoints;
 
 

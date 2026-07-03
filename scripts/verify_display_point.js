@@ -252,6 +252,64 @@ function verifyWildJokerSplitLowersPenalty() {
   );
 }
 
+function verifyNoPureSequenceKeepsFullDisplayPoint() {
+  const hand = [
+    card('s2', '2', 'spades', 2),
+    card('s5', '5', 'spades', 5),
+    card('s8', '8', 'spades', 8),
+    card('dK', 'K', 'diamonds', 10),
+    card('hQ', 'Q', 'hearts', 10),
+    card('cJ', 'J', 'clubs', 10),
+  ];
+
+  const submittedGroups = [
+    { group_id: 1, cards: ['s2', 's5', 's8'] },
+    { group_id: 2, cards: ['dK'] },
+    { group_id: 3, cards: ['hQ'] },
+    { group_id: 4, cards: ['cJ'] },
+  ];
+
+  const submittedGrouping = groupingService.evaluateSubmittedGrouping(hand, null, submittedGroups);
+  assert(submittedGrouping.summary.pure_sequence_count === 0, 'Expected no pure sequence');
+  assert(submittedGrouping.summary.hand_points === 45, 'Expected hand_points=45');
+  assert(
+    submittedGrouping.summary.display_point === submittedGrouping.summary.hand_points,
+    'Expected full hand_points as display_point when no pure sequence exists'
+  );
+}
+
+function verifySinglePureSequenceReducesDisplayPoint() {
+  const hand = [
+    card('h2', '2', 'hearts', 2),
+    card('h3', '3', 'hearts', 3),
+    card('h4', '4', 'hearts', 4),
+    card('sK', 'K', 'spades', 10),
+    card('dQ', 'Q', 'diamonds', 10),
+    card('cJ', 'J', 'clubs', 10),
+  ];
+
+  const bestGrouping = groupingService.buildBestGrouping(hand, null);
+  assert(bestGrouping.summary.pure_sequence_count === 1, 'Expected one pure sequence');
+  assert(bestGrouping.summary.sequence_count === 1, 'Expected only one sequence');
+  assert(bestGrouping.summary.valid_for_declare === false, 'Expected declare to remain invalid with one sequence');
+  assert(bestGrouping.summary.hand_points === 39, 'Expected hand_points=39');
+  assert(
+    bestGrouping.summary.display_point === 30,
+    `Expected display_point=30 (invalid cards only), got ${bestGrouping.summary.display_point}`
+  );
+
+  const submittedGrouping = groupingService.evaluateSubmittedGrouping(hand, null, [
+    { group_id: 1, cards: ['h2', 'h3', 'h4'] },
+    { group_id: 2, cards: ['sK', 'dQ', 'cJ'] },
+  ]);
+  assert(submittedGrouping.summary.pure_sequence_count === 1, 'Expected submitted pure sequence');
+  assert(submittedGrouping.summary.valid_for_declare === false, 'Expected submitted declare to remain invalid');
+  assert(
+    submittedGrouping.summary.display_point === 30,
+    `Expected submitted display_point=30, got ${submittedGrouping.summary.display_point}`
+  );
+}
+
 function main() {
   const wildJoker = card('WJ', '5', null, 0, true);
 
@@ -281,12 +339,20 @@ function main() {
   const submittedGrouping = groupingService.evaluateSubmittedGrouping(submittedHand, wildJoker, submittedGroups);
   assert(submittedGrouping.summary.hand_points === 91, 'Expected submitted hand_points=91');
   assert(submittedGrouping.summary.ungrouped_points === 0, 'Expected submitted ungrouped_points=0');
-  assert(submittedGrouping.summary.display_point === 91, 'Expected submitted display_point=91 when sequence requirement fails');
+  assert(submittedGrouping.summary.pure_sequence_count === 1, 'Expected one pure sequence in submitted grouping');
+  assert(
+    submittedGrouping.summary.display_point === 72,
+    `Expected submitted display_point=72 when one pure sequence reduces penalty, got ${submittedGrouping.summary.display_point}`
+  );
 
   const bestGrouping = groupingService.buildBestGrouping(submittedHand, wildJoker);
   assert(
-    bestGrouping.summary.display_point === bestGrouping.summary.hand_points,
-    'Expected bestGrouping display_point to match hand_points when sequence requirement fails'
+    bestGrouping.summary.display_point < bestGrouping.summary.hand_points,
+    'Expected bestGrouping display_point to be reduced when a pure sequence exists'
+  );
+  assert(
+    bestGrouping.summary.pure_sequence_count >= 1,
+    'Expected bestGrouping to include at least one pure sequence for reduction case'
   );
 
   const suitGroups = groupingService.buildSuitGroups(submittedHand, wildJoker);
@@ -304,6 +370,8 @@ function main() {
   verifySingleLeftoverNonJokerStaysInvalid();
   verifyUngroupedAutoBucketsPreferRank();
   verifyWildJokerSplitLowersPenalty();
+  verifyNoPureSequenceKeepsFullDisplayPoint();
+  verifySinglePureSequenceReducesDisplayPoint();
 
   console.log('verify_display_point: PASS');
 }

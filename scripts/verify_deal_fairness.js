@@ -20,8 +20,8 @@ const RANKS = [
 const PLAYERS = [101, 102, 103, 104];
 const CARDS_PER_PLAYER = 13;
 const HISTORY_LIMIT = 8;
-const CANDIDATES = 3;
-const RANDOM_PICK_PROBABILITY = 0.22;
+const CANDIDATES = 5;
+const RANDOM_PICK_PROBABILITY = 0.05;
 
 function secureRandomInt(maxExclusive) {
   const max = Number(maxExclusive);

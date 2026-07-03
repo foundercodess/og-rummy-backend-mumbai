@@ -22,11 +22,15 @@ const PREGAME_LOCK_RENEW_EVERY_MS = 8000;
 const BONUS_ATTEMPTS_PER_PLAYER = 2;
 const ENTRY_DEBIT_COMMISSION_PERCENT = 12;
 const HAND_PATTERN_HISTORY_LIMIT = Math.max(3, Number(process.env.HAND_PATTERN_HISTORY_LIMIT) || 8);
-const DEAL_SHUFFLE_CANDIDATE_COUNT = Math.max(1, Math.min(5, Number(process.env.DEAL_SHUFFLE_CANDIDATE_COUNT) || 3));
-const DEAL_RANDOM_PICK_PROBABILITY = Math.max(0, Math.min(0.6, Number(process.env.DEAL_RANDOM_PICK_PROBABILITY) || 0.22));
+const DEAL_SHUFFLE_CANDIDATE_COUNT = Math.max(1, Math.min(7, Number(process.env.DEAL_SHUFFLE_CANDIDATE_COUNT) || 5));
+const DEAL_RANDOM_PICK_PROBABILITY = Math.max(0, Math.min(0.6, Number(process.env.DEAL_RANDOM_PICK_PROBABILITY) || 0.05));
 const DEAL_TOP_CANDIDATE_WINDOW = Math.max(
   1,
-  Math.min(5, Number(process.env.DEAL_TOP_CANDIDATE_WINDOW) || 3),
+  Math.min(5, Number(process.env.DEAL_TOP_CANDIDATE_WINDOW) || 2),
+);
+const DEAL_FAIRNESS_PLAYABILITY_WEIGHT = Math.max(
+  0.1,
+  Math.min(0.45, Number(process.env.DEAL_FAIRNESS_PLAYABILITY_WEIGHT) || 0.27),
 );
 
 const activePregameBySession = new Map();
@@ -671,8 +675,8 @@ function estimateSequencePotential(cards = [], wildRank = null) {
 }
 
 function computeHandPlayabilityScore(cards = [], wildRank = null) {
-  // Normalise to [0,1]; a hand with ≥3 viable meld windows is comfortably playable
-  return clamp01(estimateSequencePotential(cards, wildRank) / 3.0);
+  // Normalise to [0,1]; divisor 2.5 rewards "almost there" hands more than 3.0
+  return clamp01(estimateSequencePotential(cards, wildRank) / 2.5);
 }
 
 function computeDurationRiskScore(handsByUser = {}, wildRank = null) {
@@ -686,6 +690,12 @@ function computeDurationRiskScore(handsByUser = {}, wildRank = null) {
 
 // ─── Candidate selection ──────────────────────────────────────────────────────
 
+function computeDealDelightScore(metrics = {}) {
+  const fairness = clamp01(Number(metrics?.fairness_score) || 0);
+  const playability = clamp01(Number(metrics?.playability_score) || 0);
+  return clamp01((fairness * 0.42) + (playability * 0.58));
+}
+
 function selectBestDealCandidate(candidates = []) {
   if (!Array.isArray(candidates) || candidates.length === 0) return null;
 
@@ -693,7 +703,15 @@ function selectBestDealCandidate(candidates = []) {
   const playable = candidates.filter((c) => !c.isUnplayable);
   const pool = playable.length > 0 ? playable : candidates; // last-resort fallback
 
-  const sorted = [...pool].sort((a, b) => {
+  const delightful = pool.filter((c) => (Number(c?.metrics?.playability_score) || 0) >= 0.22);
+  const delightPool = delightful.length > 0 ? delightful : pool;
+
+  const sorted = [...delightPool].sort((a, b) => {
+    const delightDelta = computeDealDelightScore(b?.metrics) - computeDealDelightScore(a?.metrics);
+    if (delightDelta !== 0) return delightDelta;
+    if ((b?.metrics?.playability_score || 0) !== (a?.metrics?.playability_score || 0)) {
+      return (b?.metrics?.playability_score || 0) - (a?.metrics?.playability_score || 0);
+    }
     if ((b?.metrics?.fairness_score || 0) !== (a?.metrics?.fairness_score || 0)) {
       return (b?.metrics?.fairness_score || 0) - (a?.metrics?.fairness_score || 0);
     }
@@ -703,10 +721,10 @@ function selectBestDealCandidate(candidates = []) {
   const topWindow = sorted.slice(0, Math.max(1, Math.min(sorted.length, DEAL_TOP_CANDIDATE_WINDOW)));
   if (topWindow.length === 1) return topWindow[0];
 
-  // Weighted random within top window
+  // Weighted random within top window — bias toward higher delight/playability
   const weighted = topWindow.map((candidate, idx) => {
-    const fairness = clamp01(candidate?.metrics?.fairness_score || 0);
-    const base = Math.max(0.0001, fairness + 0.001);
+    const delight = computeDealDelightScore(candidate?.metrics || {});
+    const base = Math.max(0.0001, delight + 0.001);
     return base * (1 / (idx + 1));
   });
   const totalWeight = weighted.reduce((sum, v) => sum + v, 0);
@@ -794,20 +812,19 @@ function buildDealPayload({ session, players, tossWinnerUserId, seed }) {
       return jokersInHand === 0 && estimateSequencePotential(cards, resolvedWildRank) === 0;
     });
 
-    // Fairness score — rebalanced to include playability
-    // Original: variance×0.33 + repetition×0.27 + entropy×0.18 + highGap×0.14 + risk×0.08
-    // Updated:  variance×0.28 + repetition×0.25 + entropy×0.16 + highGap×0.13 + risk×0.03
-    //           + playability×0.15 (bonus)
+    // Fairness score — playability weighted for user delight (server-only selection)
     const normalizedVariance = Math.min(1, distributionVariance / 220);
     const normalizedHighCardGap = Math.min(1, highCardGap / 4);
+    const playabilityWeight = DEAL_FAIRNESS_PLAYABILITY_WEIGHT;
+    const penaltyBudget = clamp01(1 - playabilityWeight);
     const fairnessScore = clamp01(
       1
-      - (normalizedVariance * 0.28)
-      - (patternRepetitionScore * 0.25)
-      - ((1 - shuffleEntropyScore) * 0.16)
-      - (normalizedHighCardGap * 0.13)
-      - (durationRiskScore * 0.03)
-      + (playabilityScore * 0.15),
+      - (normalizedVariance * penaltyBudget * 0.34)
+      - (patternRepetitionScore * penaltyBudget * 0.30)
+      - ((1 - shuffleEntropyScore) * penaltyBudget * 0.19)
+      - (normalizedHighCardGap * penaltyBudget * 0.14)
+      - (durationRiskScore * penaltyBudget * 0.03)
+      + (playabilityScore * playabilityWeight),
     );
 
     return {
@@ -823,6 +840,10 @@ function buildDealPayload({ session, players, tossWinnerUserId, seed }) {
         shuffle_entropy_score: Number(shuffleEntropyScore.toFixed(4)),
         playability_score: Number(playabilityScore.toFixed(4)),
         fairness_score: Number(fairnessScore.toFixed(4)),
+        delight_score: Number(computeDealDelightScore({
+          fairness_score: fairnessScore,
+          playability_score: playabilityScore,
+        }).toFixed(4)),
         seed_hint: seedHint,
       },
     };
@@ -907,11 +928,14 @@ function getTossCardStrength(card) {
 }
 
 const TOSS_DECK_COUNT = 1;
+// Highest priority first — lower index wins on equal rank.
 const TOSS_SUIT_ORDER = ['spades', 'hearts', 'diamonds', 'clubs'];
 
 function getTossSuitRank(card) {
-  if (!card || !card.suit) return 0;
-  return TOSS_SUIT_ORDER.indexOf(card.suit) + 1;
+  if (!card || !card.suit) return TOSS_SUIT_ORDER.length + 1;
+  const idx = TOSS_SUIT_ORDER.indexOf(card.suit);
+  if (idx < 0) return TOSS_SUIT_ORDER.length + 1;
+  return idx + 1;
 }
 
 function buildTossResult(players) {
@@ -931,7 +955,12 @@ function buildTossResult(players) {
 
   const maxValue = Math.max(...tossEntries.map((e) => e.toss_value));
   const topEntries = tossEntries.filter((e) => e.toss_value === maxValue);
-  topEntries.sort((a, b) => b.toss_suit_rank - a.toss_suit_rank);
+  topEntries.sort((a, b) => {
+    if (a.toss_suit_rank !== b.toss_suit_rank) {
+      return a.toss_suit_rank - b.toss_suit_rank;
+    }
+    return a.seat_no - b.seat_no;
+  });
   const tossWinner = topEntries[0];
 
   return {
@@ -1696,4 +1725,19 @@ async function cancelPregame(sessionId) {
   await cleanupPregameSequence(sessionId);
 }
 
-module.exports = { startPregame, cancelPregame };
+module.exports = {
+  startPregame,
+  cancelPregame,
+  __testHooks: {
+    buildTossResult,
+    getTossCardStrength,
+    getTossSuitRank,
+    TOSS_SUIT_ORDER,
+    buildDealPayload,
+    selectBestDealCandidate,
+    computeDealDelightScore,
+    DEAL_SHUFFLE_CANDIDATE_COUNT,
+    DEAL_RANDOM_PICK_PROBABILITY,
+    DEAL_TOP_CANDIDATE_WINDOW,
+  },
+};

@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { tryBuildBotFinishPlan } = require('../realtime/socketServer');
+const { tryBuildBotFinishPlan, tryBuildFinishPlan } = require('../realtime/socketServer');
 
 function runOversizedMeldScenario() {
   const cards = [
@@ -111,10 +111,91 @@ function runThirteenCardHandReturnsNull() {
   assert.strictEqual(plan, null, '13-card hand must not produce finish plan');
 }
 
+function runUngroupedFinishCardPrefersTwoDiamonds() {
+  const cards = [
+    { rank: '7', suit: 'diamonds', value: 7, card_id: 'D7', card_uid: 'd7', is_joker: false },
+    { rank: '8', suit: 'diamonds', value: 8, card_id: 'D8', card_uid: 'd8', is_joker: false },
+    { rank: '9', suit: 'diamonds', value: 9, card_id: 'D9', card_uid: 'd9', is_joker: false },
+    { rank: 'A', suit: 'hearts', value: 10, card_id: 'HA', card_uid: 'ha', is_joker: false },
+    { rank: 'K', suit: 'hearts', value: 10, card_id: 'HK', card_uid: 'hk', is_joker: false },
+    { rank: '3', suit: 'hearts', value: 3, card_id: 'H3', card_uid: 'h3', is_joker: false },
+    { rank: '4', suit: 'hearts', value: 4, card_id: 'H4', card_uid: 'h4', is_joker: false },
+    { rank: 'A', suit: 'clubs', value: 10, card_id: 'CA', card_uid: 'ca', is_joker: false },
+    { rank: 'K', suit: 'clubs', value: 10, card_id: 'CK', card_uid: 'ck', is_joker: false },
+    { rank: 'Q', suit: 'diamonds', value: 10, card_id: 'DQ', card_uid: 'dq', is_joker: true },
+    { rank: '3', suit: 'spades', value: 3, card_id: 'S3', card_uid: 's3', is_joker: false },
+    { rank: '3', suit: 'diamonds', value: 3, card_id: 'D3', card_uid: 'd3', is_joker: false },
+    { rank: '3', suit: 'clubs', value: 3, card_id: 'C3', card_uid: 'c3', is_joker: false },
+    { rank: '2', suit: 'diamonds', value: 2, card_id: 'D2', card_uid: 'd2_finish', is_joker: false },
+  ];
+  const wildJoker = { rank: 'K', card_id: 'HK' };
+  const submittedGroups = [
+    { group_id: 1, cards: ['d7', 'd8', 'd9'] },
+    { group_id: 2, cards: ['ha', 'hk', 'h3', 'h4'] },
+    { group_id: 3, cards: ['ca', 'ck', 'dq'] },
+    { group_id: 4, cards: ['s3', 'd3', 'c3'] },
+  ];
+
+  const plan = tryBuildFinishPlan(cards, wildJoker, {
+    submittedGroups,
+    sessionId: 'verify',
+    userId: 1,
+    turnId: 1,
+  });
+
+  assert(plan, 'expected finish plan from submitted groups');
+  assert.strictEqual(plan.finishCard?.card_uid, 'd2_finish', 'expected ungrouped 2D as finish card');
+  assert.strictEqual(plan.explain?.source, 'submitted_groups');
+  assert.strictEqual(plan.preview?.summary?.valid_for_declare, true);
+}
+
+function runUngroupedInvalidLayoutSkipsBotFallback() {
+  const cards = [
+    { rank: '9', suit: 'clubs', value: 9, card_uid: 'D2_clubs_9_101', is_joker: false },
+    { rank: '10', suit: 'clubs', value: 10, card_uid: 'D1_clubs_10_49', is_joker: false },
+    { rank: 'J', suit: 'clubs', value: 10, card_uid: 'D2_clubs_J_103', is_joker: false },
+    { rank: 'Q', suit: 'clubs', value: 10, card_uid: 'D1_clubs_Q_51', is_joker: false },
+    { rank: 'K', suit: 'clubs', value: 10, card_uid: 'D1_clubs_K_52', is_joker: false },
+    { rank: '7', suit: 'spades', value: 7, card_uid: 'D2_spades_7_60', is_joker: false },
+    { rank: '8', suit: 'spades', value: 8, card_uid: 'D1_spades_8_8', is_joker: false },
+    { rank: '6', suit: 'spades', value: 6, card_uid: 'D1_spades_6_6', is_joker: false },
+    { rank: '4', suit: 'spades', value: 4, card_uid: 'D1_spades_4_4', is_joker: false },
+    { rank: '4', suit: 'hearts', value: 4, card_uid: 'D1_hearts_4_17', is_joker: false },
+    { rank: '4', suit: 'diamonds', value: 4, card_uid: 'D1_diamonds_4_30', is_joker: false },
+    { rank: '4', suit: 'clubs', value: 4, card_uid: 'D1_clubs_4_43', is_joker: false },
+    { rank: '4', suit: 'spades', value: 4, card_uid: 'D2_spades_4_57', is_joker: false },
+    { rank: '6', suit: 'hearts', value: 6, card_uid: 'D1_hearts_6_19', is_joker: false },
+  ];
+  const wildJoker = { rank: '6', card_id: 'S6' };
+  const submittedGroups = [
+    { group_id: 1, cards: ['D2_clubs_9_101', 'D1_clubs_10_49', 'D2_clubs_J_103', 'D1_clubs_Q_51'] },
+    { group_id: 2, cards: ['D2_spades_7_60', 'D1_spades_8_8'] },
+    { group_id: 3, cards: ['D1_spades_4_4', 'D1_hearts_4_17', 'D1_spades_6_6'] },
+    { group_id: 4, cards: ['D2_spades_4_57', 'D1_diamonds_4_30', 'D1_clubs_4_43'] },
+  ];
+
+  const botPlan = tryBuildBotFinishPlan(cards, wildJoker, {
+    sessionId: 'verify',
+    userId: 'bot',
+    turnId: 3,
+  });
+  assert(botPlan, 'bot heuristic should still find a finish card');
+
+  const plan = tryBuildFinishPlan(cards, wildJoker, {
+    submittedGroups,
+    sessionId: 'verify',
+    userId: 1,
+    turnId: 3,
+  });
+  assert.strictEqual(plan, null, 'invalid manual layout with leftovers must not fall back to bot finish');
+}
+
 function run() {
   runOversizedMeldScenario();
   runSession558WildJokerScenario();
   runThirteenCardHandReturnsNull();
+  runUngroupedFinishCardPrefersTwoDiamonds();
+  runUngroupedInvalidLayoutSkipsBotFallback();
   console.log('Finish plan checks passed');
 }
 
