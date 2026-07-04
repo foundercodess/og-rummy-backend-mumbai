@@ -29,7 +29,8 @@ const MAX_TOTAL_GROUPS = 6;
 
 const GROUP_TYPE_PRIORITY = {
   pure_sequence: 0, impure_sequence: 1, set: 2,
-  invalid_sequence_candidate: 3, invalid_single: 4, invalid_mixed: 5,
+  invalid_set_candidate: 3, invalid_sequence_candidate: 4,
+  invalid_single: 5, invalid_mixed: 6,
 };
 
 // ─── Joker detection ──────────────────────────────────────────────────────────
@@ -351,12 +352,9 @@ function _runDP(hand, wildRank, melds) {
 
   // Fill DP in ascending mask order so sub-problems are always ready
   for (let mask = 1; mask <= fullMask; mask++) {
+    const ungroupedPts = subsetPts[mask];
     for (let s = 0; s < SEQ_STATES; s++) {
-      // Base: leave all cards in this mask ungrouped
-      const ungrouped = subsetPts[mask];
-      // dp[idx(mask, s)] = s === 3 ? ungrouped : (BIG_OFFSET + ungrouped);
-      dp[idx(mask, s)] =
-        STATE_PENALTY[s] + ungrouped;
+      dp[idx(mask, s)] = STATE_PENALTY[s] + ungroupedPts;
       par[idx(mask, s)] = null;
 
       for (const meld of melds) {
@@ -433,7 +431,8 @@ function _runDP(hand, wildRank, melds) {
         }
 
         if (shouldTake) {
-          dp[idx(mask, s)] = subDP;
+          const meldPenalty = _meldDisplayPenalty(meld, nextS, subsetPts);
+          dp[idx(mask, s)] = subDP + meldPenalty;
           par[idx(mask, s)] = {
             sub,
             meldMask: meld.mask,
@@ -448,11 +447,69 @@ function _runDP(hand, wildRank, melds) {
   return { dp, par, subsetPts, idx };
 }
 
-function _traceGrouping(hand, par, idx) {
+function _displayPointForDpTrace(hand, wildRank, groups, ungrouped) {
+  const grouped = groups.map((meld, i) => ({
+    group_id: i + 1,
+    type: meld.type,
+    cards: meld.cards,
+    group_points: 0,
+    is_valid_meld: true,
+  }));
+  const ungroupedGroups = buildUngroupedGroups(ungrouped, wildRank, grouped.length + 1, true);
+  const allGroups = capGroupsToMax([...grouped, ...ungroupedGroups], true);
+  const pureCount = groups.filter((m) => m.type === 'pure_sequence').length;
+  const impureCount = groups.filter((m) => m.type === 'impure_sequence').length;
+  const seqCount = pureCount + impureCount;
+  const allGrouped =
+    ungrouped.length === 0 ||
+    hasOnlyZeroPointUngrouped(ungrouped, wildRank);
+  const validForDeclare = allGrouped && pureCount >= 1 && seqCount >= 2;
+  const groupsWithPts = applyGroupDisplayPoints(allGroups, {
+    pure_sequence_count: pureCount,
+    sequence_count: seqCount,
+    valid_for_declare: validForDeclare,
+  }, wildRank);
+  return computeDisplayPoint({
+    validForDeclare,
+    handCards: hand,
+    groups: groupsWithPts,
+    ungrouped,
+    wildRank,
+    pureCount,
+    seqCount,
+  });
+}
+
+function _pickBestDpTrace(hand, wildRank, dp, par, idx) {
+  const fullMask = (1 << hand.length) - 1;
+  let bestTrace = null;
+  let bestDisplay = Infinity;
+  let bestCost = Infinity;
+
+  for (let s = 0; s < 4; s++) {
+    if (s > 0 && par[idx(fullMask, s)] == null) continue;
+    const traced = _traceGrouping(hand, par, idx, fullMask, s);
+    const displayPoint = _displayPointForDpTrace(hand, wildRank, traced.groups, traced.ungrouped);
+    const cost = dp[idx(fullMask, s)];
+    const better =
+      displayPoint < bestDisplay ||
+      (displayPoint === bestDisplay && cost < bestCost) ||
+      (displayPoint === bestDisplay && cost === bestCost && s > (bestTrace?.endS ?? -1));
+    if (better) {
+      bestDisplay = displayPoint;
+      bestCost = cost;
+      bestTrace = { ...traced, endS: s };
+    }
+  }
+
+  return bestTrace || _traceGrouping(hand, par, idx, fullMask, 0);
+}
+
+function _traceGrouping(hand, par, idx, startMask, startS) {
   const fullMask = (1 << hand.length) - 1;
   const groups = [];
-  let cur = fullMask;
-  let s = 0; // start from seqState=0
+  let cur = startMask != null ? startMask : fullMask;
+  let s = startS != null ? startS : 0;
 
   while (cur > 0 && par[idx(cur, s)] !== null) {
     const { sub, meldMask, type, nextS } = par[idx(cur, s)];
@@ -532,34 +589,175 @@ function getInvalidGroupType(cards) {
   return cards.length >= 2 ? 'invalid_sequence_candidate' : 'invalid_single';
 }
 
+function isInvalidSetCandidate(cards, wildRank) {
+  if (!Array.isArray(cards) || cards.length < 2) return false;
+  const natural = cards.filter((c) => !isJoker(c, wildRank));
+  if (natural.length < 2) return false;
+  const ranks = new Set(natural.map((c) => c.rank));
+  return ranks.size === 1;
+}
+
+function getInvalidClusterType(cards, wildRank) {
+  if (!Array.isArray(cards) || cards.length <= 1) return 'invalid_single';
+  if (isInvalidSetCandidate(cards, wildRank)) return 'invalid_set_candidate';
+  return 'invalid_sequence_candidate';
+}
+
+function clusterSequenceIndices(sortedIdxs, cards, wildRank) {
+  if (sortedIdxs.length < 2) return [];
+
+  const chains = [];
+  let chain = [sortedIdxs[0]];
+
+  for (let i = 1; i < sortedIdxs.length; i++) {
+    const idx = sortedIdxs[i];
+    const prevIdx = chain[chain.length - 1];
+    const prev = cards[prevIdx];
+    const cur = cards[idx];
+    const prevOrder = rankOrderValue(prev.rank, false);
+    const curOrder = rankOrderValue(cur.rank, false);
+
+    if (curOrder <= prevOrder) {
+      if (chain.length >= 2) chains.push([...chain]);
+      chain = [idx];
+      continue;
+    }
+
+    const gap = curOrder - prevOrder;
+    const jokersInChain = chain.filter((ci) => isJoker(cards[ci], wildRank)).length;
+    const missingBetween = Math.max(0, gap - 1);
+    // One missing rank or wild fill keeps cards in the same potential-sequence bucket.
+    if (missingBetween <= 1 + jokersInChain) {
+      chain.push(idx);
+      continue;
+    }
+
+    if (chain.length >= 2) chains.push([...chain]);
+    chain = [idx];
+  }
+
+  if (chain.length >= 2) chains.push(chain);
+  return chains;
+}
+
+function clusterInvalidCards(cards, wildRank) {
+  const n = cards.length;
+  if (n === 0) return [];
+
+  const used = new Set();
+  const clusters = [];
+
+  const takeCluster = (indices) => {
+    const picked = indices.filter((i) => !used.has(i));
+    if (picked.length === 0) return;
+    picked.forEach((i) => used.add(i));
+    clusters.push(picked.map((i) => cards[i]));
+  };
+
+  // 1) Set candidates — same rank, 2+ natural cards.
+  const byRank = new Map();
+  for (let i = 0; i < n; i++) {
+    const card = cards[i];
+    if (isJoker(card, wildRank)) continue;
+    const rank = card.rank || 'unknown';
+    if (!byRank.has(rank)) byRank.set(rank, []);
+    byRank.get(rank).push(i);
+  }
+
+  [...byRank.entries()]
+    .sort((a, b) => b[1].length - a[1].length)
+    .forEach(([, idxs]) => {
+      const available = idxs.filter((i) => !used.has(i));
+      if (available.length >= 2) {
+        takeCluster(available.slice(0, MAX_SET_SIZE));
+      }
+    });
+
+  // 2) Sequence candidates — same suit, proximate ranks (one card away from valid seq).
+  const bySuit = new Map();
+  for (let i = 0; i < n; i++) {
+    if (used.has(i)) continue;
+    const card = cards[i];
+    if (isJoker(card, wildRank) || !card.suit) continue;
+    if (!bySuit.has(card.suit)) bySuit.set(card.suit, []);
+    bySuit.get(card.suit).push(i);
+  }
+
+  for (const [, idxs] of bySuit) {
+    const available = idxs.filter((i) => !used.has(i));
+    if (available.length < 2) continue;
+    const sorted = [...available].sort(
+      (a, b) => rankOrderValue(cards[a].rank, false) - rankOrderValue(cards[b].rank, false)
+    );
+    clusterSequenceIndices(sorted, cards, wildRank).forEach((chain) => takeCluster(chain));
+  }
+
+  // 3) Jokers — attach to the best nearby sequence bucket, else keep together.
+  const jokerIdxs = [];
+  for (let i = 0; i < n; i++) {
+    if (!used.has(i) && isJoker(cards[i], wildRank)) jokerIdxs.push(i);
+  }
+  if (jokerIdxs.length > 0) {
+    let attached = false;
+    for (let ci = clusters.length - 1; ci >= 0; ci--) {
+      const cluster = clusters[ci];
+      if (getInvalidClusterType(cluster, wildRank) !== 'invalid_sequence_candidate') continue;
+      jokerIdxs.forEach((ji) => {
+        used.add(ji);
+        cluster.push(cards[ji]);
+      });
+      attached = true;
+      break;
+    }
+    if (!attached) takeCluster(jokerIdxs);
+  }
+
+  // 4) Remaining rank pairs and singles.
+  const remainingByRank = new Map();
+  for (let i = 0; i < n; i++) {
+    if (used.has(i)) continue;
+    const card = cards[i];
+    if (isJoker(card, wildRank)) continue;
+    const rank = card.rank || 'unknown';
+    if (!remainingByRank.has(rank)) remainingByRank.set(rank, []);
+    remainingByRank.get(rank).push(i);
+  }
+  [...remainingByRank.entries()]
+    .sort((a, b) => b[1].length - a[1].length)
+    .forEach(([, idxs]) => {
+      const available = idxs.filter((i) => !used.has(i));
+      if (available.length >= 2) takeCluster(available);
+    });
+
+  for (let i = 0; i < n; i++) {
+    if (!used.has(i)) takeCluster([i]);
+  }
+
+  return clusters;
+}
+
 function buildUngroupedGroups(cards, wildRank, startGroupId, forceSort) {
-  const buckets = new Map();
   const suitOrder = new Map(SUITS.map((s, i) => [s, i]));
 
-  cards.forEach(card => {
-    const key = isJoker(card, wildRank)
-      ? `joker:${card.card_uid}`
-      : `rank:${card.rank || 'unknown'}`;
-    if (!buckets.has(key)) buckets.set(key, []);
-    buckets.get(key).push(card);
-  });
-
-  return [...buckets.entries()]
+  return clusterInvalidCards(cards, wildRank)
     .sort((a, b) => {
-      const [aKey, aCards] = a;
-      const [bKey, bCards] = b;
-      if (aCards.length !== bCards.length) return bCards.length - aCards.length;
-      const aOrd = RANK_TO_ORDER[aCards[0]?.rank] || 99;
-      const bOrd = RANK_TO_ORDER[bCards[0]?.rank] || 99;
+      const typeA = getInvalidClusterType(a, wildRank);
+      const typeB = getInvalidClusterType(b, wildRank);
+      const pa = GROUP_TYPE_PRIORITY[typeA] ?? 99;
+      const pb = GROUP_TYPE_PRIORITY[typeB] ?? 99;
+      if (pa !== pb) return pa - pb;
+      if (b.length !== a.length) return b.length - a.length;
+      const aOrd = RANK_TO_ORDER[a[0]?.rank] || 99;
+      const bOrd = RANK_TO_ORDER[b[0]?.rank] || 99;
       if (aOrd !== bOrd) return aOrd - bOrd;
-      const aSOrd = suitOrder.get(aCards[0]?.suit) ?? 99;
-      const bSOrd = suitOrder.get(bCards[0]?.suit) ?? 99;
+      const aSOrd = suitOrder.get(a[0]?.suit) ?? 99;
+      const bSOrd = suitOrder.get(b[0]?.suit) ?? 99;
       if (aSOrd !== bSOrd) return aSOrd - bSOrd;
-      return String(aKey).localeCompare(String(bKey));
+      return String(a[0]?.card_uid || '').localeCompare(String(b[0]?.card_uid || ''));
     })
-    .map(([, bucketCards], i) => ({
+    .map((bucketCards, i) => ({
       group_id: startGroupId + i,
-      type: getInvalidGroupType(bucketCards),
+      type: getInvalidClusterType(bucketCards, wildRank),
       cards: sortCardsForDisplay(bucketCards, forceSort),
       group_points: sumPoints(bucketCards, wildRank),
       is_valid_meld: false,
@@ -626,6 +824,91 @@ function assertNoDuplicateCardUsage(handCards, groups, ungrouped, context) {
   }
 }
 
+function computeDisplayPoint({
+  validForDeclare = false,
+  handCards = [],
+  groups = [],
+  ungrouped = [],
+  wildRank = null,
+  pureCount = 0,
+  seqCount = 0,
+}) {
+  const totalPoints = sumPoints(handCards, wildRank);
+  if (validForDeclare) return 0;
+  if (pureCount < 1) return totalPoints;
+
+  const seqRequirementMet = pureCount >= 1 && seqCount >= 2;
+  if (!seqRequirementMet) {
+    const pureUids = new Set();
+    groups.forEach((group) => {
+      if (group?.is_valid_meld === true && group.type === 'pure_sequence') {
+        (group.cards || []).forEach((card) => pureUids.add(card.card_uid));
+      }
+    });
+    let pts = 0;
+    handCards.forEach((card) => {
+      if (pureUids.has(card.card_uid)) return;
+      pts += cardPoints(card, wildRank);
+    });
+    return pts;
+  }
+
+  const invalidUids = new Set();
+  let invalidGroupPoints = 0;
+  groups.forEach((group) => {
+    if (group?.is_valid_meld === true) return;
+    (group.cards || []).forEach((card) => {
+      const uid = typeof card === 'string' ? card : card.card_uid;
+      if (uid) invalidUids.add(uid);
+    });
+    invalidGroupPoints += Number(group.group_points) || 0;
+  });
+  const extraUngroupedPoints = sumPoints(
+    ungrouped.filter(
+      (card) =>
+        !invalidUids.has(card.card_uid) && !isZeroPointUngrouped(card, wildRank)
+    ),
+    wildRank
+  );
+  return invalidGroupPoints + extraUngroupedPoints;
+}
+
+function applyGroupDisplayPoints(groups = [], summary = {}, wildRank = null) {
+  const pureCount = Number(summary.pure_sequence_count) || 0;
+  const seqCount = Number(summary.sequence_count) || 0;
+  const validForDeclare = summary.valid_for_declare === true;
+  const seqRequirementMet = pureCount >= 1 && seqCount >= 2;
+
+  return groups.map((group) => {
+    const cards = Array.isArray(group?.cards) ? group.cards : [];
+    if (validForDeclare) {
+      return { ...group, group_points: group.is_valid_meld ? 0 : group.group_points };
+    }
+    if (pureCount < 1) {
+      return {
+        ...group,
+        group_points: group.is_valid_meld ? sumPoints(cards, wildRank) : group.group_points,
+      };
+    }
+    if (!seqRequirementMet) {
+      if (group.is_valid_meld && group.type === 'pure_sequence') {
+        return { ...group, group_points: 0 };
+      }
+      if (group.is_valid_meld) {
+        return { ...group, group_points: sumPoints(cards, wildRank) };
+      }
+      return group;
+    }
+    return { ...group, group_points: group.is_valid_meld ? 0 : group.group_points };
+  });
+}
+
+function _meldDisplayPenalty(meld, nextSeqState, subsetPts) {
+  if (meld.type === 'pure_sequence') return 0;
+  if (nextSeqState === 3) return 0;
+  return subsetPts[meld.mask];
+}
+
 // ─── buildBestGrouping ────────────────────────────────────────────────────────
 
 function buildBestGrouping(cards, wildJoker, options) {
@@ -636,8 +919,8 @@ function buildBestGrouping(cards, wildJoker, options) {
   if (n === 0) return _emptyResult();
 
   const melds = _enumerateMelds(hand, wildRank);
-  const { par, idx } = _runDP(hand, wildRank, melds);
-  const { groups, ungrouped } = _traceGrouping(hand, par, idx);
+  const { dp, par, idx } = _runDP(hand, wildRank, melds);
+  const { groups, ungrouped } = _pickBestDpTrace(hand, wildRank, dp, par, idx);
 
   const grouped = groups.map((meld, i) => ({
     group_id: i + 1,
@@ -660,40 +943,49 @@ function buildBestGrouping(cards, wildJoker, options) {
     hasOnlyZeroPointUngrouped(ungrouped, wildRank);
   const validForDeclare = allGrouped && pureCount >= 1 && seqCount >= 2;
   const totalPoints = sumPoints(hand, wildRank);
-  const hasPureSequence = pureCount >= 1;
   const ungroupedCardPoints = ungroupedGroups.reduce((s, g) => s + g.group_points, 0);
 
-  const displayPoint = validForDeclare ? 0
-    : hasPureSequence ? ungroupedCardPoints
-      : totalPoints;
+  const summaryBase = {
+    valid_for_declare: validForDeclare,
+    all_cards_grouped: allGrouped,
+    invalid_group_count:
+      ungroupedGroups.filter(
+        g => g.group_points > 0
+      ).length,
+    pure_sequence_count: pureCount,
+    sequence_count: seqCount,
+    grouped_cards_count:
+      hand.length -
+      ungrouped.filter(c => !isZeroPointUngrouped(c, wildRank)).length,
+    ungrouped_cards_count:
+      ungrouped.filter(c => !isZeroPointUngrouped(c, wildRank)).length,
+    grouped_points: grouped.reduce((s, g) => s + g.group_points, 0),
+    ungrouped_points: sumPoints(ungrouped, wildRank),
+    hand_points: totalPoints,
+    grouping_confidence: null,
+    decision_margin: null,
+    alternative_count: null,
+  };
+  const displayPoint = computeDisplayPoint({
+    validForDeclare,
+    handCards: hand,
+    groups: allGroups,
+    ungrouped,
+    wildRank,
+    pureCount,
+    seqCount,
+  });
+  const groupsWithDisplayPoints = applyGroupDisplayPoints(allGroups, {
+    ...summaryBase,
+    display_point: displayPoint,
+  }, wildRank);
 
   return {
-    groups: allGroups,
+    groups: groupsWithDisplayPoints,
     ungrouped_cards: ungrouped,
     summary: {
-      valid_for_declare: validForDeclare,
-      all_cards_grouped: allGrouped,
-      // invalid_group_count: ungroupedGroups.length,
-      invalid_group_count:
-        ungroupedGroups.filter(
-          g => g.group_points > 0
-        ).length,
-      pure_sequence_count: pureCount,
-      sequence_count: seqCount,
-      // grouped_cards_count: hand.length - ungrouped.length,
-      grouped_cards_count:
-        hand.length -
-        ungrouped.filter(c => !isZeroPointUngrouped(c, wildRank)).length,
-      // ungrouped_cards_count: ungrouped.length,
-      ungrouped_cards_count:
-        ungrouped.filter(c => !isZeroPointUngrouped(c, wildRank)).length,
-      grouped_points: grouped.reduce((s, g) => s + g.group_points, 0),
-      ungrouped_points: sumPoints(ungrouped, wildRank),
+      ...summaryBase,
       display_point: displayPoint,
-      hand_points: totalPoints,
-      grouping_confidence: null,
-      decision_margin: null,
-      alternative_count: null,
     },
   };
 }
@@ -771,38 +1063,47 @@ function evaluateSubmittedGrouping(cards, wildJoker, submittedGroups) {
     hasOnlyZeroPointUngrouped(remainingUngrouped, wildRank);
   const validForDeclare = allGrouped && invalidCount === 0 && pureCount >= 1 && seqCount >= 2;
   const totalPoints = sumPoints(handCards, wildRank);
-  const hasPureSequence = pureCount >= 1;
-  const invalidGroupPoints =
-    groups.filter(g => !g.is_valid_meld).reduce((s, g) => s + g.group_points, 0)
-    + sumPoints(ungrouped, wildRank);
-
-  const displayPoint = validForDeclare ? 0
-    : hasPureSequence ? invalidGroupPoints
-      : totalPoints;
-
 
   const ungroupedGroups = buildUngroupedGroups(ungrouped, wildRank, groups.length + 1, false);
   const allGroups = capGroupsToMax([...groups, ...ungroupedGroups], false);
   assertNoDuplicateCardUsage(handCards, allGroups, [], 'submitted_grouping');
 
-  return {
+  const summaryBase = {
+    valid_for_declare: validForDeclare,
+    all_cards_grouped: allGrouped,
+    invalid_group_count: invalidCount,
+    pure_sequence_count: pureCount,
+    sequence_count: seqCount,
+    grouped_cards_count: used.size,
+    ungrouped_cards_count: ungrouped.length,
+    grouped_points: groups.reduce((s, g) => s + g.group_points, 0),
+    ungrouped_points: sumPoints(ungrouped, wildRank),
+    hand_points: totalPoints,
+    grouping_confidence: null,
+    decision_margin: null,
+    alternative_count: null,
+  };
+  const displayPoint = computeDisplayPoint({
+    validForDeclare,
+    handCards,
     groups: allGroups,
+    ungrouped,
+    wildRank,
+    pureCount,
+    seqCount,
+  });
+
+  const groupsWithDisplayPoints = applyGroupDisplayPoints(allGroups, {
+    ...summaryBase,
+    display_point: displayPoint,
+  }, wildRank);
+
+  return {
+    groups: groupsWithDisplayPoints,
     ungrouped_cards: ungrouped,
     summary: {
-      valid_for_declare: validForDeclare,
-      all_cards_grouped: allGrouped,
-      invalid_group_count: invalidCount,
-      pure_sequence_count: pureCount,
-      sequence_count: seqCount,
-      grouped_cards_count: used.size,
-      ungrouped_cards_count: ungrouped.length,
-      grouped_points: groups.reduce((s, g) => s + g.group_points, 0),
-      ungrouped_points: sumPoints(ungrouped, wildRank),
+      ...summaryBase,
       display_point: displayPoint,
-      hand_points: totalPoints,
-      grouping_confidence: null,
-      decision_margin: null,
-      alternative_count: null,
     },
   };
 }
@@ -884,4 +1185,10 @@ function hasOnlyZeroPointUngrouped(cards, wildRank) {
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
-module.exports = { buildBestGrouping, buildSuitGroups, evaluateSubmittedGrouping };
+module.exports = {
+  buildBestGrouping,
+  buildSuitGroups,
+  evaluateSubmittedGrouping,
+  computeDisplayPoint,
+  applyGroupDisplayPoints,
+};

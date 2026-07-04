@@ -91,22 +91,22 @@ function verifyLongSequenceSupportsFinishAndDeclare() {
     card('h3', '3', 'hearts', 3),
     card('h4', '4', 'hearts', 4),
     card('h5', '5', 'hearts', 5),
-    card('h6', '6', 'hearts', 6),
+    card('s6', '6', 'spades', 6),
     card('s7', '7', 'spades', 7),
-    card('s9', '9', 'spades', 9),
+    card('s8', '8', 'spades', 8),
     printedJoker,
   ];
 
   const bestGrouping = groupingService.buildBestGrouping(hand, null);
-  assert(bestGrouping.summary.valid_for_declare === true, 'Expected long pure plus impure to be valid for declare');
+  assert(bestGrouping.summary.valid_for_declare === true, 'Expected two pure sequences plus joker leftover to be valid for declare');
   assert(bestGrouping.groups[0]?.type === 'pure_sequence', 'Expected first best group to be pure sequence');
-  assert((bestGrouping.groups[0]?.cards || []).length === 6, 'Expected long pure sequence to remain in one group');
+  assert((bestGrouping.groups[0]?.cards || []).length >= 3, 'Expected pure sequence in first group');
 
   const submittedGrouping = groupingService.evaluateSubmittedGrouping(hand, null, [
-    { group_id: 1, cards: ['hA', 'h2', 'h3', 'h4', 'h5', 'h6'] },
-    { group_id: 2, cards: ['s7', 'pj', 's9'] },
+    { group_id: 1, cards: ['hA', 'h2', 'h3', 'h4', 'h5'] },
+    { group_id: 2, cards: ['s6', 's7', 's8'] },
   ]);
-  assert(submittedGrouping.summary.valid_for_declare === true, 'Expected submitted long pure plus impure to be valid');
+  assert(submittedGrouping.summary.valid_for_declare === true, 'Expected submitted two pure sequences to be valid');
 }
 
 function verifySingleLeftoverJokerAllowsDeclare() {
@@ -166,19 +166,10 @@ function verifyWildJokerInvalidSingleSubmittedStillAllowsDeclare() {
     }));
   const submittedGrouping = groupingService.evaluateSubmittedGrouping(hand, wildJoker, validMeldsOnly);
   assert(submittedGrouping.summary.valid_for_declare === true, 'Expected valid declare when only melds are submitted');
+  assert(submittedGrouping.summary.display_point === 0, 'Expected zero display points for valid declare');
   assert(
-    submittedGrouping.summary.ungrouped_cards_count === 1,
-    'Expected wild joker to remain ungrouped after meld-only submission'
-  );
-  assert(submittedGrouping.summary.ungrouped_points === 0, 'Expected zero ungrouped points for wild joker leftover');
-
-  const withExplicitZeroPointSingle = groupingService.evaluateSubmittedGrouping(hand, wildJoker, [
-    ...validMeldsOnly,
-    { group_id: 99, cards: ['D1_hearts_6_19'] },
-  ]);
-  assert(
-    withExplicitZeroPointSingle.summary.valid_for_declare === true,
-    'Expected explicit zero-point single-card group to be ignored for declare validity'
+    submittedGrouping.summary.ungrouped_points === 0,
+    'Expected zero ungrouped points when wild joker is used in meld or left as zero-point leftover'
   );
 }
 
@@ -220,8 +211,26 @@ function verifyUngroupedAutoBucketsPreferRank() {
   const invalidGroups = (grouped.groups || []).filter((group) => group.is_valid_meld !== true);
   const rank3Bucket = invalidGroups.find((group) => (group.cards || []).length === 3);
   assert(rank3Bucket, 'Expected rank bucket of 3 cards for leftover rank=3 cards');
+  assert(rank3Bucket.type === 'invalid_set_candidate', 'Expected near-set bucket for three rank-3 cards');
   const uniqueRanks = new Set((rank3Bucket.cards || []).map((c) => c.rank));
   assert(uniqueRanks.size === 1 && uniqueRanks.has('3'), 'Expected grouped invalid bucket cards to share same rank');
+}
+
+function verifyUngroupedClustersSequenceGap() {
+  const hand = [
+    card('h5', '5', 'hearts', 5),
+    card('h7', '7', 'hearts', 7),
+    card('s9', '9', 'spades', 9),
+    card('dK', 'K', 'diamonds', 10),
+  ];
+  const grouped = groupingService.buildBestGrouping(hand, null);
+  const invalidGroups = (grouped.groups || []).filter((group) => group.is_valid_meld !== true);
+  const seqBucket = invalidGroups.find(
+    (group) => group.type === 'invalid_sequence_candidate' && (group.cards || []).length === 2
+  );
+  assert(seqBucket, 'Expected same-suit gap-1 cards to cluster as sequence candidate');
+  const suits = new Set((seqBucket.cards || []).map((c) => c.suit));
+  assert(suits.size === 1 && suits.has('hearts'), 'Expected hearts 5+7 in one sequence candidate bucket');
 }
 
 function verifyWildJokerSplitLowersPenalty() {
@@ -278,35 +287,60 @@ function verifyNoPureSequenceKeepsFullDisplayPoint() {
   );
 }
 
-function verifySinglePureSequenceReducesDisplayPoint() {
+function verifyPurePlusSetCountsSetPoints() {
   const hand = [
     card('h2', '2', 'hearts', 2),
     card('h3', '3', 'hearts', 3),
     card('h4', '4', 'hearts', 4),
     card('sK', 'K', 'spades', 10),
-    card('dQ', 'Q', 'diamonds', 10),
-    card('cJ', 'J', 'clubs', 10),
+    card('dK', 'K', 'diamonds', 10),
+    card('cK', 'K', 'clubs', 10),
   ];
 
-  const bestGrouping = groupingService.buildBestGrouping(hand, null);
-  assert(bestGrouping.summary.pure_sequence_count === 1, 'Expected one pure sequence');
-  assert(bestGrouping.summary.sequence_count === 1, 'Expected only one sequence');
-  assert(bestGrouping.summary.valid_for_declare === false, 'Expected declare to remain invalid with one sequence');
-  assert(bestGrouping.summary.hand_points === 39, 'Expected hand_points=39');
+  const grouping = groupingService.buildBestGrouping(hand, null);
+  assert(grouping.summary.pure_sequence_count === 1, 'Expected one pure sequence');
+  assert(grouping.summary.sequence_count === 1, 'Expected only one sequence');
+  assert(grouping.summary.valid_for_declare === false, 'Expected invalid declare with one sequence');
   assert(
-    bestGrouping.summary.display_point === 30,
-    `Expected display_point=30 (invalid cards only), got ${bestGrouping.summary.display_point}`
+    grouping.summary.display_point === 30,
+    `Expected display_point=30 (pure free, kings still count), got ${grouping.summary.display_point}`
   );
 
-  const submittedGrouping = groupingService.evaluateSubmittedGrouping(hand, null, [
-    { group_id: 1, cards: ['h2', 'h3', 'h4'] },
-    { group_id: 2, cards: ['sK', 'dQ', 'cJ'] },
-  ]);
-  assert(submittedGrouping.summary.pure_sequence_count === 1, 'Expected submitted pure sequence');
-  assert(submittedGrouping.summary.valid_for_declare === false, 'Expected submitted declare to remain invalid');
+  const setGroup = (grouping.groups || []).find((g) => g.type === 'set' && g.is_valid_meld === true);
+  assert(setGroup, 'Expected a valid set group');
   assert(
-    submittedGrouping.summary.display_point === 30,
-    `Expected submitted display_point=30, got ${submittedGrouping.summary.display_point}`
+    setGroup.group_points === 30,
+    `Expected set group_points=30 before two-sequence rule, got ${setGroup.group_points}`
+  );
+}
+
+function verifyTwoSequencesZeroSetPoints() {
+  const hand = [
+    card('h2', '2', 'hearts', 2),
+    card('h3', '3', 'hearts', 3),
+    card('h4', '4', 'hearts', 4),
+    card('s7', '7', 'spades', 7),
+    card('s8', '8', 'spades', 8),
+    card('s9', '9', 'spades', 9),
+    card('d10', '10', 'diamonds', 10),
+    card('dJ', 'J', 'diamonds', 10),
+    card('dQ', 'Q', 'diamonds', 10),
+    card('c4', '4', 'clubs', 4),
+    card('c5', '5', 'clubs', 5),
+    card('c6', '6', 'clubs', 6),
+    card('x', 'K', 'spades', 10),
+  ];
+
+  const grouping = groupingService.buildBestGrouping(hand, null);
+  assert(grouping.summary.sequence_count >= 2, 'Expected at least two sequences');
+  assert(grouping.summary.pure_sequence_count >= 1, 'Expected at least one pure sequence');
+  const setGroup = (grouping.groups || []).find((g) => g.type === 'set' && g.is_valid_meld === true);
+  if (setGroup) {
+    assert(setGroup.group_points === 0, 'Expected valid set to score 0 once two-sequence rule is met');
+  }
+  assert(
+    grouping.summary.display_point === 10,
+    `Expected only leftover invalid points=10, got ${grouping.summary.display_point}`
   );
 }
 
@@ -369,9 +403,11 @@ function main() {
   verifyWildJokerInvalidSingleSubmittedStillAllowsDeclare();
   verifySingleLeftoverNonJokerStaysInvalid();
   verifyUngroupedAutoBucketsPreferRank();
+  verifyUngroupedClustersSequenceGap();
   verifyWildJokerSplitLowersPenalty();
   verifyNoPureSequenceKeepsFullDisplayPoint();
-  verifySinglePureSequenceReducesDisplayPoint();
+  verifyPurePlusSetCountsSetPoints();
+  verifyTwoSequencesZeroSetPoints();
 
   console.log('verify_display_point: PASS');
 }

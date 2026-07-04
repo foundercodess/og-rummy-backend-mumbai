@@ -179,9 +179,16 @@ function canFinishAfterOneDiscard(cards = [], wildJoker = null, options = {}) {
   return false;
 }
 
+function urgencyScaledThreshold(baseThreshold, urgency = 0.5) {
+  const clamped = Math.max(0, Math.min(1, Number(urgency) || 0.5));
+  return baseThreshold * (1.2 - (clamped * 0.55));
+}
+
 function chooseBotPickSource(distribution, playerCards = [], wildJoker = null, options = {}) {
   const softRiggingEnabled = options?.softRiggingEnabled === true;
   const conservativeMode = options?.conservativeMode === true;
+  const playToWin = options?.playToWin === true;
+  const urgency = Math.max(0, Math.min(1, Number(options?.playUrgency) || 0.55));
   const tieBreakSeed = options?.tieBreakSeed ? String(options.tieBreakSeed) : '';
   const discardTop = Array.isArray(distribution?.discard_pile) ? distribution.discard_pile[0] : null;
   if (!discardTop) return 'closed';
@@ -195,28 +202,46 @@ function chooseBotPickSource(distribution, playerCards = [], wildJoker = null, o
   const afterSummary = after.summary || {};
   const canFinishBefore = canFinishAfterOneDiscard(playerCards, wildJoker, options);
   const canFinishAfterPick = canFinishAfterOneDiscard([...playerCards, discardTop], wildJoker, options);
+  const needsPure = before.pureCount === 0;
+  const proactive = playToWin || urgency >= 0.7;
 
-  if (conservativeMode && improvement < 12 && pickImportance < 48) return 'closed';
+  const conservativeOpenGate = urgencyScaledThreshold(12, urgency);
+  const minFinishImprovement = urgencyScaledThreshold(18, urgency);
+  const minGroupedImprovement = urgencyScaledThreshold(10, urgency);
+  const minUngroupedImprovement = urgencyScaledThreshold(4, urgency);
+  const minImportancePick = urgencyScaledThreshold(44, urgency);
+  const minImportanceDelta = urgencyScaledThreshold(4, urgency);
+
+  if (conservativeMode && improvement < conservativeOpenGate && pickImportance < urgencyScaledThreshold(48, urgency)) {
+    return 'closed';
+  }
 
   if (isWildcard(discardTop, before.wildRank)) return 'discard';
   if (canFinishAfterPick && !canFinishBefore) return 'discard';
   if (afterSummary.valid_for_declare === true && beforeSummary.valid_for_declare !== true) return 'discard';
+  if (needsPure && after.pureCount > before.pureCount) return 'discard';
+  if (proactive && needsPure && after.sequenceCount > before.sequenceCount && improvement >= 2) return 'discard';
   if (after.pureCount > before.pureCount) return 'discard';
   if (after.impureCount > before.impureCount) return 'discard';
   if (after.sequenceCount > before.sequenceCount) return 'discard';
-  if (after.groupedCount > before.groupedCount && improvement >= 10) return 'discard';
-  if ((Number(afterSummary.ungrouped_points) || 0) < (Number(beforeSummary.ungrouped_points) || 0) && improvement >= 4) {
-    if (!softRiggingEnabled || seededFloat(tieBreakSeed, 'pick-ungrouped') >= 0.35) return 'discard';
+  if (after.groupedCount > before.groupedCount && improvement >= minGroupedImprovement) return 'discard';
+  if ((Number(afterSummary.ungrouped_points) || 0) < (Number(beforeSummary.ungrouped_points) || 0)
+    && improvement >= minUngroupedImprovement) {
+    if (!softRiggingEnabled || seededFloat(tieBreakSeed, 'pick-ungrouped') >= (proactive ? 0.2 : 0.35)) return 'discard';
     return 'closed';
   }
-  if (pickImportance >= 44 && improvement >= 4) {
-    if (!softRiggingEnabled || seededFloat(tieBreakSeed, 'pick-importance') >= 0.30) return 'discard';
+  if (pickImportance >= minImportancePick && improvement >= minImportanceDelta) {
+    if (!softRiggingEnabled || seededFloat(tieBreakSeed, 'pick-importance') >= (proactive ? 0.15 : 0.30)) return 'discard';
     return 'closed';
   }
 
-  if (improvement >= 18) {
-    if (!softRiggingEnabled || seededFloat(tieBreakSeed, 'pick-improvement') >= 0.25) return 'discard';
+  if (improvement >= minFinishImprovement) {
+    if (!softRiggingEnabled || seededFloat(tieBreakSeed, 'pick-improvement') >= (proactive ? 0.12 : 0.25)) return 'discard';
     return 'closed';
+  }
+
+  if (proactive && needsPure && pickImportance >= 30 && improvement >= 2) {
+    return 'discard';
   }
 
   return 'closed';
@@ -227,7 +252,10 @@ function buildDiscardCandidateRanking(cards = [], wildJoker = null, options = {}
 
   const tieBreakSeed = options?.tieBreakSeed ? String(options.tieBreakSeed) : '';
   const conservativeMode = options?.conservativeMode === true;
+  const playToWin = options?.playToWin === true;
+  const urgency = Math.max(0, Math.min(1, Number(options?.playUrgency) || 0.55));
   const nearEqualMargin = Math.max(0.5, Number(options?.nearEqualMargin) || 8);
+  const proactive = playToWin || urgency >= 0.7;
 
   const currentGrouping = groupingService.buildBestGrouping(cards, wildJoker, options?.groupingOptions || {});
   const groupedIds = new Set(
@@ -247,10 +275,16 @@ function buildDiscardCandidateRanking(cards = [], wildJoker = null, options = {}
     const remainingState = evaluateHandStrength(remainingCards, wildJoker, options);
     const importance = getCardImportance(candidate, cards, wildRank);
     const value = getCardValue(candidate, wildRank);
-    const isolatedBonus = isCardIsolated(candidate, cards, wildRank) ? 14 : 0;
-    const groupedPenalty = groupedIds.has(candidate.card_uid) ? 35 : 0;
+    const isolatedBonus = isCardIsolated(candidate, cards, wildRank) ? (proactive ? 18 : 14) : 0;
+    const groupedPenalty = groupedIds.has(candidate.card_uid) ? (proactive ? 42 : 35) : 0;
+    const highValueIsolatedPenalty = proactive && isolatedBonus > 0 && value >= 10 ? (value * 0.35) : 0;
 
-    const discardScore = remainingState.score + (value * 2) + isolatedBonus - (importance * 2) - groupedPenalty;
+    const discardScore = remainingState.score
+      + (value * 2)
+      + isolatedBonus
+      + highValueIsolatedPenalty
+      - (importance * 2)
+      - groupedPenalty;
 
     return {
       candidate,

@@ -190,9 +190,45 @@ function runUngroupedInvalidLayoutSkipsBotFallback() {
   assert.strictEqual(plan, null, 'invalid manual layout with leftovers must not fall back to bot finish');
 }
 
+function runScreenshotStyleFinishPlan() {
+  const cards = [
+    { rank: '4', suit: 'spades', value: 4, card_uid: 'ps4', is_joker: false },
+    { rank: '5', suit: 'spades', value: 5, card_uid: 'ps5', is_joker: false },
+    { rank: '6', suit: 'spades', value: 6, card_uid: 'ps6', is_joker: false },
+    { rank: '10', suit: 'diamonds', value: 10, card_uid: 'd10', is_joker: false },
+    { rank: 'A', suit: 'spades', value: 10, card_uid: 'jas', is_joker: true },
+    { rank: 'Q', suit: 'diamonds', value: 10, card_uid: 'dq', is_joker: false },
+    { rank: 'K', suit: 'diamonds', value: 10, card_uid: 'dk', is_joker: false },
+    { rank: '2', suit: 'spades', value: 2, card_uid: 's2', is_joker: false },
+    { rank: '2', suit: 'diamonds', value: 2, card_uid: 'd2', is_joker: false },
+    { rank: '2', suit: 'clubs', value: 2, card_uid: 'c2', is_joker: false },
+    { rank: '5', suit: 'hearts', value: 5, card_uid: 'h5', is_joker: false },
+    { rank: '5', suit: 'clubs', value: 5, card_uid: 'c5', is_joker: false },
+    { rank: 'A', suit: 'diamonds', value: 10, card_uid: 'jad', is_joker: true },
+    { rank: '4', suit: 'clubs', value: 4, card_uid: 'c4lone', is_joker: false },
+  ];
+  const wildJoker = { rank: '7', card_id: 'h7' };
+  const groupingService = require('../services/grouping.service');
+
+  const bestGrouping = groupingService.buildBestGrouping(cards, wildJoker);
+  assert.strictEqual(bestGrouping.summary.display_point, 4, 'expected lone 4C to be only display points');
+  assert.strictEqual(bestGrouping.summary.sequence_count, 2, 'expected two sequences in best grouping');
+
+  const plan = tryBuildBotFinishPlan(cards, wildJoker, {
+    tieBreakSeed: 'verify:finish:screenshot',
+    sessionId: 'verify',
+    userId: 1,
+    turnId: 4,
+  });
+  assert(plan, 'expected finish plan for screenshot-style hand');
+  assert.strictEqual(plan.finishCard?.card_uid, 'c4lone', 'expected lone 4C as finish card');
+  assert.strictEqual(plan.preview?.summary?.valid_for_declare, true);
+}
+
 function run() {
   runOversizedMeldScenario();
   runSession558WildJokerScenario();
+  runScreenshotStyleFinishPlan();
   runThirteenCardHandReturnsNull();
   runUngroupedFinishCardPrefersTwoDiamonds();
   runUngroupedInvalidLayoutSkipsBotFallback();

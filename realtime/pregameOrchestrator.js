@@ -902,6 +902,7 @@ function buildDealPayload({ session, players, tossWinnerUserId, seed }) {
           cards: playerCards,
           auto_groups: suitGrouping,
           submitted_groups: submittedGroups,
+          auto_best_group: false,
           has_picked: false,
         };
       }),

@@ -157,18 +157,29 @@ const BOT_AGGRESSIVE_PICK_DELAY_MAX_MULTIPLIER = 0.52;
 const BOT_AGGRESSIVE_DISCARD_DELAY_MIN_MULTIPLIER = 0.22;
 const BOT_AGGRESSIVE_DISCARD_DELAY_MAX_MULTIPLIER = 0.48;
 const BOT_STRATEGIC_DROP_ENABLED = String(process.env.BOT_STRATEGIC_DROP_ENABLED || 'true').trim().toLowerCase() === 'true';
-const BOT_DROP_BENEFIT_THRESHOLD = Math.max(12, Number(process.env.BOT_DROP_BENEFIT_THRESHOLD) || 20);
-const BOT_STRATEGIC_DROP_EARLY_TURN_GATE = Math.max(1, Number(process.env.BOT_STRATEGIC_DROP_EARLY_TURN_GATE) || 4);
-const BOT_HOPELESS_DISPLAY_POINT = Math.max(30, Number(process.env.BOT_HOPELESS_DISPLAY_POINT) || 45);
-const BOT_HOPELESS_TURN_MIN = Math.max(1, Number(process.env.BOT_HOPELESS_TURN_MIN) || 4);
-const BOT_HOPELESS_DROP_BENEFIT_MIN = Math.max(10, Number(process.env.BOT_HOPELESS_DROP_BENEFIT_MIN) || 15);
+const BOT_DROP_BENEFIT_THRESHOLD = Math.max(12, Number(process.env.BOT_DROP_BENEFIT_THRESHOLD) || 28);
+const BOT_STRATEGIC_DROP_EARLY_TURN_GATE = Math.max(1, Number(process.env.BOT_STRATEGIC_DROP_EARLY_TURN_GATE) || 6);
+const BOT_HOPELESS_DISPLAY_POINT = Math.max(30, Number(process.env.BOT_HOPELESS_DISPLAY_POINT) || 58);
+const BOT_HOPELESS_TURN_MIN = Math.max(1, Number(process.env.BOT_HOPELESS_TURN_MIN) || 5);
+const BOT_HOPELESS_DROP_BENEFIT_MIN = Math.max(10, Number(process.env.BOT_HOPELESS_DROP_BENEFIT_MIN) || 28);
 const BOT_EARLY_DROP_MEANINGFUL_UNGROUPED_REDUCTION = Math.max(
   6,
   Number(process.env.BOT_EARLY_DROP_MEANINGFUL_UNGROUPED_REDUCTION) || 10
 );
 const BOT_STRUCTURE_BLOCK_UNGROUPED_MAX = Math.max(
   15,
-  Number(process.env.BOT_STRUCTURE_BLOCK_UNGROUPED_MAX) || 35
+  Number(process.env.BOT_STRUCTURE_BLOCK_UNGROUPED_MAX) || 38
+);
+const BOT_POOL_COMFORTABLE_HEADROOM = Math.max(20, Number(process.env.BOT_POOL_COMFORTABLE_HEADROOM) || 45);
+const BOT_POOL_NEAR_ELIMINATION_HEADROOM = Math.max(8, Number(process.env.BOT_POOL_NEAR_ELIMINATION_HEADROOM) || 28);
+const BOT_EARLY_DROP_MIN_MARGIN = Math.max(10, Number(process.env.BOT_EARLY_DROP_MIN_MARGIN) || 35);
+const BOT_STRATEGIC_DROP_MAX_PROBABILITY = Math.max(
+  0.05,
+  Math.min(0.6, Number(process.env.BOT_STRATEGIC_DROP_MAX_PROBABILITY) || 0.28)
+);
+const BOT_POOL_STRATEGIC_DROP_MAX_PROBABILITY = Math.max(
+  0.05,
+  Math.min(0.5, Number(process.env.BOT_POOL_STRATEGIC_DROP_MAX_PROBABILITY) || 0.22)
 );
 const BOT_SPLIT_AUTO_RESPONSE_MIN_MS = Math.max(250, Number(process.env.BOT_SPLIT_AUTO_RESPONSE_MIN_MS) || 600);
 const BOT_SPLIT_AUTO_RESPONSE_MAX_MS = Math.max(BOT_SPLIT_AUTO_RESPONSE_MIN_MS, Number(process.env.BOT_SPLIT_AUTO_RESPONSE_MAX_MS) || 1500);
@@ -1978,7 +1989,7 @@ function isDeclarationWindowActive(sessionId, metadata = {}) {
   return String(metadata?.phase || '').toLowerCase() === 'declaration_window';
 }
 
-function cleanupTurnState(sessionId) {
+function cleanupTurnTimeoutOnly(sessionId) {
   const state = activeTurnBySession.get(sessionId);
   if (!state) return;
 
@@ -1987,6 +1998,10 @@ function cleanupTurnState(sessionId) {
   }
 
   activeTurnBySession.delete(sessionId);
+}
+
+function cleanupTurnState(sessionId) {
+  cleanupTurnTimeoutOnly(sessionId);
   cleanupBotActionState(sessionId);
 }
 
@@ -2444,11 +2459,52 @@ function hasBotPlayer(session) {
 }
 
 function isBotSoftRiggingEnabled(session = null) {
-  const envEnabled = String('true').trim().toLowerCase() === 'true';
+  const envEnabled = String(process.env.ENABLE_BOT_SOFT_RIGGING || 'false').trim().toLowerCase() === 'true';
   const metadata = session?.metadata || {};
   const runtimeToggle = metadata?.bot_soft_rigging_enabled;
   const runtimeEnabled = runtimeToggle == null ? envEnabled : runtimeToggle === true;
   return runtimeEnabled && hasBotPlayer(session);
+}
+
+function buildBotPlayContext(session = {}, userId = null) {
+  const mode = resolveSessionGameMode(session);
+  const poolLimit = resolvePoolLimit(session);
+  const scoresByUser = session?.metadata?.pool_scores_by_user || {};
+  const currentPoolScore = Number(scoresByUser[String(userId)]) || 0;
+  const safePoolLimit = Number.isFinite(poolLimit) ? poolLimit : 101;
+  const scoreHeadroom = safePoolLimit - currentPoolScore;
+  const dealLike = isDealLikeMode(mode);
+
+  let urgency = 0.55;
+  let playToWin = false;
+  if (dealLike) {
+    urgency = 0.9;
+    playToWin = true;
+  } else if (mode === 'pool') {
+    if (scoreHeadroom > BOT_POOL_COMFORTABLE_HEADROOM) {
+      urgency = 0.82;
+      playToWin = true;
+    } else if (scoreHeadroom <= BOT_POOL_NEAR_ELIMINATION_HEADROOM) {
+      urgency = 0.38;
+      playToWin = false;
+    } else {
+      urgency = 0.62;
+      playToWin = true;
+    }
+  } else if (mode === 'points') {
+    urgency = 0.68;
+    playToWin = true;
+  }
+
+  return {
+    mode,
+    playToWin,
+    urgency,
+    scoreHeadroom,
+    currentPoolScore,
+    poolLimit: safePoolLimit,
+    dealLike,
+  };
 }
 
 function calculateRiggingNeedScore(summary = {}) {
@@ -2488,7 +2544,14 @@ function tryFindBotCardInClosedDeck(closedDeck, botCards, wildJoker, options = {
   }
 
   const needScore = calculateRiggingNeedScore(currentSummary);
-  const activationChance = Math.max(0.15, Math.min(0.55, 0.18 + (needScore * 0.6)));
+  const playToWin = options?.playToWin === true;
+  const urgency = Math.max(0, Math.min(1, Number(options?.playUrgency) || 0.5));
+  const activationBase = playToWin ? 0.28 : 0.18;
+  const activationCap = playToWin ? 0.72 : 0.55;
+  const activationChance = Math.max(
+    activationBase,
+    Math.min(activationCap, activationBase + (needScore * (playToWin ? 0.75 : 0.6)) + (urgency * 0.08))
+  );
   if (Math.random() > activationChance) {
     return null;
   }
@@ -2570,6 +2633,28 @@ function tryBuildFinishPlanFromSubmittedGroups(cards = [], wildJoker = null, opt
     return uid && !groupedUids.has(uid);
   });
 
+  let layoutGrouping = null;
+  try {
+    layoutGrouping = groupingService.evaluateSubmittedGrouping(cards, wildJoker, submittedGroups);
+  } catch (_) {
+    layoutGrouping = null;
+  }
+  const cardToLayoutMeta = new Map();
+  (layoutGrouping?.groups || []).forEach((group) => {
+    const type = String(group?.type || '');
+    const cardsInGroup = Array.isArray(group?.cards) ? group.cards : [];
+    const isInvalidSingle = type === 'invalid_single'
+      || (group?.is_valid_meld !== true && cardsInGroup.length === 1);
+    cardsInGroup.forEach((card) => {
+      if (!card?.card_uid) return;
+      cardToLayoutMeta.set(String(card.card_uid).trim(), {
+        type,
+        isInvalidSingle,
+        groupPoints: Number(group?.group_points) || 0,
+      });
+    });
+  });
+
   const candidates = [];
   const finishPool = ungroupedCards.length > 0 ? ungroupedCards : cards;
 
@@ -2606,7 +2691,10 @@ function tryBuildFinishPlanFromSubmittedGroups(cards = [], wildJoker = null, opt
     const isUngrouped = ungroupedCards.some(
       (card) => String(card?.card_uid || '').trim() === finishUid
     );
+    const layoutMeta = cardToLayoutMeta.get(finishUid) || {};
     let utilityScore = isUngrouped ? 1500 : 0;
+    if (layoutMeta.isInvalidSingle) utilityScore += 1450;
+    else if (!isUngrouped && layoutMeta.groupPoints > 0) utilityScore += 900;
     utilityScore -= cardValue * 10;
     if (isCardIsolated(finishCard, cards, wildJoker)) utilityScore += 50;
 
@@ -2709,6 +2797,28 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
   const groupingOptions = options?.groupingOptions || {};
   const tieBreakSeed = String(options?.tieBreakSeed || '');
   const currentGrouping = groupingService.buildBestGrouping(cards, wildJoker, groupingOptions);
+  const currentSubmitted = toSubmittedGroupsFromGrouping(currentGrouping);
+  let layoutGrouping = null;
+  try {
+    layoutGrouping = groupingService.evaluateSubmittedGrouping(cards, wildJoker, currentSubmitted);
+  } catch (_) {
+    layoutGrouping = null;
+  }
+  const cardToLayoutMeta = new Map();
+  (layoutGrouping?.groups || []).forEach((group) => {
+    const type = String(group?.type || '');
+    const cardsInGroup = Array.isArray(group?.cards) ? group.cards : [];
+    const isInvalidSingle = type === 'invalid_single'
+      || (group?.is_valid_meld !== true && cardsInGroup.length === 1);
+    cardsInGroup.forEach((card) => {
+      if (!card?.card_uid) return;
+      cardToLayoutMeta.set(String(card.card_uid).trim(), {
+        type,
+        isInvalidSingle,
+        groupPoints: Number(group?.group_points) || 0,
+      });
+    });
+  });
   const cardToGroupMeta = new Map();
   (Array.isArray(currentGrouping?.groups) ? currentGrouping.groups : []).forEach((group) => {
     const groupCards = Array.isArray(group?.cards) ? group.cards : [];
@@ -2749,12 +2859,16 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
       const fromType = String(meta.type || '');
       const cardValue = getCardValue(finishCard, wildJoker);
       const isolated = isCardIsolated(finishCard, cards, wildJoker);
+      const layoutMeta = cardToLayoutMeta.get(String(finishCard.card_uid || '').trim()) || {};
 
       // "Most useless card" heuristic:
+      // - Prefer true leftovers / invalid singles from best-group layout.
       // - Prefer removing extra cards from oversized melds (4/5 cards) first.
       // - Avoid breaking minimal 3-card melds unless no other safe option.
-      // - Prefer high-point disposable cards, then isolated cards.
       let utilityScore = 0;
+      if (layoutMeta.isInvalidSingle) utilityScore += 1650;
+      else if (!fromValidMeld) utilityScore += 1500;
+      else if (layoutMeta.groupPoints > 0) utilityScore += 850;
       if (fromValidMeld && fromMeldSize > 3) utilityScore += (fromMeldSize - 3) * 80;
       if (fromValidMeld && fromMeldSize === 3) utilityScore -= 35;
       if (fromType === 'set' && fromMeldSize === 3) utilityScore -= 20;
@@ -2878,8 +2992,15 @@ function resolveBotActionDelayMs(turn, options = {}) {
   if (Number.isNaN(endsAtTs)) return startDelayMs + randomizedDelay;
 
   const remainingMs = endsAtTs - Date.now();
-  const safeRemaining = Math.max(250, remainingMs - 350);
+  const isBonusTurn = String(turn?.type || '').toLowerCase() === 'bonus';
+  const discardReserveMs = options?.phase === 'pick'
+    ? Math.max(BOT_POST_PICK_DELAY_MAX_MS, 700) + 900
+    : 0;
+  const safeRemaining = Math.max(250, remainingMs - 350 - discardReserveMs);
   let finalDelay = Math.max(250, Math.min(startDelayMs + randomizedDelay, safeRemaining));
+  if (isBonusTurn) {
+    finalDelay = Math.min(finalDelay, Math.max(250, safeRemaining * 0.45));
+  }
   if (options?.aggressiveEnabled === true) {
     const aggressiveMultiplier = BOT_AGGRESSIVE_PICK_DELAY_MIN_MULTIPLIER
       + (Math.random() * (BOT_AGGRESSIVE_PICK_DELAY_MAX_MULTIPLIER - BOT_AGGRESSIVE_PICK_DELAY_MIN_MULTIPLIER));
@@ -2936,7 +3057,9 @@ function resolveProjectedDropLoss(summary = {}) {
 function isHopelessHandForDrop(summary = {}, turnId = 0) {
   if (Number(turnId) < BOT_HOPELESS_TURN_MIN) return false;
   const pureCount = Number(summary.pure_sequence_count) || 0;
+  const sequenceCount = Number(summary.sequence_count) || 0;
   if (pureCount > 0) return false;
+  if (sequenceCount >= 2) return false;
   return resolveProjectedDropLoss(summary) >= BOT_HOPELESS_DISPLAY_POINT;
 }
 
@@ -2987,12 +3110,13 @@ function shouldBotStrategicallyDrop(session, userId, cards = [], wildJoker = nul
   if (BOT_STRATEGIC_DROP_ENABLED !== true) return false;
   const mode = resolveSessionGameMode(session);
   if (!['pool', 'points'].includes(mode)) return false;
+  if (isDealLikeMode(mode)) return false;
   if (!Array.isArray(cards) || cards.length === 0) return false;
 
+  const playContext = buildBotPlayContext(session, userId);
   const turnId = Number(options?.turn?.turn_id) || 0;
   const isDeadHand = !hasAnyValidMeld(cards, wildJoker);
   if (turnId > 0 && turnId < BOT_STRATEGIC_DROP_EARLY_TURN_GATE && !isDeadHand) return false;
-  if (options?.playerDistribution?.has_picked !== true) return false;
   if (canFinishAfterOneDiscard(cards, wildJoker, { groupingOptions: buildGroupingTieBreakOptions(options?.decisionSeed) })) {
     return false;
   }
@@ -3009,22 +3133,31 @@ function shouldBotStrategicallyDrop(session, userId, cards = [], wildJoker = nul
   const dropLoss = Number(resolveDropLossPoints(session, userId));
   if (!Number.isFinite(dropLoss)) return false;
 
-  if (mode === 'pool' && !hopeless) {
-    const poolLimit = resolvePoolLimit(session);
-    const scoresByUser = session?.metadata?.pool_scores_by_user || {};
-    const currentScore = Number(scoresByUser[String(userId)]) || 0;
-    const safePoolLimit = Number.isFinite(poolLimit) ? poolLimit : 101;
-    const scoreHeadroom = safePoolLimit - currentScore;
-    if (projectedLoss < 40 && scoreHeadroom > (dropLoss + 12)) return false;
+  if (mode === 'pool') {
+    const scoreHeadroom = playContext.scoreHeadroom;
+    const currentPoolScore = playContext.currentPoolScore;
+    // Plenty of pool buffer: always play the deal out instead of folding.
+    if (scoreHeadroom > BOT_POOL_COMFORTABLE_HEADROOM) return false;
+    if (!hopeless && currentPoolScore < 30 && projectedLoss < 65) return false;
+    if (!hopeless && scoreHeadroom > (dropLoss + 18) && projectedLoss < 55) return false;
+    // Hopeless fold only when near elimination.
+    if (hopeless && scoreHeadroom > BOT_POOL_NEAR_ELIMINATION_HEADROOM) return false;
+  }
+
+  if (mode === 'points' && !hopeless && playContext.playToWin && projectedLoss < 52) {
+    return false;
   }
 
   const benefit = projectedLoss - dropLoss;
   const benefitThreshold = resolveStrategicDropBenefitThreshold(summary, turnId);
   if (benefit < benefitThreshold) return false;
 
+  const maxProbability = mode === 'pool'
+    ? BOT_POOL_STRATEGIC_DROP_MAX_PROBABILITY
+    : BOT_STRATEGIC_DROP_MAX_PROBABILITY;
   const confidence = hopeless
-    ? Math.min(0.85, Math.max(0.55, benefit / 80))
-    : Math.min(0.75, Math.max(0.35, benefit / 100));
+    ? Math.min(maxProbability, Math.max(0.12, benefit / 120))
+    : Math.min(maxProbability * 0.75, Math.max(0.08, benefit / 140));
   const seededRoll = Number(options?.seededRoll);
   if (Number.isFinite(seededRoll)) return seededRoll < confidence;
   return Math.random() < confidence;
@@ -3061,7 +3194,7 @@ function buildStrategicDropExplainability(session, userId, cards = [], wildJoker
     policy_flag_on: BOT_STRATEGIC_DROP_ENABLED === true,
     mode_ok: ['pool', 'points'].includes(mode),
     turn_window_ok: turnWindowOk,
-    has_picked: options?.playerDistribution?.has_picked === true,
+    has_picked_in_deal: options?.playerDistribution?.has_picked === true,
     can_finish_after_one_discard: canFinishAfterOneDiscard(cards, wildJoker),
     hand_summary: compactGroupingSummary(summary),
     grouping_confidence: Number(summary.grouping_confidence),
@@ -3107,6 +3240,12 @@ function shouldBotTakeEarlyDrop(session, userId, handCards = [], distribution = 
 
   const mode = resolveSessionGameMode(session);
   if (!['pool', 'points'].includes(mode)) return false;
+  if (isDealLikeMode(mode)) return false;
+
+  const playContext = buildBotPlayContext(session, userId);
+  if (mode === 'pool' && playContext.scoreHeadroom > BOT_POOL_COMFORTABLE_HEADROOM) {
+    return false;
+  }
 
   // If bot already has any valid meld structure, continue.
   if (hasAnyValidMeld(handCards, wildJoker)) return false;
@@ -3129,12 +3268,13 @@ function shouldBotTakeEarlyDrop(session, userId, handCards = [], distribution = 
   const dropLoss = Number(resolveDropLossPoints(session, userId));
   if (!Number.isFinite(dropLoss)) return false;
 
-  // Allow first-drop only when dead hand and drop is clearly better than continuing.
-  return projectedLoss >= (dropLoss + 20);
+  // First-drop only when dead hand and continuing is clearly worse than folding.
+  return projectedLoss >= (dropLoss + BOT_EARLY_DROP_MIN_MARGIN);
 }
 
 function buildEarlyDropExplainability(session, userId, handCards = [], distribution, wildJoker = null) {
   const mode = resolveSessionGameMode(session);
+  const playContext = buildBotPlayContext(session, userId);
   const projectedGrouping = groupingService.buildBestGrouping(handCards, wildJoker);
   const projectedLoss = resolveProjectedDropLoss(projectedGrouping?.summary || {});
   const dropLoss = Number(resolveDropLossPoints(session, userId));
@@ -3158,8 +3298,9 @@ function buildEarlyDropExplainability(session, userId, handCards = [], distribut
     projected_loss: projectedLoss,
     drop_loss: Number.isFinite(dropLoss) ? dropLoss : null,
     passes_dead_hand_margin: Number.isFinite(dropLoss)
-      ? projectedLoss >= (dropLoss + 20)
+      ? projectedLoss >= (dropLoss + BOT_EARLY_DROP_MIN_MARGIN)
       : false,
+    play_context: playContext,
   };
 }
 
@@ -3353,6 +3494,25 @@ function resolveGroupingSnapshot(handCards, wildJoker, submittedGroups) {
     grouping,
     submittedGroups: toSubmittedGroupsFromGrouping(grouping),
   };
+}
+
+function isAutoBestGroupEnabled(playerDistribution) {
+  return playerDistribution?.auto_best_group === true;
+}
+
+function buildAutoBestGroupingResult(handCards, wildJoker, options = {}) {
+  const groupingOptions = options.groupingOptions || {};
+  const grouping = groupingService.buildBestGrouping(handCards, wildJoker, groupingOptions);
+  const submittedGroups = toSubmittedGroupsFromGrouping(grouping);
+  const finishPlan = tryBuildFinishPlan(handCards, wildJoker, {
+    submittedGroups,
+    groupingOptions,
+    tieBreakSeed: options.tieBreakSeed || '',
+    sessionId: options.sessionId,
+    userId: options.userId,
+    turnId: options.turnId,
+  });
+  return { grouping, submittedGroups, finishPlan };
 }
 
 /** Attach evaluated meld types/points to each player row for session:refresh. */
@@ -6596,6 +6756,65 @@ function scheduleAutoRematchFromResult(io, sourceSessionId) {
     });
 }
 
+async function tryExecuteBotDropBeforePick(
+  io,
+  sessionId,
+  session,
+  turn,
+  handCards,
+  distribution,
+  wildJoker,
+  decisionStartedAt
+) {
+  const userId = turn.user_id;
+  const mode = resolveSessionGameMode(session);
+  const decisionSeed = buildDecisionSeed(sessionId, turn.turn_id, userId);
+  const dealPlayerDist = getPlayerDistribution(distribution, userId) || { user_id: userId };
+
+  if (shouldBotTakeEarlyDrop(session, userId, handCards, distribution, wildJoker)) {
+    logBotDecisionExplainability(sessionId, {
+      phase: 'early_drop',
+      user_id: userId,
+      turn_id: Number(turn.turn_id) || 0,
+      mode,
+      wild_joker: wildJoker && { rank: wildJoker.rank, card_id: wildJoker.card_id },
+      explain: buildEarlyDropExplainability(session, userId, handCards, distribution, wildJoker),
+      elapsed_ms: Date.now() - decisionStartedAt,
+    });
+    await dropPlayerFromSession(io, sessionId, userId);
+    return true;
+  }
+
+  const stratExplain = buildStrategicDropExplainability(
+    session,
+    userId,
+    handCards,
+    wildJoker,
+    { turn, playerDistribution: dealPlayerDist, decisionSeed }
+  );
+  const stratSeedRoll = deterministicRoll(decisionSeed, 'strategic_drop');
+  const strategicDrop = shouldBotStrategicallyDrop(
+    session,
+    userId,
+    handCards,
+    wildJoker,
+    { turn, playerDistribution: dealPlayerDist, decisionSeed, seededRoll: stratSeedRoll }
+  );
+  if (!strategicDrop) return false;
+
+  logBotDecisionExplainability(sessionId, {
+    phase: 'strategic_drop',
+    user_id: userId,
+    turn_id: Number(turn.turn_id) || 0,
+    mode,
+    wild_joker: wildJoker && { rank: wildJoker.rank, card_id: wildJoker.card_id },
+    explain: stratExplain,
+    elapsed_ms: Date.now() - decisionStartedAt,
+  });
+  await dropPlayerFromSession(io, sessionId, userId);
+  return true;
+}
+
 async function executeBotPickAction(io, sessionId, expectedTurnId) {
   const decisionStartedAt = Date.now();
   const session = await gameplayService.getSessionState(sessionId);
@@ -6626,33 +6845,26 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
   const playerDistribution = {
     ...playersDistribution[playerIndex],
     cards: [...(playersDistribution[playerIndex].cards || [])],
-    has_picked: true, // Mark that this player has picked at least once
   };
   const wildJoker = distribution.wild_joker || null;
   const mode = resolveSessionGameMode(session);
   const decisionSeed = buildDecisionSeed(sessionId, turn.turn_id, turn.user_id);
+  const playContext = buildBotPlayContext(session, turn.user_id);
   const tieBreakOptions = buildGroupingTieBreakOptions(decisionSeed);
   const conservativeMode = BOT_CONSERVATIVE_PLAY_ON_LOW_CONFIDENCE
     && isLowConfidenceGrouping(
       groupingService.buildBestGrouping(playerDistribution.cards, wildJoker, tieBreakOptions)?.summary || {}
     );
-  if (shouldBotTakeEarlyDrop(
+  if (await tryExecuteBotDropBeforePick(
+    io,
+    sessionId,
     session,
-    turn.user_id,
+    turn,
     playerDistribution.cards,
     distribution,
-    wildJoker
+    wildJoker,
+    decisionStartedAt
   )) {
-    logBotDecisionExplainability(sessionId, {
-      phase: 'early_drop',
-      user_id: turn.user_id,
-      turn_id: Number(turn.turn_id) || 0,
-      mode,
-      wild_joker: wildJoker && { rank: wildJoker.rank, card_id: wildJoker.card_id },
-      explain: buildEarlyDropExplainability(session, turn.user_id, playerDistribution.cards, distribution, wildJoker),
-      elapsed_ms: Date.now() - decisionStartedAt,
-    });
-    await dropPlayerFromSession(io, sessionId, turn.user_id);
     return;
   }
   let discardPile = [...(distribution.discard_pile || [])];
@@ -6672,6 +6884,9 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
       conservativeMode,
       tieBreakSeed: decisionSeed,
       groupingOptions: tieBreakOptions,
+      playUrgency: playContext.urgency,
+      playToWin: playContext.playToWin,
+      mode,
     }
   );
   source = pickExplain.chosen;
@@ -6735,6 +6950,8 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
         turnId: turn.turn_id,
         userId: turn.user_id,
         decisionSeed,
+        playToWin: playContext.playToWin,
+        playUrgency: playContext.urgency,
       }
     );
 
@@ -6747,6 +6964,7 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
   }
 
   playerDistribution.cards.push(pickedCard);
+  playerDistribution.has_picked = true;
   playersDistribution[playerIndex] = playerDistribution;
 
   const pickedMetadata = {
@@ -7130,44 +7348,15 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
     return;
   }
 
-  const stratPlayerContext = { ...refreshedPlayer, has_picked: refreshedTurn.has_picked === true };
-  const stratExplain = buildStrategicDropExplainability(
-    refreshed,
-    refreshedTurn.user_id,
-    refreshedPlayer.cards,
-    refreshedDistribution.wild_joker || null,
-    { turn: refreshedTurn, playerDistribution: stratPlayerContext, decisionSeed }
-  );
-  const stratSeedRoll = deterministicRoll(decisionSeed, 'strategic_drop');
-  const strategicDrop = shouldBotStrategicallyDrop(
-    refreshed,
-    refreshedTurn.user_id,
-    refreshedPlayer.cards,
-    refreshedDistribution.wild_joker || null,
-    { turn: refreshedTurn, playerDistribution: stratPlayerContext, decisionSeed, seededRoll: stratSeedRoll }
-  );
-  if (strategicDrop) {
-    logBotDecisionExplainability(sessionId, {
-      phase: 'strategic_drop',
-      user_id: refreshedTurn.user_id,
-      turn_id: Number(refreshedTurn.turn_id) || 0,
-      mode: resolveSessionGameMode(refreshed),
-      wild_joker: refreshedDistribution.wild_joker && {
-        rank: refreshedDistribution.wild_joker.rank,
-        card_id: refreshedDistribution.wild_joker.card_id,
-      },
-      explain: stratExplain,
-      elapsed_ms: Date.now() - decisionStartedAt,
-    });
-    await dropPlayerFromSession(io, sessionId, refreshedTurn.user_id);
-    return;
-  }
-
   const discardWild = refreshedDistribution.wild_joker || null;
+  const playContext = buildBotPlayContext(refreshed, refreshedTurn.user_id);
   const discardOptions = {
     tieBreakSeed: `${decisionSeed}:discard`,
     conservativeMode,
     groupingOptions: tieBreakOptions,
+    playUrgency: playContext.urgency,
+    playToWin: playContext.playToWin,
+    mode: playContext.mode,
   };
   const discardCandidates = getTopDiscardCandidatesForLog(refreshedPlayer.cards, discardWild, 5, discardOptions);
   const discardCard = chooseBotDiscardCard(refreshedPlayer.cards, discardWild, discardOptions);
@@ -7299,7 +7488,7 @@ function scheduleBotTurnAction(io, sessionId, turn, phase = 'pick', options = {}
   cleanupBotActionState(sessionId);
   const actionDelayMs = normalizedPhase === 'discard'
     ? resolveBotDiscardDelayMs(turn, options)
-    : resolveBotActionDelayMs(turn, options);
+    : resolveBotActionDelayMs(turn, { ...options, phase: 'pick' });
 
   const timeoutHandle = setTimeout(() => {
     executeBotTurnAction(io, sessionId, Number(turn.turn_id), normalizedPhase).catch((err) => {
@@ -7781,6 +7970,9 @@ async function onTurnTimeout(io, sessionId, expectedTurnId) {
     });
 
     scheduleTurnTimeout(io, sessionId, nextTurn);
+    maybeScheduleBotTurnAction(io, sessionId, nextTurn).catch((err) => {
+      errorGame(sessionId, `Bot schedule on bonus turn failed: ${err.message}`);
+    });
     return;
   }
 
@@ -7987,7 +8179,13 @@ function scheduleTurnTimeout(io, sessionId, turn) {
     return;
   }
 
-  cleanupTurnState(sessionId);
+  const nextTurnId = Number(turn.turn_id);
+  const pendingBot = getActiveBotActionState(sessionId);
+  if (pendingBot && Number(pendingBot.turnId) !== nextTurnId) {
+    cleanupBotActionState(sessionId);
+  }
+
+  cleanupTurnTimeoutOnly(sessionId);
 
   const delayMs = Math.max(0, Date.parse(turn.ends_at) - Date.now());
   const timeoutHandle = setTimeout(() => {
@@ -8030,6 +8228,10 @@ async function dropPlayerFromSession(io, sessionId, userId) {
   const eliminatedSet = getEliminatedUserIdSet(session.metadata || {});
   if (eliminatedSet.has(Number(userId)) || player.metadata?.is_dropped === true) {
     throw new Error('Player already dropped or eliminated');
+  }
+
+  if (Number(turn.user_id) === Number(userId) && turn.has_picked === true) {
+    throw new Error('Cannot drop after picking a card this turn — discard first');
   }
 
   const droppedAt = new Date().toISOString();
@@ -8118,9 +8320,13 @@ async function dropPlayerFromSession(io, sessionId, userId) {
     metadata: nextPlayerMetadata,
   });
 
-  const activePlayersAfterDrop = (session.players || []).filter(
-    (item) => !nextEliminatedSet.has(Number(item.user_id))
-  );
+  const activePlayersAfterDrop = getActivePlayers({
+    ...session,
+    metadata: {
+      ...(session.metadata || {}),
+      turn_eliminated_user_ids: Array.from(nextEliminatedSet),
+    },
+  });
 
   if (activePlayersAfterDrop.length <= 1) {
     const winnerUserId = activePlayersAfterDrop[0]?.user_id;
@@ -9885,18 +10091,21 @@ function registerSocketServer(httpServer) {
         const decisionSeed = buildDecisionSeed(sessionId, turnIdForSeed, socket.user.id);
         const groupingOptions = buildGroupingTieBreakOptions(decisionSeed);
         const bestGrouping = groupingService.buildBestGrouping(playerCards, wildJoker, groupingOptions);
-        const finishPlan = tryBuildBotFinishPlan(playerCards, wildJoker, {
+        const newSubmittedGroups = toSubmittedGroupsFromGrouping(bestGrouping);
+        const finishPlan = tryBuildFinishPlan(playerCards, wildJoker, {
+          submittedGroups: newSubmittedGroups,
           groupingOptions,
           tieBreakSeed: decisionSeed,
           sessionId,
           userId: socket.user.id,
           turnId: turnIdForSeed,
         });
-        const newSubmittedGroups = toSubmittedGroupsFromGrouping(bestGrouping);
 
         const autoPdIndex = distribution.players.findIndex((pd) => pd.user_id === socket.user.id);
         const autoUpdatedPlayers = distribution.players.map((pd, i) =>
-          i === autoPdIndex ? { ...pd, submitted_groups: newSubmittedGroups } : pd
+          i === autoPdIndex
+            ? { ...pd, submitted_groups: newSubmittedGroups, auto_best_group: true }
+            : pd
         );
 
         await gameSessionModel.updateSessionStatus(sessionId, session.status, {
@@ -10257,33 +10466,53 @@ function registerSocketServer(httpServer) {
         playerDistribution.cards.push(pickedCard);
 
         const wildJoker = distribution.wild_joker || null;
-        const storedPickGroups = Array.isArray(playerDistribution.submitted_groups)
-          ? playerDistribution.submitted_groups
-          : [];
-        const updatedPickGroups = appendCardToSpecifiedGroupOrLast(
-          storedPickGroups,
-          pickedCard.card_uid,
-          requestedGroupId,
-          requestedPosition
-        );
-        playerDistribution.submitted_groups = updatedPickGroups;
-        playersDistribution[playerIndex] = playerDistribution;
-
-        const { grouping } = resolveGroupingSnapshot(
-          playerDistribution.cards,
-          wildJoker,
-          updatedPickGroups
-        );
         const turnIdForSeed = Number(session?.metadata?.turn?.turn_id) || 0;
         const decisionSeed = buildDecisionSeed(sessionId, turnIdForSeed, socket.user.id);
-        const finishPlan = tryBuildFinishPlan(playerDistribution.cards, wildJoker, {
-          submittedGroups: updatedPickGroups,
-          groupingOptions: buildGroupingTieBreakOptions(decisionSeed),
-          tieBreakSeed: decisionSeed,
-          sessionId,
-          userId: socket.user.id,
-          turnId: turnIdForSeed,
-        });
+        const groupingOptions = buildGroupingTieBreakOptions(decisionSeed);
+        const autoBestGroup = isAutoBestGroupEnabled(playerDistribution);
+
+        let updatedPickGroups;
+        let grouping;
+        let finishPlan;
+
+        if (autoBestGroup) {
+          const autoResult = buildAutoBestGroupingResult(playerDistribution.cards, wildJoker, {
+            groupingOptions,
+            tieBreakSeed: decisionSeed,
+            sessionId,
+            userId: socket.user.id,
+            turnId: turnIdForSeed,
+          });
+          updatedPickGroups = autoResult.submittedGroups;
+          grouping = autoResult.grouping;
+          finishPlan = autoResult.finishPlan;
+        } else {
+          const storedPickGroups = Array.isArray(playerDistribution.submitted_groups)
+            ? playerDistribution.submitted_groups
+            : [];
+          updatedPickGroups = appendCardToSpecifiedGroupOrLast(
+            storedPickGroups,
+            pickedCard.card_uid,
+            requestedGroupId,
+            requestedPosition
+          );
+          ({ grouping } = resolveGroupingSnapshot(
+            playerDistribution.cards,
+            wildJoker,
+            updatedPickGroups
+          ));
+          finishPlan = tryBuildFinishPlan(playerDistribution.cards, wildJoker, {
+            submittedGroups: updatedPickGroups,
+            groupingOptions,
+            tieBreakSeed: decisionSeed,
+            sessionId,
+            userId: socket.user.id,
+            turnId: turnIdForSeed,
+          });
+        }
+
+        playerDistribution.submitted_groups = updatedPickGroups;
+        playersDistribution[playerIndex] = playerDistribution;
 
         const nextMetadata = {
           ...(session.metadata || {}),
@@ -11938,6 +12167,7 @@ module.exports = {
     canMeaningfullyImproveWithPickedCard,
     isHopelessHandForDrop,
     doesStructureBlockStrategicDrop,
+    buildBotPlayContext,
     tryBuildBotFinishPlan,
     tryBuildFinishPlan,
     evaluateAdminProfitProtection,

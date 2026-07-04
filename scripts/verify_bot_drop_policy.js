@@ -145,14 +145,26 @@ function runEarlyDropTests() {
   );
   assert.strictEqual(
     __testHooks.shouldBotTakeEarlyDrop(
-      makeSession({ mode: 'pool', poolScores: { [String(userId)]: 0 }, poolLimit: 101 }),
+      makeSession({ mode: 'pool', poolScores: { [String(userId)]: 78 }, poolLimit: 101 }),
       userId,
       deadHand,
       deadDist,
       wildJoker
     ),
     true,
-    'Bot should first-drop for dead hand with no meaningful pick potential and clear loss advantage'
+    'Bot should first-drop for dead hand near elimination with no meaningful pick potential'
+  );
+
+  assert.strictEqual(
+    __testHooks.shouldBotTakeEarlyDrop(
+      makeSession({ mode: 'pool', poolScores: { [String(userId)]: 0 }, poolLimit: 101 }),
+      userId,
+      deadHand,
+      deadDist,
+      wildJoker
+    ),
+    false,
+    'Bot should keep playing on comfortable pool score even with a dead hand'
   );
 }
 
@@ -160,7 +172,7 @@ function runStrategicDropTests() {
   const userId = 888;
   const session = makeSession({
     mode: 'pool',
-    poolScores: { [String(userId)]: 12 },
+    poolScores: { [String(userId)]: 78 },
     poolLimit: 101,
     userId,
     hasPicked: true,
@@ -170,29 +182,29 @@ function runStrategicDropTests() {
   const hopelessHand = [
     card('h2', '2', 'hearts', 2),
     card('h4', '4', 'hearts', 4),
-    card('h6', '6', 'hearts', 6),
-    card('h8', '8', 'hearts', 8),
-    card('h10', '10', 'hearts', 10),
-    card('hQ', 'Q', 'hearts', 10),
+    card('h7', '7', 'hearts', 7),
+    card('h9', '9', 'hearts', 9),
+    card('hJ', 'J', 'hearts', 10),
     card('cA', 'A', 'clubs', 10),
     card('c3', '3', 'clubs', 3),
-    card('c7', '7', 'clubs', 7),
-    card('c9', '9', 'clubs', 9),
-    card('cJ', 'J', 'clubs', 10),
+    card('c8', '8', 'clubs', 8),
+    card('cQ', 'Q', 'clubs', 10),
+    card('d2', '2', 'diamonds', 2),
+    card('d6', '6', 'diamonds', 6),
     card('dK', 'K', 'diamonds', 10),
-    card('s5', '5', 'spades', 5),
-    card('s5w', '5', 'diamonds', 5),
+    card('s9', '9', 'spades', 9),
+    card('sK', 'K', 'spades', 10),
   ];
 
   const hopelessSummary = groupingService.buildBestGrouping(hopelessHand, wildJoker).summary;
   assert.strictEqual(hopelessSummary.pure_sequence_count, 0, 'hopeless hand should have no pure sequence');
   assert(
-    hopelessSummary.display_point >= 45,
+    hopelessSummary.display_point >= 58,
     `hopeless hand display_point should be high, got ${hopelessSummary.display_point}`
   );
   assert(
-    __testHooks.isHopelessHandForDrop(hopelessSummary, 5) === true,
-    'expected hopeless classification after turn 4'
+    __testHooks.isHopelessHandForDrop(hopelessSummary, 6) === true,
+    'expected hopeless classification after turn gate'
   );
 
   const weakStructureOnly = [
@@ -224,7 +236,7 @@ function runStrategicDropTests() {
       hopelessHand,
       wildJoker,
       {
-        turn: { turn_id: 5 },
+        turn: { turn_id: 6 },
         playerDistribution: { has_picked: true },
         decisionSeed: 'verify:hopeless-drop',
         seededRoll: 0.2,
@@ -234,21 +246,83 @@ function runStrategicDropTests() {
     'Bot should strategically drop hopeless no-pure hand after turn 4'
   );
 
+  const firstDealSession = makeSession({
+    mode: 'pool',
+    poolScores: { [String(userId)]: 78 },
+    poolLimit: 101,
+    userId,
+    hasPicked: false,
+  });
+  const prePickHopelessHand = hopelessHand.slice(0, 13);
+  assert.strictEqual(
+    __testHooks.shouldBotStrategicallyDrop(
+      firstDealSession,
+      userId,
+      prePickHopelessHand,
+      wildJoker,
+      {
+        turn: { turn_id: 6 },
+        playerDistribution: { has_picked: false },
+        decisionSeed: 'verify:hopeless-first-pick',
+        seededRoll: 0.2,
+      }
+    ),
+    true,
+    'Bot should evaluate strategic drop before first pick in deal (first-drop penalty)'
+  );
+
   assert.strictEqual(
     __testHooks.shouldBotStrategicallyDrop(
       session,
       userId,
-      hopelessHand,
+      weakStructureOnly,
       wildJoker,
       {
-        turn: { turn_id: 2 },
+        turn: { turn_id: 3 },
         playerDistribution: { has_picked: true },
         decisionSeed: 'verify:early-turn',
         seededRoll: 0.1,
       }
     ),
     false,
-    'Bot should not strategically drop structured hopeless hand before turn gate'
+    'Bot should not strategically drop structured hand before turn gate'
+  );
+
+  const comfortablePool = makeSession({
+    mode: 'pool',
+    poolScores: { [String(userId)]: 5 },
+    poolLimit: 101,
+    userId,
+    hasPicked: true,
+  });
+  assert.strictEqual(
+    __testHooks.shouldBotStrategicallyDrop(
+      comfortablePool,
+      userId,
+      hopelessHand,
+      wildJoker,
+      {
+        turn: { turn_id: 8 },
+        playerDistribution: { has_picked: true },
+        seededRoll: 0.01,
+      }
+    ),
+    false,
+    'Comfortable pool score should discourage hopeless strategic drop unless loss is extreme'
+  );
+
+  const dealsSession = makeSession({ mode: 'deals_2', userId: 999 });
+  const deadDist = makeDistribution({ closedDeck: [] });
+  assert.strictEqual(
+    __testHooks.shouldBotStrategicallyDrop(
+      dealsSession,
+      999,
+      hopelessHand,
+      wildJoker,
+      { turn: { turn_id: 8 }, playerDistribution: { has_picked: true }, seededRoll: 0.01 }
+    ),
+    false,
+    'Deals bots should never strategically drop'
   );
 }
 
