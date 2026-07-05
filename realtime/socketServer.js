@@ -2203,6 +2203,31 @@ function emitDeckReshuffled(io, sessionId, extras = {}) {
   return payload;
 }
 
+/** Room broadcast so opponents can animate bot/human discards (mirrors `game:pick`). */
+function emitBotDiscardBroadcast(io, sessionId, userId, discardedCard, discardTop, extras = {}) {
+  const payload = traceSessionBroadcast({
+    sessionId,
+    eventName: 'game:discard',
+    payload: {
+      session_id: sessionId,
+      server_time: new Date().toISOString(),
+      event: 'game:discard',
+      success: true,
+      user_id: userId,
+      data: {
+        user_id: userId,
+        discarded_by_user_id: userId,
+        discarded_card: discardedCard,
+        discard_top: discardTop || null,
+      },
+      ...extras,
+    },
+    targetUserId: userId,
+  });
+  io.to(sessionRoom(sessionId)).emit('game:discard', payload);
+  return payload;
+}
+
 /** Same `data` shape as `player:discard` ack — sent only to the given user (e.g. turn-timeout auto discard). */
 function emitGameDiscardAckToUser(io, sessionId, userId, data, extras = {}) {
   const payload = {
@@ -6999,7 +7024,8 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
 
   if (source === 'closed') {
     if (closedDeck.length === 0) {
-      warnGame(sessionId, `Bot pick aborted — closed deck still empty after reshuffle attempt uid=${turn.user_id}`);
+      warnGame(sessionId, `Bot pick aborted — closed deck still empty after reshuffle attempt uid=${turn.user_id}; retrying`);
+      scheduleBotTurnAction(io, sessionId, turn, 'pick', { softRiggingEnabled, aggressiveEnabled });
       return;
     }
 
@@ -7442,7 +7468,14 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
       });
     }
   }
-  if (!discardCard) return;
+  if (!discardCard && refreshedPlayer.cards.length > 0) {
+    discardCard = refreshedPlayer.cards[refreshedPlayer.cards.length - 1];
+  }
+  if (!discardCard) {
+    warnGame(sessionId, `Bot discard aborted — no card available uid=${refreshedTurn.user_id}; retrying pick`);
+    scheduleBotTurnAction(io, sessionId, refreshedTurn, 'pick', { softRiggingEnabled, aggressiveEnabled });
+    return;
+  }
 
   logBotDecisionExplainability(sessionId, {
     phase: 'discard',
@@ -7463,14 +7496,25 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
   });
 
   const discardIndex = refreshedPlayer.cards.findIndex((card) => card.card_uid === discardCard.card_uid);
-  if (discardIndex < 0) return;
+  if (discardIndex < 0) {
+    warnGame(sessionId, `Bot discard card missing from hand uid=${refreshedTurn.user_id}; retrying discard`);
+    scheduleBotTurnAction(io, sessionId, refreshedTurn, 'discard', { softRiggingEnabled, aggressiveEnabled });
+    return;
+  }
 
   const [discardedCard] = refreshedPlayer.cards.splice(discardIndex, 1);
   refreshedPlayersDistribution[refreshedPlayerIndex] = refreshedPlayer;
   const nextDiscardPile = [discardedCard, ...(refreshedDistribution.discard_pile || [])];
 
-  const nextTurnUser = nextTurnUserId(getActivePlayers(refreshed), refreshedTurn.user_id);
-  if (!nextTurnUser) return;
+  const nextTurnUser = nextTurnUserId(getActivePlayers(refreshed), refreshedTurn.user_id, {
+    currentSeatNo: (refreshed.players || []).find(
+      (p) => Number(p.user_id) === Number(refreshedTurn.user_id)
+    )?.seat_no,
+  });
+  if (!nextTurnUser) {
+    warnGame(sessionId, `Bot discard could not resolve next turn uid=${refreshedTurn.user_id}`);
+    return;
+  }
 
   const turnTimerSeconds = Number(refreshed?.game?.turn_timer_seconds) || 30;
   const attemptsUsedByUser = normalizeAttemptsUsedByUser(refreshed.metadata || {});
@@ -7527,6 +7571,15 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
     },
   });
 
+  emitBotDiscardBroadcast(
+    io,
+    sessionId,
+    refreshedTurn.user_id,
+    discardedCard,
+    nextDiscardPile[0] || null,
+    { reason: 'bot_discard' }
+  );
+
   emitTurn(io, sessionId, nextTurn, {
     action: 'discard',
     previous_turn_user_id: refreshedTurn.user_id,
@@ -7546,7 +7599,52 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
   scheduleTurnTimeout(io, sessionId, nextTurn);
 }
 
+async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
+  if (!isBotTurn(session, turn.user_id)) return session;
+
+  cleanupBotActionState(sessionId);
+  const softRiggingEnabled = isBotSoftRiggingEnabled(session);
+  const aggressiveEnabled = isBotAggressionEnabled(session);
+  const phase = turn.has_picked === true ? 'discard' : 'pick';
+
+  try {
+    await executeBotTurnAction(io, sessionId, Number(turn.turn_id), phase);
+  } catch (err) {
+    warnGame(sessionId, `Bot forced action before timeout failed uid=${turn.user_id}: ${err.message}`);
+  }
+
+  const refreshed = await gameplayService.getSessionState(sessionId);
+  if (!refreshed || refreshed.status !== 'active') return refreshed;
+
+  const refreshedTurn = refreshed.metadata?.turn;
+  if (Number(refreshedTurn?.turn_id) !== Number(turn.turn_id)) {
+    logGame(sessionId, `Turn timeout skipped — bot completed turn uid=${turn.user_id}`);
+    return refreshed;
+  }
+
+  if (phase === 'pick' && refreshedTurn?.has_picked === true) {
+    try {
+      await executeBotTurnAction(io, sessionId, Number(turn.turn_id), 'discard');
+    } catch (err) {
+      warnGame(sessionId, `Bot forced discard before timeout failed uid=${turn.user_id}: ${err.message}`);
+    }
+    const afterDiscard = await gameplayService.getSessionState(sessionId);
+    if (afterDiscard?.metadata?.turn?.turn_id !== turn.turn_id) {
+      logGame(sessionId, `Turn timeout skipped — bot discarded uid=${turn.user_id}`);
+      return afterDiscard;
+    }
+    return afterDiscard || refreshed;
+  }
+
+  scheduleBotTurnAction(io, sessionId, refreshedTurn, phase, {
+    softRiggingEnabled,
+    aggressiveEnabled,
+  });
+  return refreshed;
+}
+
 function executeBotTurnAction(io, sessionId, expectedTurnId, phase = 'pick') {
+  cleanupBotActionState(sessionId);
   if (phase === 'discard') {
     return executeBotDiscardAction(io, sessionId, expectedTurnId);
   }
@@ -7929,14 +8027,14 @@ async function finalizeGameByElimination(
 }
 
 async function onTurnTimeout(io, sessionId, expectedTurnId) {
-  const session = await gameplayService.getSessionState(sessionId);
+  let session = await gameplayService.getSessionState(sessionId);
   if (!session || session.status !== 'active') {
     cleanupTurnState(sessionId);
     return;
   }
 
-  const distribution = session.metadata?.distribution;
-  const turn = session.metadata?.turn;
+  let distribution = session.metadata?.distribution;
+  let turn = session.metadata?.turn;
   if (!distribution || !turn) {
     cleanupTurnState(sessionId);
     return;
@@ -7949,6 +8047,23 @@ async function onTurnTimeout(io, sessionId, expectedTurnId) {
   if (isDeclarationWindowActive(sessionId, session.metadata)) {
     logGame(sessionId, 'Turn timeout skipped — declaration window active');
     cleanupTurnState(sessionId);
+    return;
+  }
+
+  session = await flushBotTurnBeforeTimeout(io, sessionId, session, turn);
+  if (!session || session.status !== 'active') {
+    cleanupTurnState(sessionId);
+    return;
+  }
+
+  distribution = session.metadata?.distribution;
+  turn = session.metadata?.turn;
+  if (!distribution || !turn) {
+    cleanupTurnState(sessionId);
+    return;
+  }
+
+  if (Number(turn.turn_id) !== Number(expectedTurnId)) {
     return;
   }
 
@@ -12263,5 +12378,9 @@ module.exports = {
     tryBuildBotFinishPlan,
     tryBuildFinishPlan,
     evaluateAdminProfitProtection,
+    activeBotActionBySession,
+    getActiveBotActionState,
+    executeBotTurnAction,
+    emitBotDiscardBroadcast,
   },
 };
