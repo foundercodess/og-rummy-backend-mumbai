@@ -172,6 +172,7 @@ const BOT_STRUCTURE_BLOCK_UNGROUPED_MAX = Math.max(
 );
 const BOT_POOL_COMFORTABLE_HEADROOM = Math.max(20, Number(process.env.BOT_POOL_COMFORTABLE_HEADROOM) || 45);
 const BOT_POOL_NEAR_ELIMINATION_HEADROOM = Math.max(8, Number(process.env.BOT_POOL_NEAR_ELIMINATION_HEADROOM) || 28);
+const BOT_POOL_HIGH_SCORE_DROP_AT = Math.max(30, Number(process.env.BOT_POOL_HIGH_SCORE_DROP_AT) || 50);
 const BOT_EARLY_DROP_MIN_MARGIN = Math.max(10, Number(process.env.BOT_EARLY_DROP_MIN_MARGIN) || 35);
 const BOT_STRATEGIC_DROP_MAX_PROBABILITY = Math.max(
   0.05,
@@ -258,13 +259,24 @@ function isLowConfidenceGrouping(summary = {}) {
   return confidence < BOT_LOW_CONFIDENCE_THRESHOLD || margin < BOT_LOW_MARGIN_THRESHOLD;
 }
 
-function nextTurnUserId(players, currentUserId) {
+function nextTurnUserId(players, currentUserId, options = {}) {
   const seats = [...(players || [])].sort((a, b) => a.seat_no - b.seat_no);
   if (seats.length === 0) return null;
 
-  const idx = seats.findIndex((p) => p.user_id === currentUserId);
-  if (idx < 0) return seats[0].user_id;
-  return seats[(idx + 1) % seats.length].user_id;
+  const currentId = Number(currentUserId);
+  const idx = seats.findIndex((p) => Number(p.user_id) === currentId);
+  if (idx >= 0) {
+    return seats[(idx + 1) % seats.length].user_id;
+  }
+
+  // Current player may already be removed (drop/pack/timeout) — advance from their seat.
+  const pivotSeat = Number(options.currentSeatNo);
+  if (Number.isFinite(pivotSeat)) {
+    const next = seats.find((p) => Number(p.seat_no) > pivotSeat);
+    return (next ?? seats[0]).user_id;
+  }
+
+  return seats[0].user_id;
 }
 
 function getEliminatedUserIdSet(metadata = {}) {
@@ -740,12 +752,26 @@ function buildAggregateResultsFromDealScores(session = {}, dealScores = []) {
     scoreTotalsByUser,
     lossTotalsByUserId,
   } = computeDealScoreboardTimeline(session, dealScores);
+  const lastDeal = Array.isArray(dealScores) && dealScores.length > 0
+    ? dealScores[dealScores.length - 1]
+    : null;
+  const lastDealResultsByUser = new Map(
+    (Array.isArray(lastDeal?.results) ? lastDeal.results : [])
+      .map((row) => [Number(row?.user_id), row])
+      .filter(([userId]) => !Number.isNaN(userId))
+  );
 
-  const aggregate = players.map((player) => ({
+  const aggregate = players.map((player) => {
+    const userId = Number(player.user_id);
+    const lastDealResult = lastDealResultsByUser.get(userId) || null;
+    const lastRoundPoints = lastDealResult == null
+      ? null
+      : Math.max(0, Number(lastDealResult.round_points ?? lastDealResult.points) || 0);
+    return {
     user_id: player.user_id,
     seat_no: player.seat_no,
-    points: lossTotalsByUserId.get(Number(player.user_id)) || 0,
-    round_points: null,
+    points: lossTotalsByUserId.get(userId) || 0,
+    round_points: lastRoundPoints,
     total_score: Number(scoreTotalsByUser[String(player.user_id)]) || 0,
     score_model: 'deal_base_plus_minus',
     grouped_points: null,
@@ -756,7 +782,8 @@ function buildAggregateResultsFromDealScores(session = {}, dealScores = []) {
     submission_mode: 'aggregate',
     submission_status: 'aggregate',
     dropped: false,
-  }));
+  };
+  });
 
   const sorted = [...aggregate].sort((a, b) => {
     if ((b.total_score || 0) !== (a.total_score || 0)) return (b.total_score || 0) - (a.total_score || 0);
@@ -1763,16 +1790,31 @@ function evaluateAdminProfitProtection(session = {}, splitRows = [], options = {
   };
 }
 
-function buildPoolFinalResults(session = {}, scoresByUser = {}, winnerUserId = null, eliminatedUserIds = []) {
+function buildPoolFinalResults(
+  session = {},
+  scoresByUser = {},
+  winnerUserId = null,
+  eliminatedUserIds = [],
+  lastRoundResults = [],
+) {
   const eliminatedSet = new Set(
     (Array.isArray(eliminatedUserIds) ? eliminatedUserIds : [])
       .map((id) => Number(id))
       .filter((id) => !Number.isNaN(id))
   );
+  const lastRoundByUserId = new Map(
+    (Array.isArray(lastRoundResults) ? lastRoundResults : [])
+      .map((row) => [Number(row?.user_id), row])
+      .filter(([userId]) => !Number.isNaN(userId))
+  );
   const players = Array.isArray(session?.players) ? session.players : [];
   return players.map((player) => {
     const userId = Number(player.user_id);
     const totalPoints = Math.max(0, Number(scoresByUser[String(userId)]) || 0);
+    const lastRound = lastRoundByUserId.get(userId) || null;
+    const roundPoints = lastRound == null
+      ? null
+      : Math.max(0, Number(lastRound.round_points ?? lastRound.points) || 0);
     const isWinner = Number(userId) === Number(winnerUserId);
     const isDropped = Boolean(
       player?.metadata?.is_dropped === true
@@ -1790,8 +1832,8 @@ function buildPoolFinalResults(session = {}, scoresByUser = {}, winnerUserId = n
     return {
       user_id: player.user_id,
       seat_no: player.seat_no,
-      points: totalPoints,
-      round_points: null,
+      points: roundPoints ?? 0,
+      round_points: roundPoints,
       total_score: totalPoints,
       score_model: 'pool_loss_cumulative',
       grouped_points: null,
@@ -3136,12 +3178,20 @@ function shouldBotStrategicallyDrop(session, userId, cards = [], wildJoker = nul
   if (mode === 'pool') {
     const scoreHeadroom = playContext.scoreHeadroom;
     const currentPoolScore = playContext.currentPoolScore;
-    // Plenty of pool buffer: always play the deal out instead of folding.
-    if (scoreHeadroom > BOT_POOL_COMFORTABLE_HEADROOM) return false;
-    if (!hopeless && currentPoolScore < 30 && projectedLoss < 65) return false;
-    if (!hopeless && scoreHeadroom > (dropLoss + 18) && projectedLoss < 55) return false;
-    // Hopeless fold only when near elimination.
-    if (hopeless && scoreHeadroom > BOT_POOL_NEAR_ELIMINATION_HEADROOM) return false;
+    const nearElimination = scoreHeadroom <= BOT_POOL_NEAR_ELIMINATION_HEADROOM;
+    const highCumulativeScore = currentPoolScore >= BOT_POOL_HIGH_SCORE_DROP_AT;
+    // Plenty of pool buffer and low cumulative score: play the deal out.
+    if (!nearElimination && !highCumulativeScore && scoreHeadroom > BOT_POOL_COMFORTABLE_HEADROOM) {
+      return false;
+    }
+    if (!hopeless && !highCumulativeScore && currentPoolScore < 30 && projectedLoss < 65) return false;
+    if (!hopeless && !highCumulativeScore && scoreHeadroom > (dropLoss + 18) && projectedLoss < 55) {
+      return false;
+    }
+    // Hopeless fold only when near elimination (unless cumulative score is already high).
+    if (hopeless && !highCumulativeScore && scoreHeadroom > BOT_POOL_NEAR_ELIMINATION_HEADROOM) {
+      return false;
+    }
   }
 
   if (mode === 'points' && !hopeless && playContext.playToWin && projectedLoss < 52) {
@@ -3155,9 +3205,12 @@ function shouldBotStrategicallyDrop(session, userId, cards = [], wildJoker = nul
   const maxProbability = mode === 'pool'
     ? BOT_POOL_STRATEGIC_DROP_MAX_PROBABILITY
     : BOT_STRATEGIC_DROP_MAX_PROBABILITY;
+  const poolScoreBoost = mode === 'pool' && playContext.currentPoolScore >= BOT_POOL_HIGH_SCORE_DROP_AT
+    ? 0.18
+    : 0;
   const confidence = hopeless
-    ? Math.min(maxProbability, Math.max(0.12, benefit / 120))
-    : Math.min(maxProbability * 0.75, Math.max(0.08, benefit / 140));
+    ? Math.min(maxProbability + poolScoreBoost, Math.max(0.12, benefit / 120) + poolScoreBoost)
+    : Math.min((maxProbability * 0.75) + poolScoreBoost, Math.max(0.08, benefit / 140) + poolScoreBoost);
   const seededRoll = Number(options?.seededRoll);
   if (Number.isFinite(seededRoll)) return seededRoll < confidence;
   return Math.random() < confidence;
@@ -3802,6 +3855,17 @@ function buildDeclarationTablePlayers({
         grouping = groupingService.buildBestGrouping(playerCards, wildJoker);
       } else {
         grouping = groupingService.evaluateSubmittedGrouping(playerCards, wildJoker, submittedGroups);
+      }
+    }
+
+    if ((mode === 'pool' || isDealLikeMode(mode)) && isFinal && grouping?.summary != null) {
+      const displayPoint = Number(grouping.summary.display_point);
+      const totalScoreNum = Number(totalScore);
+      const roundPointsNum = Number(roundPoints);
+      if (Number.isFinite(displayPoint)
+        && (!Number.isFinite(roundPointsNum)
+          || roundPointsNum === totalScoreNum)) {
+        roundPoints = Math.max(0, displayPoint);
       }
     }
 
@@ -7256,7 +7320,11 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
           return;
         }
       }
-      const nextTurnUser = nextTurnUserId(activePlayersAfterPack, refreshedTurn.user_id);
+      const nextTurnUser = nextTurnUserId(activePlayersAfterPack, refreshedTurn.user_id, {
+        currentSeatNo: (refreshed.players || []).find(
+          (p) => Number(p.user_id) === Number(refreshedTurn.user_id)
+        )?.seat_no,
+      });
       if (!nextTurnUser) return;
       const turnTimerSeconds = Number(refreshed?.game?.turn_timer_seconds) || 30;
       const attemptsUsedByUser = normalizeAttemptsUsedByUser(refreshed.metadata || {});
@@ -7359,7 +7427,21 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
     mode: playContext.mode,
   };
   const discardCandidates = getTopDiscardCandidatesForLog(refreshedPlayer.cards, discardWild, 5, discardOptions);
-  const discardCard = chooseBotDiscardCard(refreshedPlayer.cards, discardWild, discardOptions);
+  let discardCard = chooseBotDiscardCard(refreshedPlayer.cards, discardWild, discardOptions);
+  const pickedUid = String(refreshedTurn.picked_card_uid || '').trim();
+  if (pickedUid && discardCard?.card_uid === pickedUid) {
+    const pickedCardObj = refreshedPlayer.cards.find((card) => card?.card_uid === pickedUid);
+    const handBeforePick = refreshedPlayer.cards.filter((card) => card?.card_uid !== pickedUid);
+    if (
+      pickedCardObj
+      && !canMeaningfullyImproveWithPickedCard(handBeforePick, pickedCardObj, discardWild)
+    ) {
+      discardCard = chooseBotDiscardCard(refreshedPlayer.cards, discardWild, {
+        ...discardOptions,
+        excludeCardUids: [pickedUid],
+      });
+    }
+  }
   if (!discardCard) return;
 
   logBotDecisionExplainability(sessionId, {
@@ -7614,7 +7696,8 @@ async function finalizeGameByElimination(
       session,
       poolScoresByUser,
       winnerUserId,
-      Array.from(poolEliminatedSet)
+      Array.from(poolEliminatedSet),
+      finalizedResults,
     );
 
     let settlement = null;
@@ -8060,7 +8143,11 @@ async function onTurnTimeout(io, sessionId, expectedTurnId) {
     return;
   }
 
-  const nextTurnUser = nextTurnUserId(activePlayersAfterTimeout, currentUserId);
+  const nextTurnUser = nextTurnUserId(activePlayersAfterTimeout, currentUserId, {
+    currentSeatNo: (session.players || []).find(
+      (p) => Number(p.user_id) === Number(currentUserId)
+    )?.seat_no,
+  });
   const nextTurnWindow = buildTurnWindow(turnTimerSeconds);
   const nextTurn = buildTurnPayload({
     session,
@@ -8394,7 +8481,9 @@ async function dropPlayerFromSession(io, sessionId, userId) {
 
   if (Number(turn.user_id) === Number(userId)) {
     const turnTimerSeconds = Number(session?.game?.turn_timer_seconds) || 30;
-    const nextTurnUser = nextTurnUserId(activePlayersAfterDrop, userId);
+    const nextTurnUser = nextTurnUserId(activePlayersAfterDrop, userId, {
+      currentSeatNo: player.seat_no,
+    });
     const nextTurnWindow = buildTurnWindow(turnTimerSeconds);
     const nextTurn = buildTurnPayload({
       session,
@@ -8970,7 +9059,8 @@ function registerSocketServer(httpServer) {
           session,
           poolProgress.scoresByUser,
           poolWinnerUserId,
-          poolProgress.eliminatedUserIds
+          poolProgress.eliminatedUserIds,
+          roundResultsWithPool,
         );
         winnerUserId = poolWinnerUserId;
 
@@ -11951,7 +12041,9 @@ function registerSocketServer(httpServer) {
 
           const turnTimerSeconds = Number(session?.game?.turn_timer_seconds) || 30;
           const attemptsUsedByUser = normalizeAttemptsUsedByUser(session.metadata || {});
-          const nextTurnUser = nextTurnUserId(activePlayersAfterPack, socket.user.id);
+          const nextTurnUser = nextTurnUserId(activePlayersAfterPack, socket.user.id, {
+            currentSeatNo: player?.seat_no,
+          });
           if (!nextTurnUser) {
             cleanupDeclareState(sessionId);
             callback({

@@ -240,7 +240,7 @@ function chooseBotPickSource(distribution, playerCards = [], wildJoker = null, o
     return 'closed';
   }
 
-  if (proactive && needsPure && pickImportance >= 30 && improvement >= 2) {
+  if (proactive && needsPure && pickImportance >= 30 && improvement >= 8) {
     return 'discard';
   }
 
@@ -267,8 +267,17 @@ function buildDiscardCandidateRanking(cards = [], wildJoker = null, options = {}
   );
 
   const wildRank = wildJoker?.rank || null;
+  const excludeUids = new Set(
+    (Array.isArray(options?.excludeCardUids) ? options.excludeCardUids : [])
+      .map((uid) => String(uid || '').trim())
+      .filter(Boolean)
+  );
   const nonWildCandidates = cards.filter((card) => !isWildcard(card, wildRank));
-  const candidates = nonWildCandidates.length > 0 ? nonWildCandidates : cards;
+  let candidates = (nonWildCandidates.length > 0 ? nonWildCandidates : cards)
+    .filter((card) => !excludeUids.has(String(card?.card_uid || '')));
+  if (candidates.length === 0) {
+    candidates = nonWildCandidates.length > 0 ? nonWildCandidates : cards;
+  }
 
   const ranked = candidates.map((candidate) => {
     const remainingCards = cards.filter((card) => card?.card_uid !== candidate.card_uid);
