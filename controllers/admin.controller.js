@@ -1,5 +1,6 @@
 const multer = require('multer');
 const adminService = require('../services/admin.service');
+const withdrawalService = require('../services/withdrawal.service');
 const adminTelemetryService = require('../services/adminTelemetry.service');
 const adminLedgerService = require('../services/adminLedger.service');
 const staleSessionCleanupScheduler = require('../services/staleSessionCleanup.scheduler');
@@ -450,6 +451,165 @@ async function getRechargeDetails(req, res) {
       return res.status(404).json({ success: false, message: 'Recharge transaction not found' });
     }
     return res.status(500).json({ success: false, message: 'Failed to fetch recharge details' });
+  }
+}
+
+async function listWithdrawals(req, res) {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const {
+      status,
+      type,
+      user_id: userId,
+      phone,
+      order_id: orderId,
+      withdraw_no: withdrawNo,
+      date_from: dateFrom,
+      date_to: dateTo,
+      min_amount: minAmount,
+      max_amount: maxAmount,
+    } = req.query || {};
+
+    const result = await adminService.listWithdrawalsForAdmin({
+      page,
+      limit,
+      status,
+      type,
+      userId,
+      phone,
+      orderId,
+      withdrawNo,
+      dateFrom,
+      dateTo,
+      minAmount,
+      maxAmount,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Withdrawal transactions fetched successfully',
+      ...result,
+    });
+  } catch (err) {
+    console.error('listWithdrawals error:', err);
+    if (err.code === 'INVALID_WITHDRAWAL_STATUS_FILTER') {
+      return res.status(400).json({
+        success: false,
+        message: 'status must be all, init, processing, pending, successful, failed, or rejected',
+      });
+    }
+    if (err.code === 'INVALID_WITHDRAWAL_TYPE_FILTER') {
+      return res.status(400).json({ success: false, message: 'type must be all, conventional, or p2p' });
+    }
+    if (err.code === 'INVALID_USER_ID_FILTER') {
+      return res.status(400).json({ success: false, message: 'user_id must be a valid positive integer' });
+    }
+    if (err.code === 'INVALID_DATE_FROM') {
+      return res.status(400).json({ success: false, message: 'date_from must be a valid date' });
+    }
+    if (err.code === 'INVALID_DATE_TO') {
+      return res.status(400).json({ success: false, message: 'date_to must be a valid date' });
+    }
+    if (err.code === 'INVALID_MIN_AMOUNT') {
+      return res.status(400).json({ success: false, message: 'min_amount must be a valid number' });
+    }
+    if (err.code === 'INVALID_MAX_AMOUNT') {
+      return res.status(400).json({ success: false, message: 'max_amount must be a valid number' });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to fetch withdrawal transactions' });
+  }
+}
+
+async function getWithdrawalDetails(req, res) {
+  try {
+    const { withdrawalId } = req.params;
+    const result = await adminService.getWithdrawalDetailsForAdmin(withdrawalId);
+    return res.json({
+      success: true,
+      message: 'Withdrawal details fetched successfully',
+      ...result,
+    });
+  } catch (err) {
+    console.error('getWithdrawalDetails error:', err);
+    if (err.code === 'INVALID_WITHDRAWAL_ID') {
+      return res.status(400).json({ success: false, message: 'withdrawalId must be a valid positive integer' });
+    }
+    if (err.code === 'WITHDRAWAL_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Withdrawal transaction not found' });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to fetch withdrawal details' });
+  }
+}
+
+async function settleWithdrawal(req, res) {
+  try {
+    const withdrawalId = Number(req.params.withdrawalId);
+    if (!withdrawalId) {
+      return res.status(400).json({ success: false, message: 'Valid withdrawal id required' });
+    }
+
+    const withdrawal = await withdrawalService.settleWithdrawalByAdmin({
+      withdrawalId,
+      adminId: req.auth?.adminId || null,
+      phone: req.body?.phone || null,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Payout initiated successfully',
+      withdrawal,
+    });
+  } catch (err) {
+    console.error('settleWithdrawal error:', err);
+    if (err.code === 'WITHDRAWAL_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Withdrawal transaction not found' });
+    }
+    if (err.code === 'WITHDRAWAL_NOT_SETTLEABLE') {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    if (err.code === 'PG_NOT_CONFIGURED') {
+      return res.status(503).json({ success: false, message: 'Payout gateway is not configured' });
+    }
+    if (['PG_UNAVAILABLE', 'PG_INVALID_RESPONSE', 'PG_INIT_FAILED'].includes(err.code)) {
+      return res.status(502).json({
+        success: false,
+        message: err.message || 'Failed to initiate payout',
+        withdrawal: err.withdrawal || null,
+      });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to settle withdrawal' });
+  }
+}
+
+async function rejectWithdrawal(req, res) {
+  try {
+    const withdrawalId = Number(req.params.withdrawalId);
+    if (!withdrawalId) {
+      return res.status(400).json({ success: false, message: 'Valid withdrawal id required' });
+    }
+
+    const { reason } = req.body || {};
+    const withdrawal = await withdrawalService.rejectWithdrawalByAdmin({
+      withdrawalId,
+      adminId: req.auth?.adminId || null,
+      reason: reason || null,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Withdrawal rejected and amount refunded to wallet',
+      withdrawal,
+    });
+  } catch (err) {
+    console.error('rejectWithdrawal error:', err);
+    if (err.code === 'WITHDRAWAL_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Withdrawal transaction not found' });
+    }
+    if (err.code === 'WITHDRAWAL_NOT_REJECTABLE') {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to reject withdrawal' });
   }
 }
 
@@ -1242,6 +1402,10 @@ module.exports = {
   getGameTelemetryTrace,
   getGameTelemetrySummary,
   getRechargeDetails,
+  listWithdrawals,
+  getWithdrawalDetails,
+  settleWithdrawal,
+  rejectWithdrawal,
   getUserDetails,
   updateAddCashOptionActive,
   updateAppUpdateConfig,

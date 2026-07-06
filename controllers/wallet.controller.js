@@ -1,4 +1,33 @@
 const walletService = require('../services/wallet.service');
+const giftauraPgService = require('../services/giftauraPg.service');
+
+function renderPaymentCallbackPage({ success, message, orderId }) {
+  const title = success ? 'Payment Successful' : 'Payment Failed';
+  const color = success ? '#1b8f3a' : '#c0392b';
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${title}</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #0f172a; color: #fff; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+    .card { background: #111827; border-radius: 12px; padding: 24px; max-width: 420px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+    h1 { color: ${color}; margin: 0 0 12px; font-size: 24px; }
+    p { margin: 8px 0; line-height: 1.5; color: #d1d5db; }
+    .order { font-size: 12px; color: #9ca3af; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>${title}</h1>
+    <p>${message}</p>
+    <p class="order">Order ID: ${orderId || '-'}</p>
+    <p>You can close this window and return to the app.</p>
+  </div>
+</body>
+</html>`;
+}
 
 /** Create an Add Cash (recharge) transaction in init state. */
 async function createAddCash(req, res) {
@@ -20,9 +49,9 @@ async function createAddCash(req, res) {
       return res.status(400).json({ success: false, message: 'Valid positive amount required' });
     }
 
-    let tx;
+    let result;
     try {
-      tx = await walletService.createAddCashInit({
+      result = await walletService.createAddCashInit({
         userId,
         amount: numericAmount,
         type,
@@ -37,17 +66,96 @@ async function createAddCash(req, res) {
       if (err.code && ['INVALID_PROMO_CODE', 'PROMO_MIN_AMOUNT', 'PROMO_ALREADY_USED', 'PROMO_EXHAUSTED'].includes(err.code)) {
         return res.status(400).json({ success: false, message: err.message });
       }
+      if (err.code === 'PG_NOT_CONFIGURED') {
+        return res.status(503).json({ success: false, message: 'Payment gateway is not configured' });
+      }
+      if (err.code && ['PG_UNAVAILABLE', 'PG_INVALID_RESPONSE', 'PG_INIT_FAILED'].includes(err.code)) {
+        console.error('createAddCash PG error:', err.code, err.message, err.gatewayResponse || '');
+        return res.status(502).json({
+          success: false,
+          message: err.message || 'Failed to initiate payment',
+        });
+      }
+      if (err.code === 'ETIMEOUT' || err.syscall === 'queryA') {
+        return res.status(502).json({
+          success: false,
+          message: 'Unable to reach payment gateway. Please try again.',
+        });
+      }
       throw err;
     }
 
     return res.json({
       success: true,
       message: 'Add cash transaction created',
-      transaction: tx,
+      transaction: result.transaction,
+      payment: result.payment,
     });
   } catch (err) {
     console.error('createAddCash error:', err);
+    if (err.code === 'ETIMEOUT' || err.syscall === 'queryA') {
+      return res.status(502).json({
+        success: false,
+        message: 'Unable to reach payment gateway. Please try again.',
+      });
+    }
     return res.status(500).json({ success: false, message: 'Failed to create add cash transaction' });
+  }
+}
+
+/** GiftAura PG redirect callback (web-based redirection after payment). */
+async function paymentCallback(req, res) {
+  try {
+    const { tx, resolvedStatus } = await walletService.handlePaymentCallback(req.query || {});
+    if (!tx) {
+      return res.status(404).send(renderPaymentCallbackPage({
+        success: false,
+        message: 'Transaction not found.',
+        orderId: req.query?.order_id || req.query?.orderid || '',
+      }));
+    }
+
+    const success = resolvedStatus === 'payment_success';
+    return res.status(success ? 200 : 400).send(renderPaymentCallbackPage({
+      success,
+      message: success
+        ? 'Your payment was received successfully.'
+        : 'Payment could not be completed. Please try again.',
+      orderId: tx.order_id,
+    }));
+  } catch (err) {
+    console.error('paymentCallback error:', err);
+    return res.status(400).send(renderPaymentCallbackPage({
+      success: false,
+      message: err.message || 'Invalid payment callback.',
+      orderId: req.query?.order_id || req.query?.orderid || '',
+    }));
+  }
+}
+
+/** Poll recharge status for the authenticated user after PG redirect. */
+async function getRechargeStatus(req, res) {
+  try {
+    const userId = req.user.id;
+    const orderId = String(req.query?.order_id || req.params?.orderId || '').trim();
+    if (!orderId) {
+      return res.status(400).json({ success: false, message: 'order_id is required' });
+    }
+
+    const tx = await walletService.getRechargeByOrderIdForUser({ userId, orderId });
+    if (!tx) {
+      return res.status(404).json({ success: false, message: 'Transaction not found', order_id: orderId });
+    }
+
+    return res.json({
+      success: true,
+      message: 'Transaction status retrieved',
+      transaction: tx,
+      redirect_url: giftauraPgService.getRedirectUrl(),
+    });
+  } catch (err) {
+    console.error('getRechargeStatus error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to retrieve transaction status' });
   }
 }
 
@@ -93,6 +201,10 @@ async function updatePaymentStatus(req, res) {
 
     if (!tx) {
       return res.status(404).json({ success: false, message: 'Transaction not found', order_id: orderId });
+    }
+
+    if (req.user && Number(tx.user_id) !== Number(req.user.id)) {
+      return res.status(403).json({ success: false, message: 'Not allowed to update this transaction' });
     }
 
     return res.json({
@@ -196,6 +308,8 @@ async function listTransactionDetails(req, res) {
 
 module.exports = {
   createAddCash,
+  paymentCallback,
+  getRechargeStatus,
   updatePaymentStatus,
   listUserTransactions,
   listPendingBonusTransactions,

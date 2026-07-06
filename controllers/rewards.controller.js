@@ -33,10 +33,12 @@ async function claimDaily(req, res) {
 
     // Fire-and-forget notification
     notificationService
-      .createNotification(userId, {
+      .notifyUser(userId, {
         title: `Day ${result.claimed.day} reward claimed`,
         content: `You received ₹${result.claimed.amount} as your daily reward.`,
         type: 'wallet',
+        event: notificationService.NOTIFICATION_EVENTS.REWARD_CLAIMED,
+        metadata: { day: result.claimed.day, amount: result.claimed.amount, screen: 'rewards' },
       })
       .catch((e) => console.error('daily reward notification error:', e));
 

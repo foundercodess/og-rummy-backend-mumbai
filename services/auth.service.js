@@ -216,16 +216,20 @@ async function verifyOtp(phone, otp, requestId, req) {
   // Create notification for new user or login
   try {
     if (isNewUser) {
-      await notificationService.createNotification(user.id, {
+      await notificationService.notifyUser(user.id, {
         title: 'Welcome to OG Rummy',
         content: 'Your account has been created successfully. Start playing and enjoy!',
         type: 'welcome',
+        event: notificationService.NOTIFICATION_EVENTS.WELCOME,
+        metadata: { screen: 'home' },
       });
     } else {
-      await notificationService.createNotification(user.id, {
+      await notificationService.notifyUser(user.id, {
         title: 'Login successful',
         content: 'You have logged in to your OG Rummy account.',
         type: 'system',
+        event: notificationService.NOTIFICATION_EVENTS.LOGIN,
+        push: false,
       });
     }
   } catch (e) {

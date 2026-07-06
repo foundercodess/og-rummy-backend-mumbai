@@ -38,6 +38,12 @@ router.get('/wallet/recharges', requireAdmin, adminController.listRecharges);
 // Admin: fetch one recharge/add-cash transaction with linked wallet ledger rows
 router.get('/wallet/recharges/:rechargeId', requireAdmin, adminController.getRechargeDetails);
 
+// Admin: withdrawal payout queue (list, detail, settle via PG, reject + refund)
+router.get('/wallet/withdrawals', requireAdmin, adminController.listWithdrawals);
+router.get('/wallet/withdrawals/:withdrawalId', requireAdmin, adminController.getWithdrawalDetails);
+router.post('/wallet/withdrawals/:withdrawalId/settle', requireAdmin, adminController.settleWithdrawal);
+router.post('/wallet/withdrawals/:withdrawalId/reject', requireAdmin, adminController.rejectWithdrawal);
+
 // Admin: support queues
 router.get('/support/feedback/withdrawal', requireAdmin, adminController.listWithdrawalFeedback);
 router.get('/support/feedback/withdrawal/:feedbackId', requireAdmin, adminController.getWithdrawalFeedbackDetails);

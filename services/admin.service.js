@@ -1164,6 +1164,332 @@ async function getRechargeDetailsForAdmin(rechargeId) {
   };
 }
 
+async function listWithdrawalsForAdmin({
+  page = 1,
+  limit = 20,
+  status,
+  type,
+  userId,
+  phone,
+  orderId,
+  withdrawNo,
+  dateFrom,
+  dateTo,
+  minAmount,
+  maxAmount,
+} = {}) {
+  const normalizedDateFrom = normalizeDateFilter(dateFrom, 'INVALID_DATE_FROM');
+  const normalizedDateTo = normalizeDateFilter(dateTo, 'INVALID_DATE_TO');
+  const normalizedUserId = normalizeIntegerFilter(userId, 'INVALID_USER_ID_FILTER');
+  const normalizedPhone = phone == null ? null : String(phone).trim();
+  const normalizedOrderId = orderId == null ? null : String(orderId).trim();
+  const normalizedWithdrawNo = withdrawNo == null ? null : String(withdrawNo).trim();
+  const normalizedStatus = status == null || String(status).trim() === ''
+    ? 'all'
+    : String(status).trim().toLowerCase();
+  const normalizedType = type == null || String(type).trim() === ''
+    ? 'all'
+    : String(type).trim().toLowerCase();
+  const normalizedMinAmount = minAmount == null || minAmount === '' ? null : Number(minAmount);
+  const normalizedMaxAmount = maxAmount == null || maxAmount === '' ? null : Number(maxAmount);
+
+  const allowedStatuses = [
+    'all', 'init', 'processing', 'pending', 'successful', 'failed', 'rejected',
+  ];
+  if (!allowedStatuses.includes(normalizedStatus)) {
+    const err = new Error('INVALID_WITHDRAWAL_STATUS_FILTER');
+    err.code = 'INVALID_WITHDRAWAL_STATUS_FILTER';
+    throw err;
+  }
+  if (!['all', 'conventional', 'p2p'].includes(normalizedType)) {
+    const err = new Error('INVALID_WITHDRAWAL_TYPE_FILTER');
+    err.code = 'INVALID_WITHDRAWAL_TYPE_FILTER';
+    throw err;
+  }
+  if (normalizedMinAmount != null && !Number.isFinite(normalizedMinAmount)) {
+    const err = new Error('INVALID_MIN_AMOUNT');
+    err.code = 'INVALID_MIN_AMOUNT';
+    throw err;
+  }
+  if (normalizedMaxAmount != null && !Number.isFinite(normalizedMaxAmount)) {
+    const err = new Error('INVALID_MAX_AMOUNT');
+    err.code = 'INVALID_MAX_AMOUNT';
+    throw err;
+  }
+
+  const where = [];
+  const params = [];
+  let idx = 1;
+
+  if (normalizedStatus !== 'all') {
+    where.push(`LOWER(wt.status) = $${idx++}`);
+    params.push(normalizedStatus);
+  }
+  if (normalizedType !== 'all') {
+    where.push(`LOWER(wt.type) = $${idx++}`);
+    params.push(normalizedType);
+  }
+  if (normalizedUserId != null) {
+    where.push(`wt.user_id = $${idx++}`);
+    params.push(normalizedUserId);
+  }
+  if (normalizedPhone) {
+    where.push(`COALESCE(u.phone, '') ILIKE $${idx++}`);
+    params.push(`%${normalizedPhone}%`);
+  }
+  if (normalizedOrderId) {
+    where.push(`wt.order_id ILIKE $${idx++}`);
+    params.push(`%${normalizedOrderId}%`);
+  }
+  if (normalizedWithdrawNo) {
+    where.push(`wt.withdraw_no ILIKE $${idx++}`);
+    params.push(`%${normalizedWithdrawNo}%`);
+  }
+  if (normalizedDateFrom) {
+    where.push(`wt.requested_at >= $${idx++}`);
+    params.push(normalizedDateFrom);
+  }
+  if (normalizedDateTo) {
+    where.push(`wt.requested_at <= $${idx++}`);
+    params.push(normalizedDateTo);
+  }
+  if (normalizedMinAmount != null) {
+    where.push(`wt.amount >= $${idx++}`);
+    params.push(normalizedMinAmount);
+  }
+  if (normalizedMaxAmount != null) {
+    where.push(`wt.amount <= $${idx++}`);
+    params.push(normalizedMaxAmount);
+  }
+
+  const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const fromJoin = `
+    FROM withdrawal_transactions wt
+    LEFT JOIN users u ON u.id = wt.user_id
+    LEFT JOIN wallets w ON w.id = wt.wallet_id
+    ${whereClause}
+  `;
+
+  const countResult = await query(`SELECT COUNT(*)::int AS total ${fromJoin}`, params);
+  const total = Number(countResult.rows[0]?.total || 0);
+
+  const summaryResult = await query(
+    `SELECT
+       COALESCE(SUM(wt.amount), 0)::numeric(14,2) AS requested_total,
+       COALESCE(SUM(CASE WHEN wt.status = 'successful' THEN wt.amount ELSE 0 END), 0)::numeric(14,2) AS success_total,
+       COUNT(*) FILTER (WHERE wt.status = 'successful')::int AS success_count,
+       COUNT(*) FILTER (WHERE wt.status = 'processing')::int AS processing_count,
+       COUNT(*) FILTER (WHERE wt.status = 'pending')::int AS pending_count,
+       COUNT(*) FILTER (WHERE wt.status = 'failed')::int AS failed_count,
+       COUNT(*) FILTER (WHERE wt.status = 'rejected')::int AS rejected_count
+     ${fromJoin}`,
+    params
+  );
+
+  const offset = (page - 1) * limit;
+  const listResult = await query(
+    `SELECT
+       wt.*,
+       u.name AS user_name,
+       u.phone AS user_phone,
+       u.view_id AS user_view_id,
+       u.active AS user_active,
+       u.withdrawals_frozen AS user_withdrawals_frozen,
+       w.withdrawable AS wallet_withdrawable,
+       w.total_balance AS wallet_total_balance
+     ${fromJoin}
+     ORDER BY wt.requested_at DESC, wt.id DESC
+     LIMIT $${idx++} OFFSET $${idx}`,
+    [...params, limit, offset]
+  );
+
+  const withdrawals = listResult.rows.map((row) => {
+    const bank = typeof row.bank_snapshot === 'string'
+      ? (() => { try { return JSON.parse(row.bank_snapshot); } catch { return {}; } })()
+      : (row.bank_snapshot || {});
+    return {
+      id: row.id,
+      withdraw_no: row.withdraw_no,
+      order_id: row.order_id,
+      status: row.status,
+      type: row.type,
+      amount: toNumberOrNull(row.amount),
+      handling_fee: toNumberOrNull(row.handling_fee),
+      net_amount: toNumberOrNull(row.net_amount),
+      pg_reference: row.pg_reference,
+      pg_remark: row.pg_remark,
+      admin_notes: row.admin_notes,
+      requested_at: row.requested_at,
+      reviewed_at: row.reviewed_at,
+      completed_at: row.completed_at,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      user: {
+        id: row.user_id,
+        name: row.user_name || null,
+        phone: row.user_phone || null,
+        view_id: row.user_view_id || null,
+        active: row.user_active !== false,
+        withdrawals_frozen: row.user_withdrawals_frozen === true,
+      },
+      wallet: {
+        id: row.wallet_id,
+        withdrawable: toNumberOrNull(row.wallet_withdrawable),
+        total_balance: toNumberOrNull(row.wallet_total_balance),
+      },
+      bank: {
+        account_holder_name: bank.account_holder_name || null,
+        bank_name: bank.bank_name || null,
+        account_number: bank.account_number || null,
+        ifsc_code: bank.ifsc_code || null,
+        branch: bank.branch || null,
+      },
+    };
+  });
+
+  const summaryRow = summaryResult.rows[0] || {};
+  return {
+    withdrawals,
+    pagination: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    },
+    filters: {
+      status: normalizedStatus,
+      type: normalizedType,
+      user_id: normalizedUserId,
+      phone: normalizedPhone || null,
+      order_id: normalizedOrderId || null,
+      withdraw_no: normalizedWithdrawNo || null,
+      date_from: normalizedDateFrom,
+      date_to: normalizedDateTo,
+      min_amount: normalizedMinAmount,
+      max_amount: normalizedMaxAmount,
+    },
+    summary: {
+      requested_total: toNumberOrNull(summaryRow.requested_total) || 0,
+      success_total: toNumberOrNull(summaryRow.success_total) || 0,
+      success_count: Number(summaryRow.success_count || 0),
+      processing_count: Number(summaryRow.processing_count || 0),
+      pending_count: Number(summaryRow.pending_count || 0),
+      failed_count: Number(summaryRow.failed_count || 0),
+      rejected_count: Number(summaryRow.rejected_count || 0),
+    },
+  };
+}
+
+async function getWithdrawalDetailsForAdmin(withdrawalId) {
+  const id = normalizeIntegerFilter(withdrawalId, 'INVALID_WITHDRAWAL_ID');
+
+  const withdrawalResult = await query(
+    `SELECT
+       wt.*,
+       u.name AS user_name,
+       u.phone AS user_phone,
+       u.view_id AS user_view_id,
+       u.avatar AS user_avatar,
+       u.active AS user_active,
+       u.withdrawals_frozen AS user_withdrawals_frozen,
+       w.deposit AS wallet_deposit,
+       w.pending_bonus AS wallet_pending_bonus,
+       w.released_bonus AS wallet_released_bonus,
+       w.withdrawable AS wallet_withdrawable,
+       w.total_balance AS wallet_total_balance,
+       a.email AS settled_by_email
+     FROM withdrawal_transactions wt
+     LEFT JOIN users u ON u.id = wt.user_id
+     LEFT JOIN wallets w ON w.id = wt.wallet_id
+     LEFT JOIN admins a ON a.id = wt.settled_by
+     WHERE wt.id = $1
+     LIMIT 1`,
+    [id]
+  );
+
+  const row = withdrawalResult.rows[0] || null;
+  if (!row) {
+    const err = new Error('WITHDRAWAL_NOT_FOUND');
+    err.code = 'WITHDRAWAL_NOT_FOUND';
+    throw err;
+  }
+
+  const ledgerResult = await query(
+    `SELECT wt_tx.*
+     FROM wallet_transactions wt_tx
+     WHERE wt_tx.reference_type = 'withdrawal_transaction'
+       AND wt_tx.reference_id = $1
+     ORDER BY wt_tx.created_at ASC, wt_tx.id ASC`,
+    [id]
+  );
+
+  const bank = typeof row.bank_snapshot === 'string'
+    ? (() => { try { return JSON.parse(row.bank_snapshot); } catch { return {}; } })()
+    : (row.bank_snapshot || {});
+
+  const ledger = ledgerResult.rows.map((tx) => ({
+    id: tx.id,
+    transaction_type: tx.transaction_type,
+    amount: toNumberOrNull(tx.amount),
+    source: tx.source,
+    reference_type: tx.reference_type,
+    reference_id: tx.reference_id,
+    metadata: tx.metadata || {},
+    created_at: tx.created_at,
+  }));
+
+  return {
+    withdrawal: {
+      id: row.id,
+      withdraw_no: row.withdraw_no,
+      order_id: row.order_id,
+      status: row.status,
+      type: row.type,
+      amount: toNumberOrNull(row.amount),
+      handling_fee: toNumberOrNull(row.handling_fee),
+      net_amount: toNumberOrNull(row.net_amount),
+      pg_reference: row.pg_reference,
+      pg_remark: row.pg_remark,
+      admin_notes: row.admin_notes,
+      payout_response: row.payout_response,
+      requested_at: row.requested_at,
+      reviewed_at: row.reviewed_at,
+      completed_at: row.completed_at,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      settled_by: row.settled_by ? {
+        id: row.settled_by,
+        email: row.settled_by_email || null,
+      } : null,
+      user: {
+        id: row.user_id,
+        name: row.user_name || null,
+        phone: row.user_phone || null,
+        view_id: row.user_view_id || null,
+        avatar: row.user_avatar || null,
+        active: row.user_active !== false,
+        withdrawals_frozen: row.user_withdrawals_frozen === true,
+      },
+      wallet: {
+        id: row.wallet_id,
+        deposit: toNumberOrNull(row.wallet_deposit),
+        pending_bonus: toNumberOrNull(row.wallet_pending_bonus),
+        released_bonus: toNumberOrNull(row.wallet_released_bonus),
+        withdrawable: toNumberOrNull(row.wallet_withdrawable),
+        total_balance: toNumberOrNull(row.wallet_total_balance),
+      },
+      bank: {
+        account_holder_name: bank.account_holder_name || null,
+        bank_name: bank.bank_name || null,
+        account_number: bank.account_number || null,
+        ifsc_code: bank.ifsc_code || null,
+        branch: bank.branch || null,
+      },
+    },
+    ledger,
+  };
+}
+
 async function getMaintenanceModeForAdmin() {
   const row = await maintenanceModeModel.getCurrent();
   return {
@@ -1597,19 +1923,21 @@ async function updateUserKycStatus({ userId, status, rejectionNote }) {
   // Best-effort user notification when admin approves/rejects KYC.
   try {
     if (normalizedStatus === 'approved') {
-      await notificationService.createNotification(userId, {
+      await notificationService.notifyUser(userId, {
         title: 'KYC Approved',
         content: 'Your KYC has been approved successfully.',
         type: 'system',
-        metadata: { kyc_status: 'approved' },
+        event: notificationService.NOTIFICATION_EVENTS.KYC_APPROVED,
+        metadata: { kyc_status: 'approved', screen: 'kyc' },
       });
     } else if (normalizedStatus === 'rejected') {
       const reason = finalNote ? ` Reason: ${finalNote}` : '';
-      await notificationService.createNotification(userId, {
+      await notificationService.notifyUser(userId, {
         title: 'KYC Rejected',
         content: `Your KYC has been rejected.${reason}`,
         type: 'system',
-        metadata: { kyc_status: 'rejected', rejection_note: finalNote },
+        event: notificationService.NOTIFICATION_EVENTS.KYC_REJECTED,
+        metadata: { kyc_status: 'rejected', rejection_note: finalNote, screen: 'kyc' },
       });
     }
   } catch (notifyErr) {
@@ -2341,6 +2669,31 @@ async function updateReportFeedbackStatusForAdmin({ feedbackId, type, status, ad
     throw err;
   }
 
+  if (['resolved', 'rejected'].includes(normalizedStatus)) {
+    try {
+      const isResolved = normalizedStatus === 'resolved';
+      const noteSuffix = normalizedAdminNotes ? ` ${normalizedAdminNotes}` : '';
+      await notificationService.notifyUser(row.user_id, {
+        title: isResolved ? 'Support ticket resolved' : 'Support ticket update',
+        content: isResolved
+          ? `Your ${normalizedType.replace('_', ' ')} request has been resolved.${noteSuffix}`
+          : `Your ${normalizedType.replace('_', ' ')} request was rejected.${noteSuffix}`,
+        type: 'support',
+        event: isResolved
+          ? notificationService.NOTIFICATION_EVENTS.TICKET_RESOLVED
+          : notificationService.NOTIFICATION_EVENTS.TICKET_REJECTED,
+        metadata: {
+          feedback_id: row.id,
+          feedback_type: normalizedType,
+          status: normalizedStatus,
+          screen: 'support',
+        },
+      });
+    } catch (notifyError) {
+      console.error('support ticket notification error:', notifyError.message);
+    }
+  }
+
   return { feedback: row };
 }
 
@@ -2421,6 +2774,31 @@ async function updateAddCashComplaintStatusForAdmin({ complaintId, status, admin
     err.code = 'ADD_CASH_COMPLAINT_NOT_FOUND';
     throw err;
   }
+
+  if (['resolved', 'rejected'].includes(normalizedStatus)) {
+    try {
+      const isResolved = normalizedStatus === 'resolved';
+      const noteSuffix = normalizedAdminNotes ? ` ${normalizedAdminNotes}` : '';
+      await notificationService.notifyUser(row.user_id, {
+        title: isResolved ? 'Add cash complaint resolved' : 'Add cash complaint update',
+        content: isResolved
+          ? `Your add cash complaint has been resolved.${noteSuffix}`
+          : `Your add cash complaint was rejected.${noteSuffix}`,
+        type: 'support',
+        event: isResolved
+          ? notificationService.NOTIFICATION_EVENTS.TICKET_RESOLVED
+          : notificationService.NOTIFICATION_EVENTS.TICKET_REJECTED,
+        metadata: {
+          complaint_id: row.id,
+          status: normalizedStatus,
+          screen: 'wallet',
+        },
+      });
+    } catch (notifyError) {
+      console.error('add cash complaint notification error:', notifyError.message);
+    }
+  }
+
   return { complaint: row };
 }
 
@@ -2433,6 +2811,8 @@ module.exports = {
   getAppSettingsForAdmin,
   getMaintenanceModeForAdmin,
   getRechargeDetailsForAdmin,
+  listWithdrawalsForAdmin,
+  getWithdrawalDetailsForAdmin,
   getGameHistoryDetailsForAdmin,
   getUserDetailsById,
   getAppUpdateConfigForAdmin,

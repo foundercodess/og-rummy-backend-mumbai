@@ -3,6 +3,8 @@ const walletModel = require('../models/wallet.model');
 const rechargeTxModel = require('../models/rechargeTransaction.model');
 const promoCodeModel = require('../models/promoCode.model');
 const walletTransactionModel = require('../models/walletTransaction.model');
+const giftauraPgService = require('./giftauraPg.service');
+const notificationService = require('./notification.service');
 
 const ACCOUNT_STATEMENT_FILTERS = Object.freeze([
   { key: 'all', label: 'All', enabled: true, default: true },
@@ -186,7 +188,7 @@ async function validateAndGetPromoBonus(promoCode, amount, userId) {
   return { promo, bonusAmount, instantCash };
 }
 
-/** Create an init recharge transaction and return it. */
+/** Create an init recharge transaction, initiate PG pay-in, and return transaction + payment link. */
 async function createAddCashInit({
   userId,
   amount,
@@ -198,6 +200,12 @@ async function createAddCashInit({
   phone = null,
   promoCode = null,
 }) {
+  if (type === 'conventional' && !giftauraPgService.isConfigured()) {
+    const error = new Error('Payment gateway is not configured');
+    error.code = 'PG_NOT_CONFIGURED';
+    throw error;
+  }
+
   let promoCodeId = null;
   let promoBonusAmount = 0;
   let promoInstantCash = 0;
@@ -212,7 +220,9 @@ async function createAddCashInit({
   }
 
   const wallet = await walletModel.getOrCreateByUserId(userId);
-  const orderId = generateOrderId();
+  const orderId = type === 'conventional'
+    ? giftauraPgService.generatePgOrderId()
+    : generateOrderId();
 
   const row = await rechargeTxModel.createInit({
     userId,
@@ -230,7 +240,90 @@ async function createAddCashInit({
     promoInstantCash,
   });
 
+  if (type !== 'conventional') {
+    return {
+      transaction: rechargeTxModel.formatForResponse(row),
+      payment: null,
+    };
+  }
+
+  let payment;
+  try {
+    payment = await giftauraPgService.initiatePayment({
+      orderId,
+      amount,
+      name,
+      email,
+      mobile: phone,
+    });
+  } catch (err) {
+    await rechargeTxModel.updateStatusByOrderId({
+      orderId,
+      status: 'failed',
+      paymentResponse: JSON.stringify({
+        stage: 'pg_init',
+        error: err.message,
+        code: err.code || null,
+        gatewayResponse: err.gatewayResponse || null,
+      }),
+      completedAt: new Date(),
+    });
+    throw err;
+  }
+
+  const updatedRow = await rechargeTxModel.updateStatusByOrderId({
+    orderId,
+    status: 'init',
+    paymentRef: payment.gateway_txn || null,
+    paymentResponse: JSON.stringify({
+      stage: 'pg_init',
+      gateway: 'giftaura',
+      ...payment.raw,
+    }),
+  });
+
+  return {
+    transaction: rechargeTxModel.formatForResponse(updatedRow || row),
+    payment: {
+      payment_link: payment.payment_link,
+      gateway_txn: payment.gateway_txn,
+      order_id: payment.gateway_order_id || orderId,
+      redirect_url: giftauraPgService.buildRedirectUrl(orderId),
+    },
+  };
+}
+
+async function getRechargeByOrderIdForUser({ userId, orderId }) {
+  const row = await rechargeTxModel.findByOrderId(orderId);
+  if (!row || Number(row.user_id) !== Number(userId)) {
+    return null;
+  }
   return rechargeTxModel.formatForResponse(row);
+}
+
+async function handlePaymentCallback(query = {}) {
+  const { orderId, paymentRef, status } = giftauraPgService.extractCallbackFields(query);
+  if (!orderId) {
+    const error = new Error('order_id is required');
+    error.code = 'INVALID_CALLBACK';
+    throw error;
+  }
+
+  const resolvedStatus = status || 'payment_success';
+  const paymentResponse = JSON.stringify({
+    stage: 'pg_callback',
+    gateway: 'giftaura',
+    query,
+  });
+
+  const tx = await updatePaymentStatus({
+    orderId,
+    status: resolvedStatus,
+    paymentRef: paymentRef || orderId,
+    paymentResponse,
+  });
+
+  return { tx, resolvedStatus };
 }
 
 /**
@@ -259,7 +352,8 @@ async function updatePaymentStatus({ orderId, status, paymentRef, paymentRespons
     }
 
     // If already in a terminal status, just return
-    if (['payment_success', 'failed', 'not_paid'].includes(txRow.status)) {
+    const wasAlreadyTerminal = ['payment_success', 'failed', 'not_paid'].includes(txRow.status);
+    if (wasAlreadyTerminal) {
       await client.query('COMMIT');
       return rechargeTxModel.formatForResponse(txRow);
     }
@@ -417,7 +511,27 @@ async function updatePaymentStatus({ orderId, status, paymentRef, paymentRespons
     }
 
     await client.query('COMMIT');
-    return rechargeTxModel.formatForResponse(updatedTx);
+    const formatted = rechargeTxModel.formatForResponse(updatedTx);
+
+    if (status === 'payment_success') {
+      try {
+        await notificationService.notifyUser(updatedTx.user_id, {
+          title: 'Cash added successfully',
+          content: `₹${roundCurrency(updatedTx.amount)} has been added to your wallet.`,
+          type: 'recharge',
+          event: notificationService.NOTIFICATION_EVENTS.CASH_ADDED,
+          metadata: {
+            order_id: updatedTx.order_id,
+            amount: roundCurrency(updatedTx.amount),
+            screen: 'wallet',
+          },
+        });
+      } catch (notifyError) {
+        console.error('cash added notification error:', notifyError.message);
+      }
+    }
+
+    return formatted;
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -481,6 +595,8 @@ async function listTransactionDetails({ userId, limit = 50, offset = 0, fromDate
 module.exports = {
   getAccountStatementFilters,
   createAddCashInit,
+  getRechargeByOrderIdForUser,
+  handlePaymentCallback,
   updatePaymentStatus,
   listUserTransactions,
   listPendingBonusTransactions,

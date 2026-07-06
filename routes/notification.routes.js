@@ -13,6 +13,10 @@ router.post('/read', requireAuth, notificationController.markRead);
 // Delete notifications (scope: 'one' | 'all')
 router.post('/delete', requireAuth, notificationController.remove);
 
+// Register / unregister FCM device token for push notifications
+router.post('/device-token', requireAuth, notificationController.registerDeviceToken);
+router.delete('/device-token', requireAuth, notificationController.unregisterDeviceToken);
+
 module.exports = router;
 
 

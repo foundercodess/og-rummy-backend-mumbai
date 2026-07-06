@@ -94,9 +94,60 @@ async function remove(req, res) {
   }
 }
 
+async function registerDeviceToken(req, res) {
+  try {
+    const {
+      fcm_token: fcmToken,
+      platform,
+      device_id: deviceId,
+      app_version: appVersion,
+    } = req.body || {};
+
+    const result = await notificationService.registerDeviceToken(req.user.id, {
+      fcmToken,
+      platform,
+      deviceId,
+      appVersion,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Device token registered successfully',
+      ...result,
+    });
+  } catch (err) {
+    if (err.code === 'FCM_TOKEN_REQUIRED') {
+      return res.status(400).json({ success: false, message: 'fcm_token is required' });
+    }
+    console.error('notifications.registerDeviceToken error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to register device token' });
+  }
+}
+
+async function unregisterDeviceToken(req, res) {
+  try {
+    const { fcm_token: fcmToken } = req.body || {};
+    const result = await notificationService.unregisterDeviceToken(req.user.id, { fcmToken });
+
+    return res.json({
+      success: true,
+      message: 'Device token unregistered successfully',
+      ...result,
+    });
+  } catch (err) {
+    if (err.code === 'FCM_TOKEN_REQUIRED') {
+      return res.status(400).json({ success: false, message: 'fcm_token is required' });
+    }
+    console.error('notifications.unregisterDeviceToken error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to unregister device token' });
+  }
+}
+
 module.exports = {
   list,
   markRead,
   remove,
+  registerDeviceToken,
+  unregisterDeviceToken,
 };
 
