@@ -872,7 +872,10 @@ async function getSessionState(sessionIdOrCode, existingPlayers = null) {
 }
 
 async function getPendingRejoinSession(userId) {
-  const session = await gameSessionModel.findLatestRejoinableSessionForUser(userId);
+  let session = await gameSessionModel.findLatestRejoinableSessionForUser(userId);
+  if (!session) {
+    session = await gameSessionModel.findLatestActiveSessionForUser(userId);
+  }
   if (!session) return null;
   return getSessionState(session.id);
 }

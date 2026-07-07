@@ -5710,7 +5710,17 @@ function emitSessionStatePayload(io, session) {
   return session;
 }
 
-function buildRejoinPendingGamePayload(session, userId, reason = 'connect') {
+function isUserPresentInSessionRoom(io, sessionId, userId) {
+  const socketIds = typeof socketRegistry?.getSocketIds === 'function'
+    ? socketRegistry.getSocketIds(userId)
+    : [];
+  if (!Array.isArray(socketIds) || socketIds.length === 0) return false;
+  const roomSocketIds = io?.sockets?.adapter?.rooms?.get(sessionRoom(sessionId)) || new Set();
+  return socketIds.some((socketId) => roomSocketIds.has(socketId));
+}
+
+function buildRejoinPendingGamePayload(session, userId, reason = 'connect', options = {}) {
+  const { isPresentInSessionRoom = null } = options;
   const player = (session?.players || []).find((item) => Number(item.user_id) === Number(userId)) || null;
   const sessionActive = String(session?.status || '').toLowerCase() === 'active';
   const playerStatus = String(player?.status || '').toLowerCase();
@@ -5721,13 +5731,15 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect') {
   const playerDropped = player?.metadata?.is_dropped === true
     || String(player?.metadata?.drop_status || '').toLowerCase() === 'dropped'
     || String(player?.metadata?.elimination_reason || '').toLowerCase() === 'dropped';
-  const canRejoin = Boolean(
+  const playerEligible = Boolean(
     session
     && sessionActive
     && ['joined', 'disconnected'].includes(playerStatus)
-    && playerDisconnected
     && !playerDropped
   );
+  const needsTableRejoin = playerDisconnected
+    || isPresentInSessionRoom === false;
+  const canRejoin = Boolean(playerEligible && needsTableRejoin);
 
   return {
     server_time: new Date().toISOString(),
@@ -5779,13 +5791,18 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect') {
   };
 }
 
-async function emitPendingRejoinGame(socket, reason = 'connect') {
+async function emitPendingRejoinGame(io, socket, reason = 'connect') {
   if (!socket?.user?.id) return null;
 
   const session = typeof gameplayService.getPendingRejoinSession === 'function'
     ? await gameplayService.getPendingRejoinSession(socket.user.id)
     : null;
-  const payload = buildRejoinPendingGamePayload(session, socket.user.id, reason);
+  const isPresentInSessionRoom = session && io
+    ? isUserPresentInSessionRoom(io, session.id, socket.user.id)
+    : null;
+  const payload = buildRejoinPendingGamePayload(session, socket.user.id, reason, {
+    isPresentInSessionRoom,
+  });
   socket.emit('rejoin_pending_game', payload);
   return payload;
 }
@@ -5800,7 +5817,7 @@ async function emitPendingRejoinGameForUser(io, userId, reason = 'status_changed
     const socket = io?.sockets?.sockets?.get(socketId);
     if (!socket) return null;
     try {
-      return await emitPendingRejoinGame(socket, reason);
+      return await emitPendingRejoinGame(io, socket, reason);
     } catch (err) {
       console.error(`[SOCKET] Failed to emit pending rejoin game uid=${userId} socket=${socketId}:`, err.message);
       return null;
@@ -6258,6 +6275,11 @@ async function attachSocketToSession(io, socket, session, options = {}) {
     });
   }
 
+  if (presence.playerFound) {
+    syncSocketToSessionPhase(socket, liveSession, presenceReason);
+    socket.emit('session:state', buildJoinAckSessionPayload(liveSession));
+  }
+
   if (emitStateIfUnchanged && !presence.changed && presence.playerFound) {
     emitSessionStatePayload(io, liveSession);
   }
@@ -6269,7 +6291,7 @@ async function attachSocketToSession(io, socket, session, options = {}) {
   }
 
   // Keep generic pending-rejoin indicator fresh when a user gets attached to any table.
-  emitPendingRejoinGame(socket, 'session_attached').catch((rejoinErr) => {
+  emitPendingRejoinGame(io, socket, 'session_attached').catch((rejoinErr) => {
     console.error(`[SOCKET] Failed to emit pending rejoin after attach uid=${socket?.user?.id}:`, rejoinErr.message);
   });
 
@@ -9936,7 +9958,7 @@ function registerSocketServer(httpServer) {
       console.error('[SOCKET] Failed to emit notices on connect:', err.message);
     });
 
-    emitPendingRejoinGame(socket, 'connect').catch((err) => {
+    emitPendingRejoinGame(io, socket, 'connect').catch((err) => {
       console.error('[SOCKET] Failed to emit pending rejoin game on connect:', err.message);
     });
 
@@ -9983,7 +10005,7 @@ function registerSocketServer(httpServer) {
 
     socket.on('rejoin_pending_game:get', async (payload = {}, callback = () => { }) => {
       try {
-        const response = await emitPendingRejoinGame(socket, 'request');
+        const response = await emitPendingRejoinGame(io, socket, 'request');
         callback({ success: true, ...response });
       } catch (err) {
         callback({ success: false, message: err.message });
@@ -12341,22 +12363,45 @@ function registerSocketServer(httpServer) {
 
     socket.on('disconnect', () => {
       const sessionIds = Array.isArray(socket.data.sessionRoomIds) ? socket.data.sessionRoomIds : [];
-      socketRegistry.removeSocket(socket.user.id, socket.id);
+      const userId = socket.user.id;
+      socketRegistry.removeSocket(userId, socket.id);
 
-      sessionIds.forEach((sessionId) => {
+      const markDisconnectedForSession = (sessionId) => {
         const roomSocketIds = io.sockets.adapter.rooms.get(sessionRoom(sessionId)) || new Set();
-        const remainingUserSocketIds = socketRegistry.getSocketIds(socket.user.id);
+        const remainingUserSocketIds = socketRegistry.getSocketIds(userId);
         const stillConnectedToSession = remainingUserSocketIds.some((socketId) => roomSocketIds.has(socketId));
         if (stillConnectedToSession) {
           return;
         }
 
-        setPlayerConnectionState(io, sessionId, socket.user.id, false, 'socket_disconnect').catch((err) => {
-          errorGame(sessionId, `Disconnect presence update failed: ${err.message}`);
-        });
-      });
+        setPlayerConnectionState(io, sessionId, userId, false, 'socket_disconnect')
+          .then((result) => {
+            if (result?.changed) {
+              emitPendingRejoinGameForUser(io, userId, 'socket_disconnect').catch((rejoinErr) => {
+                console.error(`[SOCKET] Failed to emit pending rejoin after disconnect uid=${userId}:`, rejoinErr.message);
+              });
+            }
+          })
+          .catch((err) => {
+            errorGame(sessionId, `Disconnect presence update failed: ${err.message}`);
+          });
+      };
 
-      console.log(`[SOCKET] Disconnected uid=${socket.user.id} socketId=${socket.id}`);
+      if (sessionIds.length > 0) {
+        sessionIds.forEach(markDisconnectedForSession);
+      } else if (typeof gameplayService.getPendingRejoinSession === 'function') {
+        gameplayService.getPendingRejoinSession(userId)
+          .then((session) => {
+            if (session?.id) {
+              markDisconnectedForSession(session.id);
+            }
+          })
+          .catch((err) => {
+            console.error(`[SOCKET] Failed to resolve active session on disconnect uid=${userId}:`, err.message);
+          });
+      }
+
+      console.log(`[SOCKET] Disconnected uid=${userId} socketId=${socket.id}`);
     });
   });
 

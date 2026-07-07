@@ -120,6 +120,33 @@ async function findLatestRejoinableSessionForUser(userId) {
   return result.rows[0] || null;
 }
 
+async function findLatestActiveSessionForUser(userId) {
+  const result = await query(
+    `SELECT gs.*
+     FROM game_sessions gs
+     JOIN game_session_players gsp ON gsp.game_session_id = gs.id
+     WHERE gsp.user_id = $1
+       AND gs.status = 'active'
+       AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
+       AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
+       AND gsp.status IN ('joined', 'disconnected')
+       AND COALESCE((gsp.metadata->>'is_dropped')::boolean, false) = false
+       AND COALESCE((gsp.metadata->>'auto_rematch_opt_out')::boolean, false) = false
+       AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
+       AND COALESCE(gsp.metadata->>'drop_status', '') <> 'dropped'
+       AND COALESCE(gsp.metadata->>'elimination_reason', '') NOT IN ('dropped', 'timeout')
+     ORDER BY
+       gsp.joined_at DESC NULLS LAST,
+       gsp.id DESC,
+       gs.updated_at DESC,
+       gs.id DESC
+     LIMIT 1`,
+    [userId]
+  );
+
+  return result.rows[0] || null;
+}
+
 async function listStaleWaitingSessions({ olderThanSeconds = 30, limit = 25 } = {}) {
   const safeOlderThanSeconds = Math.max(1, Number(olderThanSeconds) || 30);
   const safeLimit = Math.max(1, Math.min(200, Number(limit) || 25));
@@ -297,6 +324,7 @@ module.exports = {
   findOpenWaitingSession,
   findReservedContinuationSession,
   findLatestRejoinableSessionForUser,
+  findLatestActiveSessionForUser,
   listStaleWaitingSessions,
   listSessionPlayers,
   addPlayer,
