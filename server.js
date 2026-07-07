@@ -67,7 +67,7 @@ app.get('/health', async (req, res) => {
 
 // Root route
 app.get('/', (req, res) => {
-  res.json({ message: 'Welcome to OG Rummy API', version: '8 bot implementation' });
+  res.json({ message: 'Welcome to OG Rummy API', version: '7 july 2026' });
 });
 
 const io = registerSocketServer(server);
