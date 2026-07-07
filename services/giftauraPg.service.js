@@ -45,6 +45,7 @@ function createPgError(code, message, extra = {}) {
   return error;
 }
 
+
 function extractGatewayMessage(body = {}) {
   return (
     body.error
