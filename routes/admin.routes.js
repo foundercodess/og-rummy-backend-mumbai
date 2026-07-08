@@ -43,6 +43,7 @@ router.get('/wallet/withdrawals', requireAdmin, adminController.listWithdrawals)
 router.get('/wallet/withdrawals/:withdrawalId', requireAdmin, adminController.getWithdrawalDetails);
 router.post('/wallet/withdrawals/:withdrawalId/settle', requireAdmin, adminController.settleWithdrawal);
 router.post('/wallet/withdrawals/:withdrawalId/reject', requireAdmin, adminController.rejectWithdrawal);
+router.post('/wallet/withdrawals/:withdrawalId/sync-status', requireAdmin, adminController.syncWithdrawalStatus);
 
 // Admin: support queues
 router.get('/support/feedback/withdrawal', requireAdmin, adminController.listWithdrawalFeedback);

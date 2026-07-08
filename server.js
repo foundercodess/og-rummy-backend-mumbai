@@ -8,6 +8,7 @@ const { pingRedis } = require('./services/redis.service');
 const { pingKafka } = require('./services/kafka.service');
 const { startBotEngine } = require('./services/botEngine');
 const { startStaleSessionCleanupCron } = require('./services/staleSessionCleanup.scheduler');
+const { startWithdrawalPayoutSyncCron } = require('./services/withdrawalPayoutSync.scheduler');
 
 const app = express();
 const server = http.createServer(app);
@@ -73,6 +74,7 @@ app.get('/', (req, res) => {
 const io = registerSocketServer(server);
 startBotEngine(io);
 startStaleSessionCleanupCron();
+startWithdrawalPayoutSyncCron();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);

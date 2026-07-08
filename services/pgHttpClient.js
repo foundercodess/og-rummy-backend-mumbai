@@ -28,66 +28,78 @@ async function resolveHostIpv4(hostname) {
   });
 }
 
-async function httpsPostJson(urlString, payload, timeoutMs = 20000) {
-  const url = new URL(urlString);
-  const body = JSON.stringify(payload);
-  let host = url.hostname;
-
-  try {
-    host = await resolveHostIpv4(url.hostname);
-  } catch (error) {
-    throw createPgError('PG_UNAVAILABLE', 'Unable to reach payment gateway', { cause: error });
-  }
-
-  return new Promise((resolve, reject) => {
-    const req = https.request(
-      {
-        host,
-        servername: url.hostname,
-        port: url.port || 443,
-        path: `${url.pathname}${url.search}`,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          Host: url.hostname,
-          'Content-Length': Buffer.byteLength(body),
-        },
-        timeout: timeoutMs,
-      },
-      (res) => {
-        let raw = '';
-        res.on('data', (chunk) => {
-          raw += chunk;
-        });
-        res.on('end', () => {
-          let parsed;
-          try {
-            parsed = raw ? JSON.parse(raw) : {};
-          } catch (error) {
-            reject(createPgError('PG_INVALID_RESPONSE', 'Payment gateway returned an invalid response', {
-              cause: error,
-              httpStatus: res.statusCode,
-            }));
-            return;
-          }
-          resolve({ statusCode: res.statusCode || 0, body: parsed });
-        });
-      }
-    );
-
-    req.on('timeout', () => {
-      req.destroy();
-      reject(createPgError('PG_UNAVAILABLE', 'Payment gateway request timed out'));
-    });
-
-    req.on('error', (error) => {
-      reject(createPgError('PG_UNAVAILABLE', 'Unable to reach payment gateway', { cause: error }));
-    });
-
-    req.write(body);
-    req.end();
+function parseHttpsJsonResponse(res, resolve, reject) {
+  let raw = '';
+  res.on('data', (chunk) => {
+    raw += chunk;
   });
+  res.on('end', () => {
+    let parsed;
+    try {
+      parsed = raw ? JSON.parse(raw) : {};
+    } catch (error) {
+      reject(createPgError('PG_INVALID_RESPONSE', 'Payment gateway returned an invalid response', {
+        cause: error,
+        httpStatus: res.statusCode,
+      }));
+      return;
+    }
+    resolve({ statusCode: res.statusCode || 0, body: parsed });
+  });
+}
+
+function httpsRequestJson(urlString, { method = 'GET', payload = null, timeoutMs = 20000 } = {}) {
+  const url = new URL(urlString);
+  const body = payload == null ? null : JSON.stringify(payload);
+
+  return resolveHostIpv4(url.hostname)
+    .then((host) => new Promise((promiseResolve, promiseReject) => {
+      const headers = {
+        Accept: 'application/json',
+        Host: url.hostname,
+      };
+      if (body != null) {
+        headers['Content-Type'] = 'application/json';
+        headers['Content-Length'] = Buffer.byteLength(body);
+      }
+
+      const req = https.request(
+        {
+          host,
+          servername: url.hostname,
+          port: url.port || 443,
+          path: `${url.pathname}${url.search}`,
+          method,
+          headers,
+          timeout: timeoutMs,
+        },
+        (res) => parseHttpsJsonResponse(res, promiseResolve, promiseReject)
+      );
+
+      req.on('timeout', () => {
+        req.destroy();
+        promiseReject(createPgError('PG_UNAVAILABLE', 'Payment gateway request timed out'));
+      });
+
+      req.on('error', (error) => {
+        promiseReject(createPgError('PG_UNAVAILABLE', 'Unable to reach payment gateway', { cause: error }));
+      });
+
+      if (body != null) req.write(body);
+      req.end();
+    }))
+    .catch((error) => {
+      if (error.code) throw error;
+      throw createPgError('PG_UNAVAILABLE', 'Unable to reach payment gateway', { cause: error });
+    });
+}
+
+async function httpsPostJson(urlString, payload, timeoutMs = 20000) {
+  return httpsRequestJson(urlString, { method: 'POST', payload, timeoutMs });
+}
+
+async function httpsGetJson(urlString, timeoutMs = 20000) {
+  return httpsRequestJson(urlString, { method: 'GET', timeoutMs });
 }
 
 function extractGatewayMessage(body = {}) {
@@ -104,6 +116,7 @@ function isGatewaySuccess(body = {}) {
 module.exports = {
   createPgError,
   httpsPostJson,
+  httpsGetJson,
   extractGatewayMessage,
   isGatewaySuccess,
 };

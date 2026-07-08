@@ -1,12 +1,15 @@
 const {
   createPgError,
   httpsPostJson,
+  httpsGetJson,
   extractGatewayMessage,
   isGatewaySuccess,
 } = require('./pgHttpClient');
 
 const GIFTAURA_PAYOUT_API_URL = process.env.GIFTAURA_PAYOUT_API_URL
   || 'https://pgapi.giftaura.shop/single_transaction';
+const GIFTAURA_PAYOUT_HISTORY_API_URL = process.env.GIFTAURA_PAYOUT_HISTORY_API_URL
+  || 'https://pgapi.giftaura.shop/merchantpayouthistory';
 const GIFTAURA_MERCHANT_ID = process.env.GIFTAURA_MERCHANT_ID || '';
 const GIFTAURA_MERCHANT_TOKEN = process.env.GIFTAURA_MERCHANT_TOKEN
   || process.env.GIFTAURA_MERCHANT_SECRET
@@ -164,6 +167,81 @@ function extractCallbackFields(query = {}) {
   return { orderId, paymentRef, status };
 }
 
+function normalizePgHistoryStatus(value) {
+  const normalized = String(value ?? '').trim();
+  if (normalized === '1') return 'successful';
+  if (normalized === '3') return 'failed';
+  if (normalized === '0') return 'pending';
+  return normalizeCallbackStatus(normalized) || 'pending';
+}
+
+function pgHistoryStatusLabel(status) {
+  const labels = {
+    successful: 'Success',
+    failed: 'Failed',
+    pending: 'Processing',
+  };
+  return labels[status] || status;
+}
+
+function isPgHistoryApiSuccess(body = {}) {
+  const status = String(body?.status ?? '').trim();
+  return status === '200' || status === 200;
+}
+
+function parsePgHistoryEntry(msg, fallbackOrderId = null) {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return null;
+  const orderId = String(msg.orderid || msg.order_id || fallbackOrderId || '').trim();
+  if (!orderId) return null;
+  const normalizedStatus = normalizePgHistoryStatus(msg.status);
+  return {
+    orderId,
+    amount: msg.amount,
+    status: msg.status,
+    normalizedStatus,
+    payoutId: msg.payoutid || msg.payout_id || null,
+    accountNo: msg.account_no,
+    ifscCode: msg.ifsccode,
+    bankName: msg.bankname,
+    raw: msg,
+  };
+}
+
+async function fetchPayoutHistoryByOrderId(orderId) {
+  if (!isConfigured()) {
+    throw createPgError('PG_NOT_CONFIGURED', 'Payout gateway is not configured');
+  }
+  const normalizedOrderId = String(orderId || '').trim();
+  if (!normalizedOrderId) {
+    throw createPgError('INVALID_ORDER_ID', 'order_id is required');
+  }
+
+  const url = new URL(GIFTAURA_PAYOUT_HISTORY_API_URL);
+  url.searchParams.set('merchantid', GIFTAURA_MERCHANT_ID);
+  url.searchParams.set('token', GIFTAURA_MERCHANT_TOKEN);
+  url.searchParams.set('orderid', normalizedOrderId);
+  url.searchParams.set('limit', 'limit');
+
+  let response;
+  try {
+    response = await httpsGetJson(url.toString(), 20000);
+  } catch (error) {
+    if (error.code) throw error;
+    throw createPgError('PG_UNAVAILABLE', 'Unable to reach payout history API', { cause: error });
+  }
+
+  const body = response.body;
+  if (!isPgHistoryApiSuccess(body)) {
+    throw createPgError(
+      'PG_HISTORY_FAILED',
+      extractGatewayMessage(body) || 'Payout history API returned an error',
+      { httpStatus: response.statusCode, gatewayResponse: body }
+    );
+  }
+
+  return parsePgHistoryEntry(body.msg, normalizedOrderId);
+}
+
 module.exports = {
   isConfigured,
   generatePayoutOrderId,
@@ -172,4 +250,7 @@ module.exports = {
   initiatePayout,
   extractCallbackFields,
   normalizeCallbackStatus,
+  normalizePgHistoryStatus,
+  pgHistoryStatusLabel,
+  fetchPayoutHistoryByOrderId,
 };

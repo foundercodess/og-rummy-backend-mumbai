@@ -215,6 +215,9 @@ async function getConfig({ platform = null, appVersion = null, token = null } = 
     appUpdateConfigModel.listAll(),
   ]);
   const authValidation = await buildAuthValidation(token);
+  const bypassWithdrawalBalanceCheck = 
+  process.env.BYPASS_WITHDRAWAL_BALANCE_CHECK === 'true'
+    && process.env.NODE_ENV !== 'production';
   return {
     avatars,
     states,
@@ -226,6 +229,9 @@ async function getConfig({ platform = null, appVersion = null, token = null } = 
     maintenanceMode: formatMaintenanceForConfig(maintenanceMode),
     appUpdate: toAppUpdatePayload(appUpdateRows, normalizePlatform(platform), appVersion),
     authValidation,
+    withdrawalTesting: {
+      bypassBalanceCheck: bypassWithdrawalBalanceCheck,
+    },
   };
 }
 

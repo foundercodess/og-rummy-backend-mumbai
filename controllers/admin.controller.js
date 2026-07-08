@@ -613,6 +613,49 @@ async function rejectWithdrawal(req, res) {
   }
 }
 
+async function syncWithdrawalStatus(req, res) {
+  try {
+    const withdrawalId = Number(req.params.withdrawalId);
+    if (!withdrawalId) {
+      return res.status(400).json({ success: false, message: 'Valid withdrawal id required' });
+    }
+
+    const result = await withdrawalService.syncWithdrawalStatusFromPg({
+      withdrawalId,
+      source: `admin:${req.auth?.adminId || 'manual'}`,
+    });
+
+    return res.json({
+      success: true,
+      message: result.message,
+      changed: result.changed,
+      pg_status: result.pgStatus,
+      pg_status_label: result.pgStatusLabel,
+      previous_status: result.previousStatus,
+      new_status: result.newStatus,
+      withdrawal: result.withdrawal,
+    });
+  } catch (err) {
+    console.error('syncWithdrawalStatus error:', err);
+    if (err.code === 'WITHDRAWAL_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Withdrawal transaction not found' });
+    }
+    if (err.code === 'WITHDRAWAL_NOT_SYNCABLE') {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    if (err.code === 'PG_NOT_CONFIGURED') {
+      return res.status(503).json({ success: false, message: 'Payout gateway is not configured' });
+    }
+    if (['PG_UNAVAILABLE', 'PG_INVALID_RESPONSE', 'PG_HISTORY_FAILED'].includes(err.code)) {
+      return res.status(502).json({
+        success: false,
+        message: err.message || 'Failed to fetch payout status from gateway',
+      });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to sync withdrawal status' });
+  }
+}
+
 async function getMaintenanceMode(req, res) {
   try {
     const result = await adminService.getMaintenanceModeForAdmin();
@@ -1406,6 +1449,7 @@ module.exports = {
   getWithdrawalDetails,
   settleWithdrawal,
   rejectWithdrawal,
+  syncWithdrawalStatus,
   getUserDetails,
   updateAddCashOptionActive,
   updateAppUpdateConfig,
