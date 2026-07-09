@@ -10,6 +10,22 @@ function createSessionCode() {
   return crypto.randomBytes(4).toString('hex').toUpperCase();
 }
 
+const DEFAULT_REJOIN_PENDING_MAX_AGE_MINUTES = 15;
+
+function resolveRejoinPendingMaxAgeMinutes(override) {
+  if (override != null && override !== '') {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.min(Math.floor(parsed), 24 * 60);
+    }
+  }
+  const envValue = Number(process.env.REJOIN_PENDING_MAX_AGE_MINUTES);
+  if (Number.isFinite(envValue) && envValue > 0) {
+    return Math.min(Math.floor(envValue), 24 * 60);
+  }
+  return DEFAULT_REJOIN_PENDING_MAX_AGE_MINUTES;
+}
+
 function buildSessionResponse(session, players = [], events = [], game = null, contest = null, extra = {}) {
   if (!session) return null;
 
@@ -880,10 +896,11 @@ async function getSessionState(sessionIdOrCode, existingPlayers = null) {
   });
 }
 
-async function getPendingRejoinSession(userId) {
-  let session = await gameSessionModel.findLatestRejoinableSessionForUser(userId);
+async function getPendingRejoinSession(userId, options = {}) {
+  const maxAgeMinutes = resolveRejoinPendingMaxAgeMinutes(options.maxAgeMinutes);
+  let session = await gameSessionModel.findLatestRejoinableSessionForUser(userId, { maxAgeMinutes });
   if (!session) {
-    session = await gameSessionModel.findLatestActiveSessionForUser(userId);
+    session = await gameSessionModel.findLatestActiveSessionForUser(userId, { maxAgeMinutes });
   }
   if (!session) return null;
   return getSessionState(session.id);
@@ -1164,6 +1181,7 @@ module.exports = {
   markPlayerReady,
   getSessionState,
   getPendingRejoinSession,
+  resolveRejoinPendingMaxAgeMinutes,
   createOrJoinContinuationSession,
   leaveTableContinuation,
   userAllowedToAccessSessionMetadata,

@@ -362,6 +362,64 @@ async function main() {
   const poolCompletionEvent = poolHarness.insertedEvents.find((event) => event.eventType === 'game_completed_by_elimination');
   assert(!poolCompletionEvent, 'Did not expect full game completion for sub-limit pool timeout');
 
+  const singleBonusPassScenario = createScenarioSession({
+    sessionId: 9004,
+    currentTurnUserId: 31,
+    turnId: 400,
+    players: [
+      { user_id: 31, seat_no: 1, name: 'Single Bonus Player', metadata: {} },
+      { user_id: 32, seat_no: 2, name: 'Opponent', metadata: {} },
+    ],
+    distributionPlayers: [
+      { user_id: 31, cards: [{ card_uid: 'a1', value: 10 }], submitted_groups: [] },
+      { user_id: 32, cards: [{ card_uid: 'b1', value: 5 }], submitted_groups: [] },
+    ],
+  });
+  singleBonusPassScenario.game.bonus_attempts_per_player = 1;
+  singleBonusPassScenario.metadata.turn_bonus = {
+    max_attempts_per_player: 1,
+    attempts_used_by_user: { '31': 1 },
+  };
+  singleBonusPassScenario.metadata.turn = createExpiredTurn(400, 31, 1);
+  singleBonusPassScenario.metadata.turn.type = 'bonus';
+
+  const singleBonusPassIo = createIoCapture();
+  const singleBonusPassHarness = loadTimeoutHarness(singleBonusPassScenario);
+  await singleBonusPassHarness.onTurnTimeout(singleBonusPassIo, singleBonusPassScenario.id, 400);
+
+  assert(singleBonusPassScenario.status === 'active', 'Expected single-bonus expiry to keep game active');
+  assert(singleBonusPassScenario.current_turn_user_id === 32, 'Expected opponent to receive turn after single bonus expiry');
+  assert(!singleBonusPassScenario.metadata.turn_eliminated_user_ids?.includes(31), 'Expected player to survive single bonus expiry');
+  assert(singleBonusPassScenario.metadata.turn.type === 'normal', 'Expected next turn to be normal after bonus expiry');
+
+  const singleBonusEliminateScenario = createScenarioSession({
+    sessionId: 9005,
+    currentTurnUserId: 41,
+    turnId: 500,
+    players: [
+      { user_id: 41, seat_no: 1, name: 'Exhausted Bonus Player', metadata: {} },
+      { user_id: 42, seat_no: 2, name: 'Winner', metadata: {} },
+    ],
+    distributionPlayers: [
+      { user_id: 41, cards: [{ card_uid: 'a1', value: 10 }], submitted_groups: [] },
+      { user_id: 42, cards: [{ card_uid: 'b1', value: 5 }], submitted_groups: [] },
+    ],
+  });
+  singleBonusEliminateScenario.game.bonus_attempts_per_player = 1;
+  singleBonusEliminateScenario.metadata.turn_bonus = {
+    max_attempts_per_player: 1,
+    attempts_used_by_user: { '41': 1 },
+  };
+  singleBonusEliminateScenario.metadata.turn = createExpiredTurn(500, 41, 0);
+  singleBonusEliminateScenario.metadata.turn.type = 'normal';
+
+  const singleBonusEliminateIo = createIoCapture();
+  const singleBonusEliminateHarness = loadTimeoutHarness(singleBonusEliminateScenario);
+  await singleBonusEliminateHarness.onTurnTimeout(singleBonusEliminateIo, singleBonusEliminateScenario.id, 500);
+
+  assert(singleBonusEliminateScenario.status === 'completed', 'Expected elimination after normal timeout with bonus used');
+  assert(singleBonusEliminateScenario.metadata.turn_eliminated_user_ids.includes(41), 'Expected player eliminated on normal timeout after bonus consumed');
+
   console.log('verify_timeout_elimination: PASS');
 }
 

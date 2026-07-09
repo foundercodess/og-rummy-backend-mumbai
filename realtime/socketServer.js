@@ -149,7 +149,8 @@ const TURN_TIMEOUT_IDEMPOTENCY_TTL_SECONDS = 120;
 const POOL_SPLIT_WINDOW_SECONDS = Math.max(10, Number(process.env.POOL_SPLIT_WINDOW_SECONDS) || 20);
 const POOL_NEXT_DEAL_COUNTDOWN_SECONDS = Math.max(5, Number(process.env.POOL_NEXT_DEAL_COUNTDOWN_SECONDS) || 10);
 const POOL_SPLIT_ENABLED = String(process.env.POOL_SPLIT_ENABLED || '').toLowerCase() === 'true';
-const MAX_BONUS_ATTEMPTS_PER_PLAYER = 2;
+const MAX_BONUS_ATTEMPTS_PER_PLAYER = 1;
+const MAX_ROUND_LOSS_POINTS = 80;
 const TURN_START_GRACE_MS = 1000;
 const BOT_ACTION_DELAY_MIN_MS = Math.max(250, Number(process.env.BOT_ACTION_DELAY_MIN_MS) || 400);
 const BOT_ACTION_DELAY_MAX_MS = Math.max(BOT_ACTION_DELAY_MIN_MS, Number(process.env.BOT_ACTION_DELAY_MAX_MS) || 1400);
@@ -1542,7 +1543,8 @@ function buildPoolRejoinContext({
       .filter((userId) => !Number.isNaN(userId) && playerIdSet.has(userId))
   );
   const activeUserIds = playerIds.filter((userId) => !eliminatedSet.has(userId));
-  if (activeUserIds.length === 0) {
+  // Pool rejoin is only offered while at least two players are still in the game.
+  if (activeUserIds.length < 2) {
     return {
       can_rejoin_table: false,
       rejoin_threshold: threshold,
@@ -3848,15 +3850,26 @@ function buildDeclarationTablePlayers({
       }
     }
 
-    if ((mode === 'pool' || isDealLikeMode(mode)) && isFinal && grouping?.summary != null) {
+    const isTimeoutOrDropped = isDropped
+      || resolvedPlayerStatus === 'timeout'
+      || resolvedPlayerStatus === 'dropped'
+      || result?.player_status === 'timeout'
+      || result?.player_status === 'dropped'
+      || result?.dropped === true;
+
+    if ((mode === 'pool' || isDealLikeMode(mode)) && isFinal && grouping?.summary != null && !isWinner && !isTimeoutOrDropped) {
       const displayPoint = Number(grouping.summary.display_point);
-      const totalScoreNum = Number(totalScore);
       const roundPointsNum = Number(roundPoints);
-      if (Number.isFinite(displayPoint)
-        && (!Number.isFinite(roundPointsNum)
-          || roundPointsNum === totalScoreNum)) {
-        roundPoints = Math.max(0, displayPoint);
+      if (Number.isFinite(displayPoint) && !Number.isFinite(roundPointsNum)) {
+        roundPoints = Math.min(MAX_ROUND_LOSS_POINTS, Math.max(0, displayPoint));
       }
+    }
+
+    if (roundPoints != null && Number.isFinite(Number(roundPoints))) {
+      const normalizedRound = Math.max(0, Number(roundPoints));
+      roundPoints = isWinner
+        ? normalizedRound
+        : Math.min(MAX_ROUND_LOSS_POINTS, normalizedRound);
     }
 
     return {
@@ -4944,7 +4957,7 @@ async function processPoolRejoinRequest({ sessionId, userId }) {
        JOIN games g ON g.id = gs.game_id
        LEFT JOIN contests c ON c.id = gs.contest_id
        WHERE gs.id = $1
-       FOR UPDATE`,
+       FOR UPDATE OF gs`,
       [sessionId]
     );
     const sessionRow = sessionRes.rows[0] || null;
@@ -5696,15 +5709,69 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
   const playerDropped = player?.metadata?.is_dropped === true
     || String(player?.metadata?.drop_status || '').toLowerCase() === 'dropped'
     || String(player?.metadata?.elimination_reason || '').toLowerCase() === 'dropped';
+  const playerLeftTable = player?.metadata?.table_left === true
+    || String(player?.status || '').toLowerCase() === 'left';
+  const postResultLeftUserIds = (
+    Array.isArray(session?.metadata?.post_result_left_user_ids)
+      ? session.metadata.post_result_left_user_ids
+      : []
+  )
+    .map((id) => Number(id))
+    .filter((id) => !Number.isNaN(id));
+  const explicitlyLeftTable = playerLeftTable
+    || postResultLeftUserIds.includes(Number(userId));
+  const poolEliminatedUserIds = (
+    Array.isArray(session?.metadata?.pool_eliminated_user_ids)
+      ? session.metadata.pool_eliminated_user_ids
+      : []
+  )
+    .map((id) => Number(id))
+    .filter((id) => !Number.isNaN(id));
+  const isPoolEliminated = poolEliminatedUserIds.includes(Number(userId));
+  const sessionPhase = String(session?.metadata?.phase || '').toLowerCase();
+  const poolRejoinWindow = ['inter_deal', 'countdown'].includes(sessionPhase);
+  let poolBuybackEligible = false;
+  if (sessionActive && isPoolEliminated && poolRejoinWindow) {
+    const poolLimit = resolvePoolLimit({
+      metadata: session?.metadata || {},
+      game: session?.game || null,
+    });
+    const rejoinContext = buildPoolRejoinContext({
+      players: session?.players || [],
+      scoresByUser: normalizePoolScoresByUser(session?.metadata || {}),
+      eliminatedUserIds: poolEliminatedUserIds,
+      poolLimit,
+    });
+    poolBuybackEligible = (rejoinContext.rejoin_candidate_user_ids || [])
+      .map((id) => Number(id))
+      .includes(Number(userId));
+  }
   const playerEligible = Boolean(
     session
     && sessionActive
     && ['joined', 'disconnected'].includes(playerStatus)
     && !playerDropped
+    && !explicitlyLeftTable
   );
   const needsTableRejoin = playerDisconnected
-    || isPresentInSessionRoom === false;
-  const canRejoin = Boolean(playerEligible && needsTableRejoin);
+    || isPresentInSessionRoom === false
+    || poolBuybackEligible;
+  let canRejoin = Boolean(
+    (playerEligible && needsTableRejoin) || poolBuybackEligible
+  );
+  if (canRejoin && !poolBuybackEligible) {
+    const maxAgeMinutes = typeof gameplayService.resolveRejoinPendingMaxAgeMinutes === 'function'
+      ? gameplayService.resolveRejoinPendingMaxAgeMinutes()
+      : 15;
+    const updatedAtMs = session?.updated_at ? new Date(session.updated_at).getTime() : NaN;
+    const ageMs = Number.isFinite(updatedAtMs) ? (Date.now() - updatedAtMs) : Number.POSITIVE_INFINITY;
+    if (ageMs > maxAgeMinutes * 60 * 1000) {
+      canRejoin = false;
+    }
+  }
+  if (canRejoin && !poolBuybackEligible && !playerDisconnected && isPresentInSessionRoom === true) {
+    canRejoin = false;
+  }
 
   return {
     server_time: new Date().toISOString(),
@@ -6593,6 +6660,7 @@ function schedulePoolEliminationDetachAfterNextDealStart(io, sessionId, userId, 
       if (poolEliminatedSet.has(safeUserId)) {
         detachUserFromSessionRoom(io, safeSessionId, safeUserId);
         logGame(safeSessionId, `Detached eliminated uid=${safeUserId} after next deal start (${reason})`);
+        await emitPendingRejoinGameForUser(io, safeUserId, reason);
       }
       pendingPoolEliminationDetachByKey.delete(key);
     } catch (err) {
@@ -8194,7 +8262,13 @@ async function onTurnTimeout(io, sessionId, expectedTurnId) {
     ? [discardedCard, ...(distribution.discard_pile || [])]
     : [...(distribution.discard_pile || [])];
 
-  const shouldEliminateCurrentUser = currentAttemptUsed >= maxBonusAttempts;
+  const isBonusTurn = String(turn.type || 'normal').toLowerCase() === 'bonus';
+  const bonusAttemptsExhausted = currentAttemptUsed >= maxBonusAttempts;
+  // With a single bonus attempt, bonus expiry only passes the turn; elimination
+  // happens on the next normal-turn timeout once the bonus has been consumed.
+  // With 2+ attempts, final bonus expiry still eliminates (legacy behaviour).
+  const shouldEliminateCurrentUser =
+    bonusAttemptsExhausted && (!isBonusTurn || maxBonusAttempts > 1);
 
   const nextEliminatedSet = new Set(eliminatedSet);
   if (shouldEliminateCurrentUser) {
@@ -11420,6 +11494,7 @@ function registerSocketServer(httpServer) {
             const outcome = await dropPlayerFromSession(io, sourceSession.id, socket.user.id);
             updatedSourceSession = outcome?.session || null;
             result = outcome?.result || null;
+            await emitPendingRejoinGameForUser(io, socket.user.id, 'table_left_after_drop');
           }
         } else {
           updatedSourceSession = await gameplayService.leaveTableContinuation({
@@ -11452,8 +11527,13 @@ function registerSocketServer(httpServer) {
         if (Number.isNaN(sessionId)) {
           throw new Error('Valid session_id is required');
         }
-        if (activePoolSplitBySession.has(sessionId) || pendingPoolSplitStartBySession.has(sessionId)) {
+        if (activePoolSplitBySession.has(sessionId)) {
           throw new Error('Pool rejoin is unavailable while split flow is active');
+        }
+        if (pendingPoolSplitStartBySession.has(sessionId)) {
+          // Rejoin should take priority over pre-split prompt. Close the pending
+          // split-start window so eliminated users can buy back immediately.
+          clearPoolSplitStartTimer(sessionId);
         }
 
         const rejoinResult = await processPoolRejoinRequest({

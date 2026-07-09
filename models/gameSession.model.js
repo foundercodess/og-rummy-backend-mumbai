@@ -69,13 +69,15 @@ async function findReservedContinuationSession(sourceSessionId) {
   return result.rows[0] || null;
 }
 
-async function findLatestRejoinableSessionForUser(userId) {
+async function findLatestRejoinableSessionForUser(userId, options = {}) {
+  const maxAgeMinutes = Math.max(1, Number(options.maxAgeMinutes) || 15);
   const result = await query(
     `SELECT gs.*
      FROM game_sessions gs
      JOIN game_session_players gsp ON gsp.game_session_id = gs.id
      WHERE gsp.user_id = $1
        AND gs.status = 'active'
+       AND gs.updated_at >= (NOW() - make_interval(mins => $2::int))
        AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
        AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
        AND gsp.status IN ('joined', 'disconnected')
@@ -89,6 +91,8 @@ async function findLatestRejoinableSessionForUser(userId) {
        AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
        AND COALESCE(gsp.metadata->>'drop_status', '') <> 'dropped'
        AND COALESCE(gsp.metadata->>'elimination_reason', '') NOT IN ('dropped', 'timeout')
+       AND NOT COALESCE(gs.metadata->'post_result_left_user_ids', '[]'::jsonb)
+         @> jsonb_build_array($1::int)
        AND NOT EXISTS (
          SELECT 1
          FROM game_sessions gs2
@@ -109,24 +113,24 @@ async function findLatestRejoinableSessionForUser(userId) {
            )
        )
      ORDER BY
-       gsp.joined_at DESC NULLS LAST,
-       gsp.id DESC,
        gs.updated_at DESC,
        gs.id DESC
      LIMIT 1`,
-    [userId]
+    [userId, maxAgeMinutes]
   );
 
   return result.rows[0] || null;
 }
 
-async function findLatestActiveSessionForUser(userId) {
+async function findLatestActiveSessionForUser(userId, options = {}) {
+  const maxAgeMinutes = Math.max(1, Number(options.maxAgeMinutes) || 15);
   const result = await query(
     `SELECT gs.*
      FROM game_sessions gs
      JOIN game_session_players gsp ON gsp.game_session_id = gs.id
      WHERE gsp.user_id = $1
        AND gs.status = 'active'
+       AND gs.updated_at >= (NOW() - make_interval(mins => $2::int))
        AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
        AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
        AND gsp.status IN ('joined', 'disconnected')
@@ -135,13 +139,13 @@ async function findLatestActiveSessionForUser(userId) {
        AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
        AND COALESCE(gsp.metadata->>'drop_status', '') <> 'dropped'
        AND COALESCE(gsp.metadata->>'elimination_reason', '') NOT IN ('dropped', 'timeout')
+       AND NOT COALESCE(gs.metadata->'post_result_left_user_ids', '[]'::jsonb)
+         @> jsonb_build_array($1::int)
      ORDER BY
-       gsp.joined_at DESC NULLS LAST,
-       gsp.id DESC,
        gs.updated_at DESC,
        gs.id DESC
      LIMIT 1`,
-    [userId]
+    [userId, maxAgeMinutes]
   );
 
   return result.rows[0] || null;
