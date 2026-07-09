@@ -74,6 +74,13 @@ async function viewIdExists(viewId) {
   return result.rows.length > 0;
 }
 
+async function findByViewId(viewId) {
+  const normalized = viewId == null ? '' : String(viewId).trim();
+  if (!normalized) return null;
+  const result = await query('SELECT * FROM users WHERE view_id = $1', [normalized]);
+  return result.rows[0] || null;
+}
+
 async function verifyOtpAndMarkVerified(phone, name = null, viewId = null, avatar = null) {
   const updates = ['otp = NULL', 'otp_expires_at = NULL', 'is_verified = TRUE', 'updated_at = NOW()'];
   const params = [phone];
@@ -122,6 +129,7 @@ async function updateActiveStatus(userId, active) {
 
 module.exports = {
   findById,
+  findByViewId,
   getAll,
   getAllPaginated,
   findByPhone,

@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const walletModel = require('../models/wallet.model');
+const userModel = require('../models/user.model');
 const rechargeTxModel = require('../models/rechargeTransaction.model');
 const promoCodeModel = require('../models/promoCode.model');
 const walletTransactionModel = require('../models/walletTransaction.model');
@@ -592,6 +593,137 @@ async function listTransactionDetails({ userId, limit = 50, offset = 0, fromDate
   return rows.map(mapWalletTransactionForDetails);
 }
 
+async function creditWalletByAdmin({
+  viewId,
+  amount,
+  adminId = null,
+  reason = null,
+}) {
+  const normalizedViewId = viewId == null ? '' : String(viewId).trim();
+  if (!/^\d{6}$/.test(normalizedViewId)) {
+    const err = new Error('view_id must be a 6-digit View ID');
+    err.code = 'INVALID_VIEW_ID';
+    throw err;
+  }
+
+  const creditAmount = roundCurrency(amount);
+  if (!Number.isFinite(creditAmount) || creditAmount <= 0) {
+    const err = new Error('amount must be a positive number');
+    err.code = 'INVALID_AMOUNT';
+    throw err;
+  }
+
+  const user = await userModel.findByViewId(normalizedViewId);
+  if (!user) {
+    const err = new Error('User not found for this View ID');
+    err.code = 'USER_NOT_FOUND';
+    throw err;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    let walletRes = await client.query(
+      'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
+      [user.id]
+    );
+    let walletRow = walletRes.rows[0];
+    if (!walletRow) {
+      await client.query(
+        `INSERT INTO wallets (user_id)
+         VALUES ($1)
+         ON CONFLICT (user_id) DO NOTHING`,
+        [user.id]
+      );
+      walletRes = await client.query(
+        'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
+        [user.id]
+      );
+      walletRow = walletRes.rows[0];
+    }
+    if (!walletRow) {
+      const err = new Error('Wallet not found');
+      err.code = 'WALLET_NOT_FOUND';
+      throw err;
+    }
+
+    const newDeposit = Number(walletRow.deposit) + creditAmount;
+    const newTotal = Number(walletRow.total_balance) + creditAmount;
+
+    await client.query(
+      `UPDATE wallets
+       SET deposit = $2,
+           total_balance = $3,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [walletRow.id, newDeposit, newTotal]
+    );
+
+    const ledgerRes = await client.query(
+      `INSERT INTO wallet_transactions (
+         user_id, wallet_id, transaction_type, amount, source, reference_type, reference_id, metadata
+       ) VALUES (
+         $1, $2, 'deposit_credit', $3, 'admin', 'admin_wallet_credit', NULL, $4::jsonb
+       )
+       RETURNING *`,
+      [
+        user.id,
+        walletRow.id,
+        creditAmount,
+        JSON.stringify({
+          view_id: normalizedViewId,
+          admin_id: adminId,
+          reason: reason || null,
+          credited_to: 'deposit',
+        }),
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    const wallet = walletModel.formatForResponse({
+      ...walletRow,
+      deposit: newDeposit,
+      total_balance: newTotal,
+      updated_at: new Date(),
+    });
+
+    try {
+      await notificationService.notifyUser(user.id, {
+        title: 'Wallet credited',
+        content: `₹${creditAmount} has been added to your wallet.`,
+        type: 'wallet',
+        event: notificationService.NOTIFICATION_EVENTS.CASH_ADDED,
+        metadata: {
+          amount: creditAmount,
+          source: 'admin',
+          screen: 'wallet',
+        },
+      });
+    } catch (notifyError) {
+      console.error('admin wallet credit notification error:', notifyError.message);
+    }
+
+    return {
+      user: {
+        id: user.id,
+        name: user.name,
+        phone: user.phone,
+        view_id: user.view_id,
+      },
+      wallet,
+      transaction: ledgerRes.rows[0],
+      credited_amount: creditAmount,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   getAccountStatementFilters,
   createAddCashInit,
@@ -601,5 +733,6 @@ module.exports = {
   listUserTransactions,
   listPendingBonusTransactions,
   listTransactionDetails,
+  creditWalletByAdmin,
 };
 

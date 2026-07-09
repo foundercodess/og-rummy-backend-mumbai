@@ -1,12 +1,26 @@
 const multer = require('multer');
 const adminService = require('../services/admin.service');
 const withdrawalService = require('../services/withdrawal.service');
+const walletService = require('../services/wallet.service');
 const adminTelemetryService = require('../services/adminTelemetry.service');
 const adminLedgerService = require('../services/adminLedger.service');
 const staleSessionCleanupScheduler = require('../services/staleSessionCleanup.scheduler');
 
 // APK upload gate: multipart field `upload_pin` must match one of these 4-digit PINs (change on deploy as needed).
 const APK_UPLOAD_ALLOWED_PINS = new Set(['8842', '7196', '4429']);
+
+function getWalletCreditAllowedPins() {
+  const fromEnv = process.env.ADMIN_WALLET_CREDIT_PIN;
+  if (fromEnv && String(fromEnv).trim()) {
+    return new Set(
+      String(fromEnv)
+        .split(',')
+        .map((pin) => pin.trim())
+        .filter(Boolean)
+    );
+  }
+  return APK_UPLOAD_ALLOWED_PINS;
+}
 
 const apkUpload = multer({
   storage: multer.memoryStorage(),
@@ -653,6 +667,51 @@ async function syncWithdrawalStatus(req, res) {
       });
     }
     return res.status(500).json({ success: false, message: 'Failed to sync withdrawal status' });
+  }
+}
+
+async function creditWalletByViewId(req, res) {
+  try {
+    const creditPinRaw = req.body?.credit_pin ?? req.body?.password;
+    const creditPin = creditPinRaw == null ? '' : String(creditPinRaw).trim();
+    if (!creditPin) {
+      return res.status(400).json({
+        success: false,
+        message: 'credit_pin is required',
+      });
+    }
+    if (!getWalletCreditAllowedPins().has(creditPin)) {
+      return res.status(403).json({ success: false, message: 'Invalid wallet credit PIN' });
+    }
+
+    const { view_id: viewId, amount, reason } = req.body || {};
+    const result = await walletService.creditWalletByAdmin({
+      viewId,
+      amount,
+      adminId: req.auth?.adminId || null,
+      reason: reason || null,
+    });
+
+    return res.json({
+      success: true,
+      message: `₹${result.credited_amount} credited to wallet successfully`,
+      ...result,
+    });
+  } catch (err) {
+    console.error('creditWalletByViewId error:', err);
+    if (err.code === 'INVALID_VIEW_ID') {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    if (err.code === 'INVALID_AMOUNT') {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    if (err.code === 'USER_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: err.message });
+    }
+    if (err.code === 'WALLET_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: err.message });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to credit wallet' });
   }
 }
 
@@ -1450,6 +1509,7 @@ module.exports = {
   settleWithdrawal,
   rejectWithdrawal,
   syncWithdrawalStatus,
+  creditWalletByViewId,
   getUserDetails,
   updateAddCashOptionActive,
   updateAppUpdateConfig,
