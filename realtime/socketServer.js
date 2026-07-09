@@ -36,6 +36,13 @@ const {
   traceSessionBroadcast,
   handleClientTelemetryAck,
 } = require('./socketTelemetry');
+const {
+  resolvePoolBaseEntryCount,
+  resolvePoolRejoinEntryCount,
+  buildPoolPrizePoolSummary,
+  buildPoolRejoinInfoPayload,
+  buildPoolSessionPrizePoolFields,
+} = require('../services/poolPrizePool.service');
 
 // ── Namespace helper ──────────────────────────────────────────────────────────
 function sessionRoom(sessionId) {
@@ -202,6 +209,11 @@ const SOCKET_SESSION_CHECK_TTL_MS = Math.max(1000, Number(process.env.SOCKET_SES
 const POOL_REJOIN_THRESHOLD_BY_LIMIT = {
   101: 79,
   201: 174,
+};
+// Bots must not drop once cumulative pool score exceeds these limits.
+const POOL_BOT_DROP_BLOCK_SCORE_BY_LIMIT = {
+  101: 80,
+  201: 160,
 };
 const POOL_SPLIT_DROP_TABLE_BY_LIMIT = {
   101: [
@@ -511,6 +523,9 @@ function buildSessionPrizePoolFields(session = null) {
     };
   }
   const mode = resolveSessionGameMode(session);
+  if (mode === 'pool') {
+    return buildPoolSessionPrizePoolFields(session);
+  }
   const isEntryPotMode = isDealLikeMode(mode) || mode === 'pool';
   const entryFee = Number(session?.contest?.entry);
   const playerCount = Array.isArray(session?.players)
@@ -1483,6 +1498,23 @@ function resolvePoolRejoinThreshold(poolLimit) {
   return null;
 }
 
+function resolvePoolBotDropBlockScore(poolLimit) {
+  const numericLimit = Number(poolLimit);
+  if (!Number.isFinite(numericLimit)) return POOL_BOT_DROP_BLOCK_SCORE_BY_LIMIT[101];
+  if (numericLimit >= 201) return POOL_BOT_DROP_BLOCK_SCORE_BY_LIMIT[201];
+  if (numericLimit >= 101) return POOL_BOT_DROP_BLOCK_SCORE_BY_LIMIT[101];
+  return POOL_BOT_DROP_BLOCK_SCORE_BY_LIMIT[101];
+}
+
+function isBotPoolDropBlockedByScore(session, userId) {
+  if (resolveSessionGameMode(session) !== 'pool') return false;
+  const poolLimit = resolvePoolLimit(session);
+  const blockScore = resolvePoolBotDropBlockScore(poolLimit);
+  const scoresByUser = session?.metadata?.pool_scores_by_user || {};
+  const currentScore = Number(scoresByUser[String(userId)]) || 0;
+  return currentScore > blockScore;
+}
+
 function buildPoolRejoinContext({
   players = [],
   scoresByUser = {},
@@ -1543,75 +1575,6 @@ function buildPoolRejoinContext({
     rejoin_threshold: threshold,
     rejoin_candidate_user_ids: rejoinCandidateUserIds,
     rejoin_start_points_by_user: rejoinStartPointsByUser,
-  };
-}
-
-function resolvePoolRejoinEntryCount(metadata = {}) {
-  const raw = Number(metadata?.pool_rejoin_entry_count);
-  if (!Number.isFinite(raw) || raw <= 0) return 0;
-  return Math.floor(raw);
-}
-
-function resolvePoolBaseEntryCount(session = {}) {
-  const players = Array.isArray(session?.players) ? session.players : [];
-  return players.filter((player) => ['joined', 'disconnected', 'eliminated', 'left'].includes(player?.status)).length;
-}
-
-function buildPoolPrizePoolSummary({
-  entryFee = 0,
-  baseEntryCount = 0,
-  rejoinEntryCount = 0,
-  projectedExtraEntries = 0,
-} = {}) {
-  const numericEntryFee = Number(entryFee);
-  const safeEntryFee = Number.isFinite(numericEntryFee) && numericEntryFee > 0 ? roundCurrency(numericEntryFee) : 0;
-  const safeBaseEntries = Math.max(0, Number.isFinite(Number(baseEntryCount)) ? Math.floor(Number(baseEntryCount)) : 0);
-  const safeRejoinEntries = Math.max(0, Number.isFinite(Number(rejoinEntryCount)) ? Math.floor(Number(rejoinEntryCount)) : 0);
-  const safeProjectedExtraEntries = Math.max(0, Number.isFinite(Number(projectedExtraEntries)) ? Math.floor(Number(projectedExtraEntries)) : 0);
-
-  const currentTotalEntries = safeBaseEntries + safeRejoinEntries;
-  const updatedTotalEntries = currentTotalEntries + safeProjectedExtraEntries;
-  const currentGrossPool = roundCurrency(safeEntryFee * currentTotalEntries);
-  const updatedGrossPool = roundCurrency(safeEntryFee * updatedTotalEntries);
-  const currentCommissionAmount = roundCurrency(currentGrossPool * 0.12);
-  const updatedCommissionAmount = roundCurrency(updatedGrossPool * 0.12);
-  const currentNetPool = roundCurrency(currentGrossPool - currentCommissionAmount);
-  const updatedNetPool = roundCurrency(updatedGrossPool - updatedCommissionAmount);
-
-  return {
-    entry_fee: safeEntryFee,
-    base_entry_count: safeBaseEntries,
-    rejoin_entry_count: safeRejoinEntries,
-    current_total_entries: currentTotalEntries,
-    current_prize_pool: currentNetPool,
-    current_prize_pool_gross: currentGrossPool,
-    current_commission_amount: currentCommissionAmount,
-    updated_total_entries: updatedTotalEntries,
-    updated_prize_pool: updatedNetPool,
-    updated_prize_pool_gross: updatedGrossPool,
-    updated_commission_amount: updatedCommissionAmount,
-  };
-}
-
-function buildPoolRejoinInfoPayload({
-  rejoinContext = {},
-  joiningFee = 0,
-  prizePoolSummary = null,
-} = {}) {
-  const safeJoiningFee = Number.isFinite(Number(joiningFee))
-    ? roundCurrency(Number(joiningFee))
-    : 0;
-  return {
-    rejoin_at_points_by_user: rejoinContext?.rejoin_start_points_by_user || {},
-    joining_fee: safeJoiningFee,
-    current_prize_pool: prizePoolSummary?.current_prize_pool ?? 0,
-    updated_prize_pool_if_rejoin: prizePoolSummary?.updated_prize_pool ?? 0,
-    current_prize_pool_gross: prizePoolSummary?.current_prize_pool_gross ?? 0,
-    updated_prize_pool_gross_if_rejoin: prizePoolSummary?.updated_prize_pool_gross ?? 0,
-    current_total_entries: prizePoolSummary?.current_total_entries ?? 0,
-    updated_total_entries_if_rejoin: prizePoolSummary?.updated_total_entries ?? 0,
-    current_commission_amount: prizePoolSummary?.current_commission_amount ?? 0,
-    updated_commission_amount_if_rejoin: prizePoolSummary?.updated_commission_amount ?? 0,
   };
 }
 
@@ -3179,6 +3142,7 @@ function shouldBotStrategicallyDrop(session, userId, cards = [], wildJoker = nul
   if (!['pool', 'points'].includes(mode)) return false;
   if (isDealLikeMode(mode)) return false;
   if (!Array.isArray(cards) || cards.length === 0) return false;
+  if (isBotPoolDropBlockedByScore(session, userId)) return false;
 
   const playContext = buildBotPlayContext(session, userId);
   const turnId = Number(options?.turn?.turn_id) || 0;
@@ -3319,6 +3283,7 @@ function shouldBotTakeEarlyDrop(session, userId, handCards = [], distribution = 
   const mode = resolveSessionGameMode(session);
   if (!['pool', 'points'].includes(mode)) return false;
   if (isDealLikeMode(mode)) return false;
+  if (isBotPoolDropBlockedByScore(session, userId)) return false;
 
   const playContext = buildBotPlayContext(session, userId);
   if (mode === 'pool' && playContext.scoreHeadroom > BOT_POOL_COMFORTABLE_HEADROOM) {
@@ -12416,6 +12381,8 @@ module.exports = {
     hasAnyValidMeld,
     shouldBotTakeEarlyDrop,
     shouldBotStrategicallyDrop,
+    isBotPoolDropBlockedByScore,
+    resolvePoolBotDropBlockScore,
     canMeaningfullyImproveWithPickedCard,
     isHopelessHandForDrop,
     doesStructureBlockStrategicDrop,

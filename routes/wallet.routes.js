@@ -4,15 +4,20 @@ const withdrawalController = require('../controllers/withdrawal.controller');
 const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
+const paymentCallbackBodyParser = express.urlencoded({ extended: true });
 
 // Create an Add Cash (recharge) transaction
 router.post('/add-cash', requireAuth, walletController.createAddCash);
 
 // GiftAura PG redirect callback (no auth)
 router.get('/payment-callback', walletController.paymentCallback);
+router.post('/payment-callback', paymentCallbackBodyParser, walletController.paymentCallback);
 
 // Poll recharge status after payment redirect
 router.get('/recharge-status', requireAuth, walletController.getRechargeStatus);
+
+// Verify pay-in with GiftAura status API and credit wallet on success
+router.post('/recharge/confirm', requireAuth, walletController.confirmRechargePayment);
 
 // List recharge transactions for the authenticated user
 router.get('/recharge-transactions', requireAuth, walletController.listUserTransactions);

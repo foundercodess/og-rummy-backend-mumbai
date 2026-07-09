@@ -7,6 +7,9 @@ const walletTransactionModel = require('../models/walletTransaction.model');
 const giftauraPgService = require('./giftauraPg.service');
 const notificationService = require('./notification.service');
 
+const RECHARGE_PAYIN_SYNC_MIN_AGE_MINUTES = Number(process.env.RECHARGE_PAYIN_SYNC_MIN_AGE_MINUTES || 2);
+const RECHARGE_PAYIN_SYNC_BATCH_LIMIT = Number(process.env.RECHARGE_PAYIN_SYNC_BATCH_LIMIT || 50);
+
 const ACCOUNT_STATEMENT_FILTERS = Object.freeze([
   { key: 'all', label: 'All', enabled: true, default: true },
   { key: 'won', label: 'Won', enabled: true, default: false },
@@ -289,7 +292,7 @@ async function createAddCashInit({
       payment_link: payment.payment_link,
       gateway_txn: payment.gateway_txn,
       order_id: payment.gateway_order_id || orderId,
-      redirect_url: giftauraPgService.buildRedirectUrl(orderId),
+      redirect_url: giftauraPgService.getRedirectUrl(),
     },
   };
 }
@@ -302,19 +305,24 @@ async function getRechargeByOrderIdForUser({ userId, orderId }) {
   return rechargeTxModel.formatForResponse(row);
 }
 
-async function handlePaymentCallback(query = {}) {
-  const { orderId, paymentRef, status } = giftauraPgService.extractCallbackFields(query);
+async function handlePaymentCallback(payload = {}) {
+  let { orderId, paymentRef, status } = giftauraPgService.extractCallbackFields(payload);
+  if (!orderId && paymentRef) {
+    const matched = await rechargeTxModel.findByPaymentRef(paymentRef);
+    if (matched?.order_id) {
+      orderId = String(matched.order_id);
+    }
+  }
   if (!orderId) {
-    const error = new Error('order_id is required');
-    error.code = 'INVALID_CALLBACK';
-    throw error;
+    // GiftAura redirect-only: PG does not return order_id; the app confirms with the id we sent at init.
+    return { tx: null, resolvedStatus: 'redirect_only', redirectOnly: true };
   }
 
   const resolvedStatus = status || 'payment_success';
   const paymentResponse = JSON.stringify({
     stage: 'pg_callback',
     gateway: 'giftaura',
-    query,
+    payload,
   });
 
   const tx = await updatePaymentStatus({
@@ -325,6 +333,184 @@ async function handlePaymentCallback(query = {}) {
   });
 
   return { tx, resolvedStatus };
+}
+
+/**
+ * Apply GiftAura pay-in status to a recharge row (idempotent for terminal statuses).
+ */
+async function applyPayinStatusFromPg(row, pgPayin, { source = 'unknown' } = {}) {
+  const previousStatus = row.status;
+
+  if (pgPayin.normalizedStatus === 'not_paid') {
+    return {
+      row,
+      previousStatus,
+      newStatus: row.status,
+      changed: false,
+      pgStatus: pgPayin.status,
+      credited: false,
+      source,
+    };
+  }
+
+  if (pgPayin.normalizedStatus === 'payment_success') {
+    const txAmount = Number(row.amount);
+    const pgAmount = Number(pgPayin.amount);
+    if (Number.isFinite(txAmount) && Number.isFinite(pgAmount) && txAmount !== pgAmount) {
+      const error = new Error('Payment amount mismatch with gateway');
+      error.code = 'PG_AMOUNT_MISMATCH';
+      error.expectedAmount = txAmount;
+      error.gatewayAmount = pgAmount;
+      throw error;
+    }
+  }
+
+  const paymentResponse = JSON.stringify({
+    stage: 'pg_payin_status',
+    gateway: 'giftaura',
+    source,
+    pg_status: pgPayin.status,
+    utr: pgPayin.utr,
+    transactionid: pgPayin.transactionId,
+    amount: pgPayin.amount,
+    date: pgPayin.date,
+    vpa: pgPayin.vpa,
+    raw: pgPayin.raw,
+  });
+
+  const updatedTx = await updatePaymentStatus({
+    orderId: row.order_id,
+    status: pgPayin.normalizedStatus,
+    paymentRef: pgPayin.utr || pgPayin.transactionId || row.order_id,
+    paymentResponse,
+  });
+
+  return {
+    row: updatedTx,
+    previousStatus,
+    newStatus: pgPayin.normalizedStatus,
+    changed: previousStatus !== pgPayin.normalizedStatus,
+    pgStatus: pgPayin.status,
+    credited: pgPayin.normalizedStatus === 'payment_success',
+    source,
+  };
+}
+
+/**
+ * Sync a single recharge with GiftAura pay-in status API.
+ */
+async function syncRechargeFromPgByOrderId(orderId, { source = 'manual' } = {}) {
+  const row = await rechargeTxModel.findByOrderId(orderId);
+  if (!row) {
+    return { found: false, tx: null };
+  }
+
+  if (row.type !== 'conventional') {
+    return {
+      found: true,
+      skipped: true,
+      reason: 'not_conventional',
+      tx: rechargeTxModel.formatForResponse(row),
+    };
+  }
+
+  if (['payment_success', 'failed'].includes(row.status)) {
+    return {
+      found: true,
+      tx: rechargeTxModel.formatForResponse(row),
+      alreadyTerminal: true,
+      pgStatus: row.status === 'payment_success' ? 'success' : row.status,
+      credited: row.status === 'payment_success',
+      changed: false,
+    };
+  }
+
+  const pgPayin = await giftauraPgService.fetchPayinStatusByOrderId(orderId);
+  const result = await applyPayinStatusFromPg(row, pgPayin, { source });
+
+  return {
+    found: true,
+    tx: rechargeTxModel.formatForResponse(result.row),
+    ...result,
+  };
+}
+
+/**
+ * Verify pay-in with GiftAura status API and credit wallet on success.
+ * Safe to call repeatedly (idempotent for terminal statuses).
+ */
+async function confirmRechargePayment({ userId, orderId }) {
+  const existing = await getRechargeByOrderIdForUser({ userId, orderId });
+  if (!existing) {
+    return { found: false, tx: null, pgStatus: null };
+  }
+
+  const result = await syncRechargeFromPgByOrderId(orderId, { source: `user:${userId}` });
+  if (!result.found) {
+    return { found: false, tx: null, pgStatus: null };
+  }
+
+  return {
+    found: true,
+    tx: result.tx,
+    pgStatus: result.pgStatus || (result.alreadyTerminal ? existing.status : 'pending'),
+    pgPayin: result.pgPayin,
+    credited: Boolean(result.credited),
+    alreadyTerminal: Boolean(result.alreadyTerminal),
+    pending: !result.credited
+      && result.newStatus !== 'failed'
+      && existing.status !== 'failed',
+  };
+}
+
+/**
+ * Background sync for pending conventional recharges (like withdrawal payout sync).
+ */
+async function syncPendingRechargesFromPg({ trigger = 'cron' } = {}) {
+  if (!giftauraPgService.isConfigured()) {
+    return { skipped: true, reason: 'pg_not_configured' };
+  }
+
+  const rows = await rechargeTxModel.listPendingForPgSync({
+    minAgeMinutes: RECHARGE_PAYIN_SYNC_MIN_AGE_MINUTES,
+    limit: RECHARGE_PAYIN_SYNC_BATCH_LIMIT,
+  });
+
+  const stats = {
+    checked: 0,
+    changed: 0,
+    successful: 0,
+    failed: 0,
+    still_pending: 0,
+    errors: 0,
+    trigger,
+  };
+
+  for (const row of rows) {
+    stats.checked += 1;
+    try {
+      const result = await syncRechargeFromPgByOrderId(row.order_id, { source: trigger });
+      if (result.changed) {
+        stats.changed += 1;
+        if (result.newStatus === 'payment_success') stats.successful += 1;
+        if (result.newStatus === 'failed') stats.failed += 1;
+      } else if (
+        result.pgStatus === 'pending'
+        || result.newStatus === 'init'
+        || result.newStatus === 'not_paid'
+      ) {
+        stats.still_pending += 1;
+      }
+    } catch (error) {
+      stats.errors += 1;
+      console.error(
+        `[recharge-payin-sync] order ${row.order_id} failed:`,
+        error.message
+      );
+    }
+  }
+
+  return stats;
 }
 
 /**
@@ -729,6 +915,9 @@ module.exports = {
   createAddCashInit,
   getRechargeByOrderIdForUser,
   handlePaymentCallback,
+  confirmRechargePayment,
+  syncRechargeFromPgByOrderId,
+  syncPendingRechargesFromPg,
   updatePaymentStatus,
   listUserTransactions,
   listPendingBonusTransactions,

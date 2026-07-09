@@ -9,6 +9,7 @@ const { pingKafka } = require('./services/kafka.service');
 const { startBotEngine } = require('./services/botEngine');
 const { startStaleSessionCleanupCron } = require('./services/staleSessionCleanup.scheduler');
 const { startWithdrawalPayoutSyncCron } = require('./services/withdrawalPayoutSync.scheduler');
+const { startRechargePayinSyncCron } = require('./services/rechargePayinSync.scheduler');
 
 const app = express();
 const server = http.createServer(app);
@@ -75,6 +76,7 @@ const io = registerSocketServer(server);
 startBotEngine(io);
 startStaleSessionCleanupCron();
 startWithdrawalPayoutSyncCron();
+startRechargePayinSyncCron();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);

@@ -3,6 +3,7 @@ const gameModel = require('../models/game.model');
 const gameSessionModel = require('../models/gameSession.model');
 const walletModel = require('../models/wallet.model');
 const { computeWalletDebitSplit } = require('./walletDebitSplit');
+const { buildPoolSessionPrizePoolFields } = require('./poolPrizePool.service');
 const { pool, query } = require('../db');
 
 function createSessionCode() {
@@ -101,7 +102,14 @@ function roundCurrency(value) {
   return Math.round((Number(value) || 0) * 100) / 100;
 }
 
-function buildSessionPrizePoolFields({ mode = null, contest = null, players = [] } = {}) {
+function buildSessionPrizePoolFields({ mode = null, contest = null, players = [], metadata = null } = {}) {
+  if (mode === 'pool') {
+    return buildPoolSessionPrizePoolFields({
+      contest,
+      players,
+      metadata: metadata || {},
+    });
+  }
   const isEntryPotMode = mode === 'deals_2' || mode === 'spin_go' || mode === 'pool';
   const entryFee = Number(contest?.entry);
   const playerCount = Array.isArray(players)
@@ -836,6 +844,7 @@ async function getSessionState(sessionIdOrCode, existingPlayers = null) {
     mode: scoreContext.game_mode,
     contest,
     players,
+    metadata: session.metadata,
   });
   const gameInfoAndRules = buildGameInfoAndRulesPayload({
     session,

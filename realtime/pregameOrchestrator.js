@@ -3,6 +3,10 @@
 const crypto = require('crypto');
 const { computeWalletDebitSplit } = require('../services/walletDebitSplit');
 const gameplayService = require('../services/gameplay.service');
+const {
+  buildPoolSessionPrizePoolFields,
+  countPoolJoinedPlayers,
+} = require('../services/poolPrizePool.service');
 const gameSessionModel = require('../models/gameSession.model');
 const groupingService = require('../services/grouping.service');
 const redisLockService = require('../services/redisLock.service');
@@ -303,6 +307,9 @@ function buildSessionPrizePoolFields(session = null) {
     };
   }
   const mode = resolveSessionGameMode(session);
+  if (mode === 'pool') {
+    return buildPoolSessionPrizePoolFields(session);
+  }
   const isEntryPotMode = isDealLikeMode(mode) || mode === 'pool';
   const entryFee = Number(session?.contest?.entry);
   const playerCount = Array.isArray(session?.players)
@@ -1262,6 +1269,19 @@ async function emitDealFromPregame({
       attempts_used_by_user: {},
     },
   };
+
+  const dealMode = resolveSessionGameMode(sessionForDeal);
+  if (
+    dealMode === 'pool'
+    && !Number.isFinite(Number(nextMetadata.pool_base_entry_count))
+  ) {
+    const lockedBase = countPoolJoinedPlayers(
+      participants.length ? participants : (sessionForDeal.players || []),
+    );
+    if (lockedBase > 0) {
+      nextMetadata.pool_base_entry_count = lockedBase;
+    }
+  }
 
   await gameSessionModel.updateSessionStatus(sessionId, 'active', {
     startedAt: new Date(),

@@ -39,6 +39,19 @@ async function findByOrderId(orderId) {
   return result.rows[0] || null;
 }
 
+async function findByPaymentRef(paymentRef) {
+  const normalized = paymentRef == null ? '' : String(paymentRef).trim();
+  if (!normalized) return null;
+  const result = await query(
+    `SELECT * FROM recharge_transactions
+     WHERE payment_ref = $1 OR order_id = $1
+     ORDER BY id DESC
+     LIMIT 1`,
+    [normalized]
+  );
+  return result.rows[0] || null;
+}
+
 async function createInit({
   userId,
   walletId,
@@ -94,6 +107,21 @@ async function updateStatusByOrderId({ orderId, status, paymentRef, paymentRespo
   return result.rows[0] || null;
 }
 
+async function listPendingForPgSync({ minAgeMinutes = 2, limit = 50 } = {}) {
+  const result = await query(
+    `SELECT *
+     FROM recharge_transactions
+     WHERE status = 'init'
+       AND type = 'conventional'
+       AND order_id IS NOT NULL
+       AND requested_at < NOW() - ($1::text || ' minutes')::interval
+     ORDER BY requested_at ASC
+     LIMIT $2`,
+    [String(minAgeMinutes), limit]
+  );
+  return result.rows;
+}
+
 async function listByUserId({ userId, limit = 50, offset = 0, fromDate = null, toDate = null }) {
   const params = [userId];
   let idx = params.length + 1;
@@ -123,8 +151,10 @@ async function listByUserId({ userId, limit = 50, offset = 0, fromDate = null, t
 module.exports = {
   formatForResponse,
   findByOrderId,
+  findByPaymentRef,
   createInit,
   updateStatusByOrderId,
+  listPendingForPgSync,
   listByUserId,
 };
 

@@ -166,6 +166,30 @@ function runEarlyDropTests() {
     false,
     'Bot should keep playing on comfortable pool score even with a dead hand'
   );
+
+  assert.strictEqual(
+    __testHooks.shouldBotTakeEarlyDrop(
+      makeSession({ mode: 'pool', poolScores: { [String(userId)]: 85 }, poolLimit: 101 }),
+      userId,
+      deadHand,
+      deadDist,
+      wildJoker
+    ),
+    false,
+    'Bot must not drop in pool 101 when cumulative score is above 80'
+  );
+
+  assert.strictEqual(
+    __testHooks.shouldBotTakeEarlyDrop(
+      makeSession({ mode: 'pool', poolScores: { [String(userId)]: 170 }, poolLimit: 201 }),
+      userId,
+      deadHand,
+      deadDist,
+      wildJoker
+    ),
+    false,
+    'Bot must not drop in pool 201 when cumulative score is above 160'
+  );
 }
 
 function runStrategicDropTests() {
@@ -244,6 +268,52 @@ function runStrategicDropTests() {
     ),
     true,
     'Bot should strategically drop hopeless no-pure hand after turn 4'
+  );
+
+  const blockedScoreSession = makeSession({
+    mode: 'pool',
+    poolScores: { [String(userId)]: 85 },
+    poolLimit: 101,
+    userId,
+    hasPicked: true,
+  });
+  assert.strictEqual(
+    __testHooks.shouldBotStrategicallyDrop(
+      blockedScoreSession,
+      userId,
+      hopelessHand,
+      wildJoker,
+      {
+        turn: { turn_id: 8 },
+        playerDistribution: { has_picked: true },
+        seededRoll: 0.01,
+      }
+    ),
+    false,
+    'Bot must not strategically drop in pool 101 when cumulative score is above 80'
+  );
+
+  const blockedScore201Session = makeSession({
+    mode: 'pool',
+    poolScores: { [String(userId)]: 165 },
+    poolLimit: 201,
+    userId,
+    hasPicked: true,
+  });
+  assert.strictEqual(
+    __testHooks.shouldBotStrategicallyDrop(
+      blockedScore201Session,
+      userId,
+      hopelessHand,
+      wildJoker,
+      {
+        turn: { turn_id: 8 },
+        playerDistribution: { has_picked: true },
+        seededRoll: 0.01,
+      }
+    ),
+    false,
+    'Bot must not strategically drop in pool 201 when cumulative score is above 160'
   );
 
   const firstDealSession = makeSession({

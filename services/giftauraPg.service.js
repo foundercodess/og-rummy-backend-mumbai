@@ -1,11 +1,19 @@
-const dns = require('dns').promises;
-const https = require('https');
 const { URL } = require('url');
+const {
+  createPgError,
+  httpsPostJson,
+  httpsGetJson,
+  extractGatewayMessage,
+} = require('./pgHttpClient');
+
 const GIFTAURA_MERCHANT_ID = process.env.GIFTAURA_MERCHANT_ID || '';
 const GIFTAURA_PG_TYPE = process.env.GIFTAURA_PG_TYPE || '2';
 const GIFTAURA_REMARK = process.env.GIFTAURA_REMARK || 'Add Cash';
 const GIFTAURA_REDIRECT_URL = process.env.GIFTAURA_REDIRECT_URL || '';
 const PUBLIC_API_BASE_URL = process.env.PUBLIC_API_BASE_URL || '';
+const GIFTAURA_PG_API_URL = process.env.GIFTAURA_PG_API_URL || 'https://pgapi.giftaura.shop/paynow';
+const GIFTAURA_PAYIN_STATUS_API_URL = process.env.GIFTAURA_PAYIN_STATUS_API_URL
+  || 'https://pgapi.giftaura.shop/payinstatus';
 
 function resolveRedirectUrl() {
   if (GIFTAURA_REDIRECT_URL) return GIFTAURA_REDIRECT_URL;
@@ -38,114 +46,12 @@ function generatePgOrderId() {
   return `${timePart}${randPart}`.padStart(18, '0').slice(-18);
 }
 
-function createPgError(code, message, extra = {}) {
-  const error = new Error(message);
-  error.code = code;
-  Object.assign(error, extra);
-  return error;
-}
-
-
-function extractGatewayMessage(body = {}) {
-  return (
-    body.error
-    || body.message
-    || body.msg
-    || body.reason
-    || null
-  );
-}
-
-function isGatewaySuccess(body = {}) {
+function isPaynowGatewaySuccess(body = {}) {
   const status = String(body?.status ?? '').trim().toUpperCase();
   if (status === 'SUCCESS') return true;
   if (status === '200' || status === '201') return Boolean(body?.payment_link);
   return false;
 }
-
-async function resolveHostIpv4(hostname) {
-  try {
-    const addresses = await dns.resolve4(hostname);
-    if (addresses?.[0]) return addresses[0];
-  } catch (_) {
-    // Docker DNS can intermittently fail; fall back below.
-  }
-
-  return new Promise((resolve, reject) => {
-    require('dns').lookup(hostname, { family: 4 }, (error, address) => {
-      if (error || !address) {
-        reject(error || new Error(`Unable to resolve ${hostname}`));
-        return;
-      }
-      resolve(address);
-    });
-  });
-}
-
-/** Node fetch can fail in Docker (IPv6/DNS). Use IPv4 HTTPS directly. */
-async function httpsPostJson(urlString, payload, timeoutMs = 20000) {
-  const url = new URL(urlString);
-  const body = JSON.stringify(payload);
-  let host = url.hostname;
-
-  try {
-    host = await resolveHostIpv4(url.hostname);
-  } catch (error) {
-    throw createPgError('PG_UNAVAILABLE', 'Unable to reach payment gateway', { cause: error });
-  }
-
-  return new Promise((resolve, reject) => {
-    const req = https.request(
-      {
-        host,
-        servername: url.hostname,
-        port: url.port || 443,
-        path: `${url.pathname}${url.search}`,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          Host: url.hostname,
-          'Content-Length': Buffer.byteLength(body),
-        },
-        timeout: timeoutMs,
-      },
-      (res) => {
-        let raw = '';
-        res.on('data', (chunk) => {
-          raw += chunk;
-        });
-        res.on('end', () => {
-          let parsed;
-          try {
-            parsed = raw ? JSON.parse(raw) : {};
-          } catch (error) {
-            reject(createPgError('PG_INVALID_RESPONSE', 'Payment gateway returned an invalid response', {
-              cause: error,
-              httpStatus: res.statusCode,
-            }));
-            return;
-          }
-          resolve({ statusCode: res.statusCode || 0, body: parsed });
-        });
-      }
-    );
-
-    req.on('timeout', () => {
-      req.destroy();
-      reject(createPgError('PG_UNAVAILABLE', 'Payment gateway request timed out'));
-    });
-
-    req.on('error', (error) => {
-      reject(createPgError('PG_UNAVAILABLE', 'Unable to reach payment gateway', { cause: error }));
-    });
-
-    req.write(body);
-    req.end();
-  });
-}
-
-const GIFTAURA_PG_API_URL = process.env.GIFTAURA_PG_API_URL || 'https://pgapi.giftaura.shop/paynow';
 
 async function initiatePayment({
   orderId,
@@ -168,7 +74,6 @@ async function initiatePayment({
     mobile: String(mobile || '').trim() || '0000000000',
     remark: String(remark || GIFTAURA_REMARK).trim() || GIFTAURA_REMARK,
     type: String(GIFTAURA_PG_TYPE),
-    // PG expects a plain redirect URL (no query params).
     redirect_url: resolveRedirectUrl(),
   };
 
@@ -181,7 +86,7 @@ async function initiatePayment({
   }
 
   const body = response.body;
-  if (!isGatewaySuccess(body) || !body?.payment_link) {
+  if (!isPaynowGatewaySuccess(body) || !body?.payment_link) {
     const gatewayMessage = extractGatewayMessage(body);
     throw createPgError(
       'PG_INIT_FAILED',
@@ -200,6 +105,73 @@ async function initiatePayment({
     amount: body.amount || payload.amount,
     raw: body,
   };
+}
+
+function normalizePayinStatus(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'success') return 'payment_success';
+  if (['failed', 'failure', 'error', 'cancelled', 'canceled', 'declined'].includes(normalized)) {
+    return 'failed';
+  }
+  if (['pending', 'init', 'processing'].includes(normalized)) return 'not_paid';
+  return 'not_paid';
+}
+
+function parsePayinStatusBody(body = {}, fallbackOrderId = null) {
+  const status = String(body?.status ?? '').trim().toLowerCase();
+  if (!status) return null;
+
+  const transactionId = String(
+    body.transactionid || body.transaction_id || body.order_id || fallbackOrderId || ''
+  ).trim();
+
+  return {
+    status,
+    normalizedStatus: normalizePayinStatus(status),
+    transactionId: transactionId || String(fallbackOrderId || '').trim(),
+    amount: body.amount != null ? Number(body.amount) : null,
+    utr: String(body.utr || '').trim() || null,
+    date: body.date || null,
+    vpa: body.vpa || null,
+    raw: body,
+  };
+}
+
+/**
+ * GiftAura pay-in status: GET /payinstatus?order_id=...
+ * status: success | pending | failed
+ */
+async function fetchPayinStatusByOrderId(orderId) {
+  if (!isConfigured()) {
+    throw createPgError('PG_NOT_CONFIGURED', 'Payment gateway is not configured');
+  }
+
+  const normalizedOrderId = String(orderId || '').trim();
+  if (!normalizedOrderId) {
+    throw createPgError('INVALID_ORDER_ID', 'order_id is required');
+  }
+
+  const url = new URL(GIFTAURA_PAYIN_STATUS_API_URL);
+  url.searchParams.set('order_id', normalizedOrderId);
+
+  let response;
+  try {
+    response = await httpsGetJson(url.toString(), 20000);
+  } catch (error) {
+    if (error.code) throw error;
+    throw createPgError('PG_UNAVAILABLE', 'Unable to reach pay-in status API', { cause: error });
+  }
+
+  const parsed = parsePayinStatusBody(response.body, normalizedOrderId);
+  if (!parsed) {
+    throw createPgError(
+      'PG_STATUS_FAILED',
+      extractGatewayMessage(response.body) || 'Pay-in status API returned an invalid response',
+      { httpStatus: response.statusCode, gatewayResponse: response.body }
+    );
+  }
+
+  return parsed;
 }
 
 function normalizeCallbackStatus(value) {
@@ -222,7 +194,13 @@ function extractCallbackFields(query = {}) {
     query.order_id
     || query.orderid
     || query.orderId
+    || query.merchant_order_id
+    || query.merchantorderid
+    || query.client_txn_id
+    || query.txnid
+    || query.txn_id
     || query.reference
+    || query.gateway_order_id
     || query.gateway_txn
     || ''
   ).toString().trim();
@@ -230,9 +208,11 @@ function extractCallbackFields(query = {}) {
   const paymentRef = (
     query.gateway_txn
     || query.txn_id
+    || query.txnid
     || query.transaction_id
     || query.payment_ref
     || query.utr
+    || query.payoutid
     || orderId
     || null
   );
@@ -242,6 +222,7 @@ function extractCallbackFields(query = {}) {
     || query.payment_status
     || query.txn_status
     || query.result
+    || query.response
   );
 
   return { orderId, paymentRef, status };
@@ -253,6 +234,8 @@ module.exports = {
   buildRedirectUrl,
   generatePgOrderId,
   initiatePayment,
+  fetchPayinStatusByOrderId,
+  normalizePayinStatus,
   extractCallbackFields,
   normalizeCallbackStatus,
 };

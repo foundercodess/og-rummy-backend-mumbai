@@ -104,14 +104,28 @@ async function createAddCash(req, res) {
 }
 
 /** GiftAura PG redirect callback (web-based redirection after payment). */
+function collectPaymentCallbackPayload(req) {
+  const query = req.query && typeof req.query === 'object' ? req.query : {};
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  return { ...query, ...body };
+}
+
 async function paymentCallback(req, res) {
+  const payload = collectPaymentCallbackPayload(req);
   try {
-    const { tx, resolvedStatus } = await walletService.handlePaymentCallback(req.query || {});
+    const { tx, resolvedStatus, redirectOnly } = await walletService.handlePaymentCallback(payload);
+    if (redirectOnly) {
+      return res.status(200).send(renderPaymentCallbackPage({
+        success: true,
+        message: 'Payment received. You can return to the app.',
+        orderId: '',
+      }));
+    }
     if (!tx) {
       return res.status(404).send(renderPaymentCallbackPage({
         success: false,
         message: 'Transaction not found.',
-        orderId: req.query?.order_id || req.query?.orderid || '',
+        orderId: payload.order_id || payload.orderid || '',
       }));
     }
 
@@ -124,11 +138,11 @@ async function paymentCallback(req, res) {
       orderId: tx.order_id,
     }));
   } catch (err) {
-    console.error('paymentCallback error:', err);
+    console.error('paymentCallback error:', err.message, 'payload:', JSON.stringify(payload));
     return res.status(400).send(renderPaymentCallbackPage({
       success: false,
       message: err.message || 'Invalid payment callback.',
-      orderId: req.query?.order_id || req.query?.orderid || '',
+      orderId: payload.order_id || payload.orderid || '',
     }));
   }
 }
@@ -156,6 +170,67 @@ async function getRechargeStatus(req, res) {
   } catch (err) {
     console.error('getRechargeStatus error:', err);
     return res.status(500).json({ success: false, message: 'Failed to retrieve transaction status' });
+  }
+}
+
+/** Verify pay-in with GiftAura status API and credit wallet when PG reports success. */
+async function confirmRechargePayment(req, res) {
+  try {
+    const userId = req.user.id;
+    const orderId = String(req.body?.order_id || req.query?.order_id || '').trim();
+    if (!orderId) {
+      return res.status(400).json({ success: false, message: 'order_id is required' });
+    }
+
+    const result = await walletService.confirmRechargePayment({ userId, orderId });
+    if (!result.found) {
+      return res.status(404).json({ success: false, message: 'Transaction not found', order_id: orderId });
+    }
+
+    const tx = result.tx;
+    const pgStatus = String(result.pgStatus || '').toLowerCase();
+
+    if (pgStatus === 'success' || tx?.status === 'payment_success') {
+      return res.json({
+        success: true,
+        message: 'Cash added to your account successfully',
+        pg_status: result.pgStatus,
+        credited: true,
+        transaction: tx,
+      });
+    }
+
+    if (pgStatus === 'failed' || tx?.status === 'failed') {
+      return res.json({
+        success: false,
+        message: 'Payment failed. Please try again.',
+        pg_status: result.pgStatus,
+        credited: false,
+        transaction: tx,
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: 'Payment is still processing. It will be credited to your wallet automatically.',
+      pg_status: result.pgStatus || 'pending',
+      credited: false,
+      pending: true,
+      transaction: tx,
+    });
+  } catch (err) {
+    console.error('confirmRechargePayment error:', err);
+    if (err.code === 'PG_AMOUNT_MISMATCH') {
+      return res.status(409).json({
+        success: false,
+        message: 'Payment amount mismatch. Please contact support.',
+        code: err.code,
+      });
+    }
+    if (err.code === 'PG_NOT_CONFIGURED' || err.code === 'PG_UNAVAILABLE') {
+      return res.status(503).json({ success: false, message: err.message || 'Payment gateway unavailable' });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to confirm payment' });
   }
 }
 
@@ -190,6 +265,15 @@ async function updatePaymentStatus(req, res) {
       }
     }
 
+    const existing = await walletService.getRechargeByOrderIdForUser({
+      userId: req.user.id,
+      orderId: orderId.trim(),
+    });
+    if (!existing) {
+      clearTimeout(timeoutId);
+      return res.status(404).json({ success: false, message: 'Transaction not found', order_id: orderId });
+    }
+
     const tx = await walletService.updatePaymentStatus({
       orderId: orderId.trim(),
       status,
@@ -201,10 +285,6 @@ async function updatePaymentStatus(req, res) {
 
     if (!tx) {
       return res.status(404).json({ success: false, message: 'Transaction not found', order_id: orderId });
-    }
-
-    if (req.user && Number(tx.user_id) !== Number(req.user.id)) {
-      return res.status(403).json({ success: false, message: 'Not allowed to update this transaction' });
     }
 
     return res.json({
@@ -310,6 +390,7 @@ module.exports = {
   createAddCash,
   paymentCallback,
   getRechargeStatus,
+  confirmRechargePayment,
   updatePaymentStatus,
   listUserTransactions,
   listPendingBonusTransactions,

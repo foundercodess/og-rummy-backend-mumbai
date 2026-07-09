@@ -2,6 +2,7 @@ const Redis = require('ioredis');
 const { createClient } = require('redis');
 
 let redis = null;
+let redisConnectPromise = null;
 let adapterPubClient = null;
 let adapterSubClient = null;
 let adapterConnectPromise = null;
@@ -36,7 +37,22 @@ async function ensureRedisConnection() {
   const client = getRedisClient();
   if (!client) return null;
   if (client.status === 'ready' || client.status === 'connect') return client;
-  await client.connect();
+
+  if (!redisConnectPromise) {
+    redisConnectPromise = client.connect().finally(() => {
+      redisConnectPromise = null;
+    });
+  }
+
+  try {
+    await redisConnectPromise;
+  } catch (err) {
+    if (client.status === 'ready' || client.status === 'connect') {
+      return client;
+    }
+    throw err;
+  }
+
   return client;
 }
 
