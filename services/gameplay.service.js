@@ -118,7 +118,16 @@ function roundCurrency(value) {
   return Math.round((Number(value) || 0) * 100) / 100;
 }
 
-function buildSessionPrizePoolFields({ mode = null, contest = null, players = [], metadata = null } = {}) {
+function resolveEntryPotPlayerCount({ mode = null, players = [], maxPlayers = null } = {}) {
+  if (mode === 'deals_2') {
+    const seats = Number(maxPlayers);
+    if (Number.isFinite(seats) && seats > 0) return Math.floor(seats);
+  }
+  if (!Array.isArray(players)) return 0;
+  return players.filter((player) => ['joined', 'disconnected'].includes(player?.status)).length;
+}
+
+function buildSessionPrizePoolFields({ mode = null, contest = null, players = [], metadata = null, maxPlayers = null } = {}) {
   if (mode === 'pool') {
     return buildPoolSessionPrizePoolFields({
       contest,
@@ -128,9 +137,7 @@ function buildSessionPrizePoolFields({ mode = null, contest = null, players = []
   }
   const isEntryPotMode = mode === 'deals_2' || mode === 'spin_go' || mode === 'pool';
   const entryFee = Number(contest?.entry);
-  const playerCount = Array.isArray(players)
-    ? players.filter((player) => ['joined', 'disconnected'].includes(player?.status)).length
-    : 0;
+  const playerCount = resolveEntryPotPlayerCount({ mode, players, maxPlayers });
 
   let totalEntry = null;
   let adminCommissionAmount = null;
@@ -367,6 +374,7 @@ function buildGameRulesByMode({ mode, poolLimit = null } = {}) {
     'Remaining groups can be sets or sequences.',
     'Winning player will get points from losing players at the end of every deal.',
     'The player with the maximum points at the end of the final deal is the winner.',
+    'If you drop at any time, you lose by 80 points for that deal.',
   ];
   const pointsRules = [
     'A valid declaration is needed to win Points Rummy game.',
@@ -419,7 +427,9 @@ function buildGameInfoAndRulesPayload({
   const practice = isPracticeGameName(gameName) || mode === 'practice';
   const dropRules = mode === 'pool'
     ? resolvePoolDropPenalties(poolLimit)
-    : { first: 20, middle: 40, full: 80 };
+    : mode === 'deals_2'
+      ? { first: 80, middle: 80, full: 80 }
+      : { first: 20, middle: 40, full: 80 };
   const numberOfDecks = Math.max(1, Number(session?.metadata?.number_of_decks) || 2);
 
   return {
@@ -861,6 +871,7 @@ async function getSessionState(sessionIdOrCode, existingPlayers = null) {
     contest,
     players,
     metadata: session.metadata,
+    maxPlayers: session.max_players,
   });
   const gameInfoAndRules = buildGameInfoAndRulesPayload({
     session,

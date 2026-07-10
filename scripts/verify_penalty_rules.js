@@ -15,7 +15,7 @@ function createIso(offsetMs = 0) {
 function loadPenaltyHarness() {
   const filePath = path.join(__dirname, '..', 'realtime', 'socketServer.js');
   const source = fs.readFileSync(filePath, 'utf8');
-  const instrumented = `${source}\nmodule.exports.__test = { resolveDropLossPoints, buildPlayerStatusPayload };`;
+  const instrumented = `${source}\nmodule.exports.__test = { resolveDropLossPoints, buildPlayerStatusPayload, isFirstDropEligible, buildSessionPrizePoolFields };`;
   const noop = () => {};
   const module = { exports: {} };
 
@@ -46,6 +46,11 @@ function loadPenaltyHarness() {
           return { emitActiveNotices: async () => {}, setSocketIO: noop };
         case './pregameOrchestrator':
           return { startPregame: async () => {} };
+        case './socketTelemetry':
+          return {
+            traceSessionBroadcast: ({ payload }) => payload,
+            traceAckResponse: (_traceId, ack) => ack,
+          };
         case './turnSchedulerBridge':
           return { setTurnTimerStarter: noop };
         case '../services/botEngine/rummyBotStrategy':
@@ -78,6 +83,7 @@ function createSession({
   mode = 'pool',
   gameName = '101 Pool',
   hasPicked = false,
+  firstTurnCycleComplete = false,
   leftUserIds = [],
 }) {
   return {
@@ -87,7 +93,11 @@ function createSession({
       game_mode: mode,
       distribution: {
         players: [
-          { user_id: 11, has_picked: hasPicked },
+          {
+            user_id: 11,
+            has_picked: hasPicked,
+            first_turn_cycle_complete: firstTurnCycleComplete,
+          },
         ],
       },
       post_result_left_user_ids: leftUserIds,
@@ -125,21 +135,25 @@ function testPoolDropPenalties(harness) {
   );
 }
 
-function testLeavePenalty(harness) {
-  const leftPool = createSession({
-    mode: 'pool',
-    gameName: '201 Pool',
-    hasPicked: false,
-    leftUserIds: [11],
-  });
-  assert(harness.resolveDropLossPoints(leftPool, 11) === 80, 'Expected leave penalty = 80');
-}
-
 function testPointsModeBackCompat(harness) {
   const pointsFirst = createSession({ mode: 'points', gameName: 'Points Rummy', hasPicked: false });
   const pointsMiddle = createSession({ mode: 'points', gameName: 'Points Rummy', hasPicked: true });
+  const pointsAfterFirstTurn = createSession({
+    mode: 'points',
+    gameName: 'Points Rummy',
+    hasPicked: false,
+    firstTurnCycleComplete: true,
+  });
   assert(harness.resolveDropLossPoints(pointsFirst, 11) === 20, 'Expected points first drop = 20');
   assert(harness.resolveDropLossPoints(pointsMiddle, 11) === 40, 'Expected points middle drop = 40');
+  assert(
+    harness.resolveDropLossPoints(pointsAfterFirstTurn, 11) === 40,
+    'Expected middle drop after first turn cycle without pick = 40'
+  );
+  assert(
+    harness.isFirstDropEligible(pointsAfterFirstTurn.metadata.distribution.players[0]) === false,
+    'Expected first-turn cycle completion to block first drop'
+  );
 }
 
 function testStatusPayloadPenaltyExposure(harness) {
@@ -165,9 +179,48 @@ function testStatusPayloadPenaltyExposure(harness) {
   assert(disconnectedPayload.points_to_lose === 50, 'Expected player_disconnected to expose 201 middle drop = 50');
 }
 
+function testDealsDropPenalty(harness) {
+  const dealsFirst = createSession({ mode: 'deals_2', gameName: 'Deals', hasPicked: false });
+  const dealsMiddle = createSession({ mode: 'deals_2', gameName: 'Deals', hasPicked: true });
+  assert(harness.resolveDropLossPoints(dealsFirst, 11) === 80, 'Expected deals first drop = 80');
+  assert(harness.resolveDropLossPoints(dealsMiddle, 11) === 80, 'Expected deals middle drop = 80');
+  assert(
+    harness.resolveDropLossPoints(dealsFirst, 11, { forceMiddleDrop: true }) === 80,
+    'Expected deals forced drop = 80'
+  );
+}
+
+function testLeavePenalty(harness) {
+  const leftPool = createSession({
+    mode: 'pool',
+    gameName: '201 Pool',
+    hasPicked: false,
+    leftUserIds: [11],
+  });
+  assert(harness.resolveDropLossPoints(leftPool, 11) === 80, 'Expected leave penalty = 80');
+}
+
+function testDealsPrizePoolUsesTableSeats(harness) {
+  const session = {
+    max_players: 2,
+    contest: { entry: 5 },
+    game: { name: 'Deals' },
+    metadata: { game_mode: 'deals_2' },
+    players: [
+      { user_id: 11, status: 'joined' },
+      { user_id: 12, status: 'eliminated' },
+    ],
+  };
+  const fields = harness.buildSessionPrizePoolFields(session);
+  assert(fields.winning_balance === 8.8, 'Expected deals prize pool to use table seats, not active joined count');
+  assert(fields.prize_pool.player_count === 2, 'Expected deals prize pool player_count to match max_players');
+}
+
 function main() {
   const harness = loadPenaltyHarness();
   testPoolDropPenalties(harness);
+  testDealsDropPenalty(harness);
+  testDealsPrizePoolUsesTableSeats(harness);
   testLeavePenalty(harness);
   testPointsModeBackCompat(harness);
   testStatusPayloadPenaltyExposure(harness);

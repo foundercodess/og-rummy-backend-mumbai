@@ -284,12 +284,23 @@ function mapPlayersForDealEmit(scoreSession, participants = []) {
       player_status: playerStatus,
       connection_status: connectionStatus,
       has_picked: distributionPlayer?.has_picked === true,
+      first_turn_cycle_complete: distributionPlayer?.first_turn_cycle_complete === true,
     };
   });
 }
 
 function roundCurrency(value) {
   return Math.round((Number(value) || 0) * 100) / 100;
+}
+
+function resolveEntryPotPlayerCount(session = {}) {
+  const mode = resolveSessionGameMode(session);
+  if (mode === 'deals_2') {
+    const seats = Number(session?.max_players);
+    if (Number.isFinite(seats) && seats > 0) return Math.floor(seats);
+  }
+  if (!Array.isArray(session?.players)) return 0;
+  return session.players.filter((p) => ['joined', 'disconnected'].includes(p?.status)).length;
 }
 
 function buildSessionPrizePoolFields(session = null) {
@@ -312,9 +323,7 @@ function buildSessionPrizePoolFields(session = null) {
   }
   const isEntryPotMode = isDealLikeMode(mode) || mode === 'pool';
   const entryFee = Number(session?.contest?.entry);
-  const playerCount = Array.isArray(session?.players)
-    ? session.players.filter((p) => ['joined', 'disconnected'].includes(p?.status)).length
-    : 0;
+  const playerCount = resolveEntryPotPlayerCount(session);
 
   let totalEntry = null;
   let adminCommissionAmount = null;
@@ -913,6 +922,7 @@ function buildDealPayload({ session, players, tossWinnerUserId, seed }) {
           submitted_groups: submittedGroups,
           auto_best_group: false,
           has_picked: false,
+          first_turn_cycle_complete: false,
         };
       }),
       wild_joker: normalizedWildJoker,

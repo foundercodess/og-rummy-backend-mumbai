@@ -332,6 +332,23 @@ function getActivePlayers(session) {
   });
 }
 
+function isSessionEligibleForAutoDrop(session) {
+  if (!session) return false;
+  const status = String(session.status || '').toLowerCase();
+  if (status === 'active') return true;
+  // Pool tables sit in `ready` between deals while players remain seated.
+  if (status === 'ready' && resolveSessionGameMode(session) === 'pool') return true;
+  return false;
+}
+
+function isPlayerEligibleForAutoDrop(session, player) {
+  if (!player) return false;
+  if (player?.metadata?.is_bot === true) return false;
+  const userId = Number(player.user_id);
+  if (Number.isNaN(userId)) return false;
+  return getActivePlayers(session).some((item) => Number(item.user_id) === userId);
+}
+
 function normalizeSessionModeValue(value) {
   if (value == null) return null;
   const normalized = String(value).trim().toLowerCase();
@@ -509,6 +526,16 @@ function roundCurrency(value) {
   return Math.round((Number(value) || 0) * 100) / 100;
 }
 
+function resolveEntryPotPlayerCount(session = {}) {
+  const mode = resolveSessionGameMode(session);
+  if (mode === 'deals_2') {
+    const seats = Number(session?.max_players);
+    if (Number.isFinite(seats) && seats > 0) return Math.floor(seats);
+  }
+  if (!Array.isArray(session?.players)) return 0;
+  return session.players.filter((player) => ['joined', 'disconnected'].includes(player?.status)).length;
+}
+
 function buildSessionPrizePoolFields(session = null) {
   if (!session) {
     return {
@@ -529,9 +556,7 @@ function buildSessionPrizePoolFields(session = null) {
   }
   const isEntryPotMode = isDealLikeMode(mode) || mode === 'pool';
   const entryFee = Number(session?.contest?.entry);
-  const playerCount = Array.isArray(session?.players)
-    ? session.players.filter((player) => ['joined', 'disconnected'].includes(player?.status)).length
-    : 0;
+  const playerCount = resolveEntryPotPlayerCount(session);
 
   let totalEntry = null;
   let adminCommissionAmount = null;
@@ -2047,6 +2072,39 @@ function getMaxBonusAttempts(session) {
   return MAX_BONUS_ATTEMPTS_PER_PLAYER;
 }
 
+function isFirstDropEligible(playerDistribution) {
+  if (!playerDistribution) return false;
+  if (playerDistribution.has_picked === true) return false;
+  if (playerDistribution.first_turn_cycle_complete === true) return false;
+  return true;
+}
+
+function markDepartingPlayerFirstTurnCycleComplete(playersDistribution, departingUserId) {
+  if (!Array.isArray(playersDistribution) || departingUserId == null) {
+    return playersDistribution;
+  }
+  const idx = playersDistribution.findIndex(
+    (pd) => Number(pd?.user_id) === Number(departingUserId)
+  );
+  if (idx < 0) return playersDistribution;
+  const pd = playersDistribution[idx];
+  if (pd?.has_picked === true || pd?.first_turn_cycle_complete === true) {
+    return playersDistribution;
+  }
+  const updated = [...playersDistribution];
+  updated[idx] = { ...pd, first_turn_cycle_complete: true };
+  return updated;
+}
+
+function buildPlayerDealFlags(playersDistribution = []) {
+  if (!Array.isArray(playersDistribution)) return [];
+  return playersDistribution.map((pd) => ({
+    user_id: pd?.user_id,
+    has_picked: pd?.has_picked === true,
+    first_turn_cycle_complete: pd?.first_turn_cycle_complete === true,
+  }));
+}
+
 function buildTurnWindow(turnTimerSeconds, graceMs = TURN_START_GRACE_MS) {
   const durationMs = Math.max(0, Number(turnTimerSeconds) || 0) * 1000;
   const safeGraceMs = Math.max(0, Number(graceMs) || 0);
@@ -2779,13 +2837,10 @@ function tryBuildFinishPlan(cards = [], wildJoker = null, options = {}) {
 
   const submittedGroups = options?.submittedGroups;
   if (Array.isArray(submittedGroups) && submittedGroups.length > 0) {
-    const groupedUids = getSubmittedGroupCardUids(submittedGroups);
-    const hasUngrouped = cards.some((card) => {
-      const uid = String(card?.card_uid || '').trim();
-      return uid && !groupedUids.has(uid);
-    });
-    // Manual layout with leftover cards: do not override with bot heuristic.
-    if (hasUngrouped) return null;
+    // A player/autogroup layout exists but no valid finish from that layout.
+    // Never substitute a hidden bot-best grouping — that auto-selects a finish card
+    // the player does not see and leads to invalid declarations.
+    return null;
   }
 
   return tryBuildBotFinishPlan(cards, wildJoker, options);
@@ -3239,6 +3294,8 @@ function buildStrategicDropExplainability(session, userId, cards = [], wildJoker
     mode_ok: ['pool', 'points'].includes(mode),
     turn_window_ok: turnWindowOk,
     has_picked_in_deal: options?.playerDistribution?.has_picked === true,
+    first_turn_cycle_complete: options?.playerDistribution?.first_turn_cycle_complete === true,
+    is_first_drop_eligible: isFirstDropEligible(options?.playerDistribution),
     can_finish_after_one_discard: canFinishAfterOneDiscard(cards, wildJoker),
     hand_summary: compactGroupingSummary(summary),
     grouping_confidence: Number(summary.grouping_confidence),
@@ -3547,8 +3604,13 @@ function isAutoBestGroupEnabled(playerDistribution) {
 
 function buildAutoBestGroupingResult(handCards, wildJoker, options = {}) {
   const groupingOptions = options.groupingOptions || {};
-  const grouping = groupingService.buildBestGrouping(handCards, wildJoker, groupingOptions);
-  const submittedGroups = toSubmittedGroupsFromGrouping(grouping);
+  const best = groupingService.buildBestGrouping(handCards, wildJoker, groupingOptions);
+  const submittedGroups = toSubmittedGroupsFromGrouping(best);
+  const grouping = groupingService.evaluateSubmittedGrouping(
+    handCards,
+    wildJoker,
+    submittedGroups
+  );
   const finishPlan = tryBuildFinishPlan(handCards, wildJoker, {
     submittedGroups,
     groupingOptions,
@@ -3658,25 +3720,21 @@ function resolveDropLossPoints(session, userId, options = {}) {
   }
 
   const mode = resolveSessionGameMode(session);
+  if (isDealLikeMode(mode)) {
+    return MAX_ROUND_LOSS_POINTS;
+  }
   if (mode === 'pool') {
     const poolLimit = resolvePoolLimit(session);
     const firstDropPenalty = poolLimit >= 201 ? 25 : 20;
     const middleDropPenalty = poolLimit >= 201 ? 50 : 40;
     if (forceMiddleDrop) return middleDropPenalty;
-    const hasPicked = playerDistribution.has_picked === true;
-    return hasPicked ? middleDropPenalty : firstDropPenalty;
+    return isFirstDropEligible(playerDistribution) ? firstDropPenalty : middleDropPenalty;
   }
 
-  // Check if player has picked at least once
-  const hasPicked = playerDistribution.has_picked === true;
   if (forceMiddleDrop) {
     return 40;
   }
-  if (!hasPicked) {
-    return 20; // Loss before first pick
-  } else {
-    return 40; // Mid drop after first pick
-  }
+  return isFirstDropEligible(playerDistribution) ? 20 : 40;
 }
 
 function buildRankByUserId(results = []) {
@@ -6128,6 +6186,7 @@ function buildPhaseSyncPlayers(session) {
       connection_status: connectionStatus,
       points_to_lose: pointsToLose,
       has_picked: distributionPlayer?.has_picked === true,
+      first_turn_cycle_complete: distributionPlayer?.first_turn_cycle_complete === true,
     };
   });
 }
@@ -7587,11 +7646,16 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
     hasPicked: false,
   });
 
+  const playersAfterDepartingTurn = markDepartingPlayerFirstTurnCycleComplete(
+    refreshedPlayersDistribution,
+    refreshedTurn.user_id
+  );
+
   const nextMetadata = {
     ...(refreshed.metadata || {}),
     distribution: {
       ...refreshedDistribution,
-      players: refreshedPlayersDistribution,
+      players: playersAfterDepartingTurn,
       discard_pile: nextDiscardPile,
     },
     turn: nextTurn,
@@ -7641,6 +7705,7 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
     previous_turn_id: refreshedTurn.turn_id,
     discarded_card: discardedCard,
     discard_top: nextDiscardPile[0] || null,
+    player_deal_flags: buildPlayerDealFlags(playersAfterDepartingTurn),
   });
 
   emitDiscardHistoryUpdate(io, {
@@ -8338,11 +8403,16 @@ async function onTurnTimeout(io, sessionId, expectedTurnId) {
     hasPicked: false,
   });
 
+  const playersAfterDepartingTurn = markDepartingPlayerFirstTurnCycleComplete(
+    playersDistribution,
+    currentUserId
+  );
+
   const nextMetadata = {
     ...(session.metadata || {}),
     distribution: {
       ...distribution,
-      players: playersDistribution,
+      players: playersAfterDepartingTurn,
       discard_pile: discardPile,
     },
     turn: nextTurn,
@@ -8432,6 +8502,7 @@ async function onTurnTimeout(io, sessionId, expectedTurnId) {
     eliminated_user_ids: Array.from(nextEliminatedSet),
     discarded_card: discardedCard,
     discard_top: discardPile[0] || null,
+    player_deal_flags: buildPlayerDealFlags(playersAfterDepartingTurn),
   });
 
   scheduleTurnTimeout(io, sessionId, nextTurn);
@@ -10264,10 +10335,14 @@ function registerSocketServer(httpServer) {
         const joinedPlayer = (ackSession?.players || []).find(
           (p) => Number(p.user_id) === userId
         );
+        const timeoutEliminatedSet = getTimeoutEliminatedUserIdSet(ackSession?.metadata || {});
+        const turnEliminatedSet = getTurnEliminatedUserIdSet(ackSession?.metadata || {});
         const canBroadcastActive = joinedPlayer
           && !['eliminated', 'left'].includes(String(joinedPlayer.status || '').toLowerCase())
           && joinedPlayer?.metadata?.is_dropped !== true
-          && String(joinedPlayer?.metadata?.drop_status || '').toLowerCase() !== 'dropped';
+          && String(joinedPlayer?.metadata?.drop_status || '').toLowerCase() !== 'dropped'
+          && !timeoutEliminatedSet.has(userId)
+          && !turnEliminatedSet.has(userId);
         if (canBroadcastActive) {
           emitPlayerStatusOverride(io, ackSession, joinedPlayer, {
             status: 'joined',
@@ -10351,13 +10426,23 @@ function registerSocketServer(httpServer) {
           throw new Error('Player cards not found in distribution');
         }
 
-        const playerCards = playerDistribution.cards || [];
-        const wildJoker = distribution.wild_joker || null;
-        const turnIdForSeed = Number(session?.metadata?.turn?.turn_id) || 0;
+        const freshSession = await gameplayService.getSessionState(sessionId);
+        const freshDistribution = freshSession?.metadata?.distribution;
+        const freshPlayerDistribution = freshDistribution?.players?.find(
+          (pd) => pd.user_id === socket.user.id
+        );
+        const playerCards = freshPlayerDistribution?.cards || playerDistribution.cards || [];
+        const wildJoker = freshDistribution?.wild_joker || distribution.wild_joker || null;
+        const turnIdForSeed = Number(freshSession?.metadata?.turn?.turn_id) || 0;
         const decisionSeed = buildDecisionSeed(sessionId, turnIdForSeed, socket.user.id);
         const groupingOptions = buildGroupingTieBreakOptions(decisionSeed);
         const bestGrouping = groupingService.buildBestGrouping(playerCards, wildJoker, groupingOptions);
         const newSubmittedGroups = toSubmittedGroupsFromGrouping(bestGrouping);
+        const evaluatedGrouping = groupingService.evaluateSubmittedGrouping(
+          playerCards,
+          wildJoker,
+          newSubmittedGroups
+        );
         const finishPlan = tryBuildFinishPlan(playerCards, wildJoker, {
           submittedGroups: newSubmittedGroups,
           groupingOptions,
@@ -10367,23 +10452,28 @@ function registerSocketServer(httpServer) {
           turnId: turnIdForSeed,
         });
 
-        const autoPdIndex = distribution.players.findIndex((pd) => pd.user_id === socket.user.id);
-        const autoUpdatedPlayers = distribution.players.map((pd, i) =>
+        const autoPdIndex = (freshDistribution?.players || distribution.players).findIndex(
+          (pd) => pd.user_id === socket.user.id
+        );
+        const autoUpdatedPlayers = (freshDistribution?.players || distribution.players).map((pd, i) =>
           i === autoPdIndex
             ? { ...pd, submitted_groups: newSubmittedGroups, auto_best_group: true }
             : pd
         );
 
-        await gameSessionModel.updateSessionStatus(sessionId, session.status, {
-          currentTurnUserId: session.current_turn_user_id,
+        await gameSessionModel.updateSessionStatus(sessionId, freshSession?.status || session.status, {
+          currentTurnUserId: freshSession?.current_turn_user_id || session.current_turn_user_id,
           metadata: {
-            ...session.metadata,
-            distribution: { ...distribution, players: autoUpdatedPlayers },
+            ...(freshSession?.metadata || session.metadata),
+            distribution: {
+              ...(freshDistribution || distribution),
+              players: autoUpdatedPlayers,
+            },
             phase_updated_at: new Date().toISOString(),
           },
         });
         console.log('player:autogroup:success', {
-          ...buildGroupingResponseData(bestGrouping),
+          ...buildGroupingResponseData(evaluatedGrouping),
           finish_card_suggestion: finishPlan?.finishCard || null,
           finish_plan: finishPlan
             ? {
@@ -10396,7 +10486,9 @@ function registerSocketServer(httpServer) {
         callback({
           success: true,
           data: {
-            ...buildGroupingResponseData(bestGrouping),
+            ...buildFinishPlanCallbackExtras(finishPlan),
+            cards_count: playerCards.length,
+            ...buildGroupingResponseData(evaluatedGrouping),
             finish_card_suggestion: finishPlan?.finishCard || null,
             finish_plan: finishPlan
               ? {
@@ -10961,11 +11053,16 @@ function registerSocketServer(httpServer) {
           hasPicked: false,
         });
 
+        const playersAfterDepartingTurn = markDepartingPlayerFirstTurnCycleComplete(
+          playersDistribution,
+          socket.user.id
+        );
+
         const nextMetadata = {
           ...(session.metadata || {}),
           distribution: {
             ...distribution,
-            players: playersDistribution,
+            players: playersAfterDepartingTurn,
             discard_pile: discardPile,
           },
           turn: nextTurn,
@@ -11008,6 +11105,7 @@ function registerSocketServer(httpServer) {
           previous_turn_id: previousTurnId,
           discarded_card: discardedCard,
           discard_top: discardPile[0],
+          player_deal_flags: buildPlayerDealFlags(playersAfterDepartingTurn),
         });
 
         emitDiscardHistoryUpdate(io, {
@@ -11222,18 +11320,19 @@ function registerSocketServer(httpServer) {
         if (!session) {
           throw new Error('Session not found');
         }
-        if (session.status !== 'active') {
+        if (!isSessionEligibleForAutoDrop(session)) {
+          const status = String(session.status || '').toLowerCase();
+          if (status === 'completed') {
+            throw new Error('Auto-drop cannot be changed after the game has ended');
+          }
           throw new Error('Auto-drop can be changed only during active game');
         }
         const player = (session.players || []).find((item) => Number(item.user_id) === Number(socket.user.id));
         if (!player) {
           throw new Error('Player not found in session');
         }
-        if (player.status === 'eliminated' || player.status === 'left') {
+        if (!isPlayerEligibleForAutoDrop(session, player)) {
           throw new Error('Player is no longer eligible for auto-drop');
-        }
-        if (player?.metadata?.is_bot === true) {
-          throw new Error('Auto-drop is not available for bots');
         }
         const nextMetadata = {
           ...(player.metadata || {}),
@@ -11865,6 +11964,9 @@ function registerSocketServer(httpServer) {
           updatedFinishGroups
         );
         const preview = grouping;
+        if (preview?.summary?.valid_for_declare !== true) {
+          throw new Error('Cannot finish — arrange a valid hand before declaring');
+        }
         logGame(
           sessionId,
           'Finish grouping classification',
