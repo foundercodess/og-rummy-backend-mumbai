@@ -261,6 +261,54 @@ function verifyWildJokerSplitLowersPenalty() {
   );
 }
 
+function verifyDualJokerKingSetSplitScreenshotCase() {
+  const wildJoker = card('w7', '7', 'diamonds', 0, true);
+  const hand = [
+    card('c1', '5', 'spades', 5),
+    card('c2', '6', 'spades', 6),
+    card('c3', '7', 'spades', 7),
+    card('c4', '9', 'spades', 9),
+    card('c5', '10', 'spades', 10),
+    card('c6', 'K', 'spades', 10),
+    card('c7', '10', 'hearts', 10),
+    card('c8', '10', 'diamonds', 10),
+    card('c9', '7', 'hearts', 0),
+    card('c10', '7', 'hearts', 0),
+    card('c11', '3', 'diamonds', 3),
+    card('c12', '9', 'clubs', 9),
+    card('c13', 'K', 'diamonds', 10),
+  ];
+
+  const longSeqLayout = groupingService.evaluateSubmittedGrouping(hand, wildJoker, [
+    { group_id: 1, cards: ['c1', 'c2', 'c3'] },
+    { group_id: 2, cards: ['c4', 'c5', 'c9', 'c10', 'c6'] },
+    { group_id: 3, cards: ['c7', 'c8'] },
+    { group_id: 4, cards: ['c11'] },
+    { group_id: 5, cards: ['c12'] },
+    { group_id: 6, cards: ['c13'] },
+  ]);
+  const splitLayout = groupingService.evaluateSubmittedGrouping(hand, wildJoker, [
+    { group_id: 1, cards: ['c1', 'c2', 'c3'] },
+    { group_id: 2, cards: ['c4', 'c5', 'c9'] },
+    { group_id: 3, cards: ['c10', 'c6', 'c13'] },
+    { group_id: 4, cards: ['c7', 'c8'] },
+    { group_id: 5, cards: ['c11'] },
+    { group_id: 6, cards: ['c12'] },
+  ]);
+  const bestGrouping = groupingService.buildBestGrouping(hand, wildJoker);
+
+  assert(longSeqLayout.summary.display_point === 42, 'Expected long-sequence layout to score 42');
+  assert(splitLayout.summary.display_point === 32, 'Expected split joker + king set layout to score 32');
+  assert(
+    bestGrouping.summary.display_point <= splitLayout.summary.display_point,
+    `Expected best grouping (${bestGrouping.summary.display_point}) to beat or match split layout (32)`
+  );
+  assert(
+    bestGrouping.summary.display_point < longSeqLayout.summary.display_point,
+    `Expected best grouping (${bestGrouping.summary.display_point}) to beat long-sequence layout (42)`
+  );
+}
+
 function verifyNoPureSequenceKeepsFullDisplayPoint() {
   const hand = [
     card('s2', '2', 'spades', 2),
@@ -405,6 +453,7 @@ function main() {
   verifyUngroupedAutoBucketsPreferRank();
   verifyUngroupedClustersSequenceGap();
   verifyWildJokerSplitLowersPenalty();
+  verifyDualJokerKingSetSplitScreenshotCase();
   verifyNoPureSequenceKeepsFullDisplayPoint();
   verifyPurePlusSetCountsSetPoints();
   verifyTwoSequencesZeroSetPoints();

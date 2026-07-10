@@ -26,6 +26,7 @@ const MIN_MELD_SIZE = 3;
 const MAX_SET_SIZE = 4;
 const MAX_SEQ_SIZE = 5;
 const MAX_TOTAL_GROUPS = 6;
+const MAX_OPTIMAL_SEARCH_CARDS = 14;
 
 const GROUP_TYPE_PRIORITY = {
   pure_sequence: 0, impure_sequence: 1, set: 2,
@@ -323,11 +324,12 @@ function _nextSeqState(seqState, meldType) {
   return seqState; // set: no change
 }
 
-function _runDP(hand, wildRank, melds) {
+function _runDP(hand, wildRank, melds, options = {}) {
   const n = hand.length;
   const fullMask = (1 << n) - 1;
   const INF = 999999;
   const SEQ_STATES = 4; // 0,1,2,3
+  const initialSeqState = Math.max(0, Math.min(3, Number(options.initialSeqState) || 0));
 
   // Pre-compute ungrouped-point cost of every card subset
   const subsetPts = new Int32Array(1 << n);
@@ -347,8 +349,10 @@ function _runDP(hand, wildRank, melds) {
   // idx(mask, s) = flat array index
   const idx = (mask, s) => (mask * SEQ_STATES) + s;
 
-  // Base cases: 0 cards remaining → 0 ungrouped cost regardless of seqState
-  for (let s = 0; s < SEQ_STATES; s++) dp[idx(0, s)] = 0;
+  // Base cases: 0 cards remaining → 0 ungrouped cost for reachable seq states.
+  for (let s = 0; s < SEQ_STATES; s++) {
+    dp[idx(0, s)] = s < initialSeqState ? INF : 0;
+  }
 
   // Fill DP in ascending mask order so sub-problems are always ready
   for (let mask = 1; mask <= fullMask; mask++) {
@@ -480,13 +484,17 @@ function _displayPointForDpTrace(hand, wildRank, groups, ungrouped) {
   });
 }
 
-function _pickBestDpTrace(hand, wildRank, dp, par, idx) {
+function _pickBestDpTrace(hand, wildRank, dp, par, idx, startSeqState = null) {
   const fullMask = (1 << hand.length) - 1;
   let bestTrace = null;
   let bestDisplay = Infinity;
   let bestCost = Infinity;
 
-  for (let s = 0; s < 4; s++) {
+  const startStates = startSeqState == null
+    ? [0, 1, 2, 3]
+    : [startSeqState];
+
+  for (const s of startStates) {
     if (s > 0 && par[idx(fullMask, s)] == null) continue;
     const traced = _traceGrouping(hand, par, idx, fullMask, s);
     const displayPoint = _displayPointForDpTrace(hand, wildRank, traced.groups, traced.ungrouped);
@@ -502,7 +510,7 @@ function _pickBestDpTrace(hand, wildRank, dp, par, idx) {
     }
   }
 
-  return bestTrace || _traceGrouping(hand, par, idx, fullMask, 0);
+  return bestTrace || _traceGrouping(hand, par, idx, fullMask, startStates[0] ?? 0);
 }
 
 function _traceGrouping(hand, par, idx, startMask, startS) {
@@ -903,10 +911,190 @@ function applyGroupDisplayPoints(groups = [], summary = {}, wildRank = null) {
   });
 }
 
+function _cardsFromMask(hand, mask) {
+  const cards = [];
+  for (let i = 0; i < hand.length; i++) {
+    if (mask & (1 << i)) cards.push(hand[i]);
+  }
+  return cards;
+}
+
+function _buildTraceWithForcedMelds(hand, wildRank, forcedMelds) {
+  if (!Array.isArray(forcedMelds) || forcedMelds.length === 0) {
+    const { dp, par, idx } = _runDP(hand, wildRank, _enumerateMelds(hand, wildRank));
+    return _pickBestDpTrace(hand, wildRank, dp, par, idx);
+  }
+
+  let forcedMask = 0;
+  let seqState = 0;
+  const groups = [];
+  for (const meld of forcedMelds) {
+    forcedMask |= meld.mask;
+    seqState = _nextSeqState(seqState, meld.type);
+    groups.push({ type: meld.type, cards: _cardsFromMask(hand, meld.mask) });
+  }
+
+  const remainingIdxs = [];
+  for (let i = 0; i < hand.length; i++) {
+    if ((forcedMask & (1 << i)) === 0) remainingIdxs.push(i);
+  }
+  const subHand = remainingIdxs.map((i) => hand[i]);
+  if (subHand.length === 0) {
+    return { groups, ungrouped: [] };
+  }
+
+  const subMelds = _enumerateMelds(subHand, wildRank);
+  const { dp, par, idx } = _runDP(subHand, wildRank, subMelds, { initialSeqState: seqState });
+  const subTrace = _pickBestDpTrace(subHand, wildRank, dp, par, idx, seqState);
+  return {
+    groups: [...groups, ...subTrace.groups],
+    ungrouped: subTrace.ungrouped,
+  };
+}
+
+function _refineWithForcedJokerMelds(hand, wildRank, baseTrace) {
+  let best = baseTrace;
+  let bestDisplay = _displayPointForDpTrace(hand, wildRank, baseTrace.groups, baseTrace.ungrouped);
+  const allMelds = _enumerateMelds(hand, wildRank);
+
+  const jokerMelds = allMelds.filter((meld) => {
+    if (meld.type !== 'set' && meld.type !== 'impure_sequence') return false;
+    return _cardsFromMask(hand, meld.mask).some((card) => isJoker(card, wildRank));
+  });
+  const pureMelds = allMelds.filter((meld) => meld.type === 'pure_sequence');
+
+  const tryTrace = (forcedMelds) => {
+    const candidate = _buildTraceWithForcedMelds(hand, wildRank, forcedMelds);
+    const display = _displayPointForDpTrace(hand, wildRank, candidate.groups, candidate.ungrouped);
+    if (display < bestDisplay) {
+      best = candidate;
+      bestDisplay = display;
+    }
+  };
+
+  for (const meld of jokerMelds) {
+    tryTrace([meld]);
+  }
+  for (const pure of pureMelds) {
+    for (const meld of jokerMelds) {
+      if (pure.mask & meld.mask) continue;
+      tryTrace([pure, meld]);
+    }
+  }
+
+  return best;
+}
+
 function _meldDisplayPenalty(meld, nextSeqState, subsetPts) {
   if (meld.type === 'pure_sequence') return 0;
   if (nextSeqState === 3) return 0;
   return subsetPts[meld.mask];
+}
+
+function _indexMeldsByBit(melds, n) {
+  const byBit = Array.from({ length: n }, () => []);
+  for (const meld of melds) {
+    for (let i = 0; i < n; i++) {
+      if (meld.mask & (1 << i)) byBit[i].push(meld);
+    }
+  }
+  return byBit;
+}
+
+function _lowestBitIndex(mask) {
+  let i = 0;
+  while ((mask & (1 << i)) === 0) i++;
+  return i;
+}
+
+function _traceTieBreak(hand, wildRank, groups, ungrouped) {
+  const pureCount = groups.filter((m) => m.type === 'pure_sequence').length;
+  const impureCount = groups.filter((m) => m.type === 'impure_sequence').length;
+  const seqCount = pureCount + impureCount;
+  const allGrouped =
+    ungrouped.length === 0 ||
+    hasOnlyZeroPointUngrouped(ungrouped, wildRank);
+  const validForDeclare = allGrouped && pureCount >= 1 && seqCount >= 2;
+  const nonJokerUngrouped = ungrouped.filter((c) => !isZeroPointUngrouped(c, wildRank)).length;
+  return {
+    validForDeclare: validForDeclare ? 1 : 0,
+    pureCount,
+    seqCount,
+    validMeldCount: groups.length,
+    nonJokerUngrouped: -nonJokerUngrouped,
+  };
+}
+
+function _compareTieBreak(a, b) {
+  const keys = ['validForDeclare', 'pureCount', 'seqCount', 'validMeldCount', 'nonJokerUngrouped'];
+  for (const k of keys) {
+    if ((a[k] || 0) !== (b[k] || 0)) return (a[k] || 0) - (b[k] || 0);
+  }
+  return 0;
+}
+
+function _isBetterPartition(display, tie, bestDisplay, bestTie) {
+  if (display < bestDisplay) return true;
+  if (display > bestDisplay) return false;
+  return _compareTieBreak(tie, bestTie) > 0;
+}
+
+// Exhaustive meld partition search — scores every layout via display_point.
+// Safe for full rummy hands (≤14 cards); guarantees lowest display_point.
+function _searchOptimalPartition(hand, wildRank, melds) {
+  const n = hand.length;
+  if (n === 0) return { groups: [], ungrouped: [] };
+
+  const meldsByBit = _indexMeldsByBit(melds, n);
+  const fullMask = (1 << n) - 1;
+  const groups = [];
+  const ungrouped = [];
+
+  let bestDisplay = Infinity;
+  let bestTie = null;
+  let bestGroups = [];
+  let bestUngrouped = [];
+
+  const consider = () => {
+    const display = _displayPointForDpTrace(hand, wildRank, groups, ungrouped);
+    const tie = _traceTieBreak(hand, wildRank, groups, ungrouped);
+    if (_isBetterPartition(display, tie, bestDisplay, bestTie)) {
+      bestDisplay = display;
+      bestTie = tie;
+      bestGroups = groups.map((g) => ({ type: g.type, cards: g.cards.slice() }));
+      bestUngrouped = ungrouped.slice();
+    }
+    return bestDisplay === 0 && bestTie?.validForDeclare === 1;
+  };
+
+  const dfs = (remainingMask) => {
+    if (remainingMask === 0) return consider();
+    if (bestDisplay === 0 && bestTie?.validForDeclare === 1) return true;
+
+    const i = _lowestBitIndex(remainingMask);
+    const bit = 1 << i;
+
+    ungrouped.push(hand[i]);
+    if (dfs(remainingMask ^ bit)) {
+      ungrouped.pop();
+      return true;
+    }
+    ungrouped.pop();
+
+    for (const meld of meldsByBit[i]) {
+      if ((meld.mask & remainingMask) !== meld.mask) continue;
+      groups.push({ type: meld.type, cards: _cardsFromMask(hand, meld.mask) });
+      if (dfs(remainingMask ^ meld.mask)) {
+        groups.pop();
+        return true;
+      }
+      groups.pop();
+    }
+    return false;
+  };
+
+  dfs(fullMask);
+  return { groups: bestGroups, ungrouped: bestUngrouped };
 }
 
 // ─── buildBestGrouping ────────────────────────────────────────────────────────
@@ -919,8 +1107,15 @@ function buildBestGrouping(cards, wildJoker, options) {
   if (n === 0) return _emptyResult();
 
   const melds = _enumerateMelds(hand, wildRank);
-  const { dp, par, idx } = _runDP(hand, wildRank, melds);
-  const { groups, ungrouped } = _pickBestDpTrace(hand, wildRank, dp, par, idx);
+  let trace;
+  if (n <= MAX_OPTIMAL_SEARCH_CARDS) {
+    trace = _searchOptimalPartition(hand, wildRank, melds);
+  } else {
+    const { dp, par, idx } = _runDP(hand, wildRank, melds);
+    trace = _pickBestDpTrace(hand, wildRank, dp, par, idx);
+    trace = _refineWithForcedJokerMelds(hand, wildRank, trace);
+  }
+  const { groups, ungrouped } = trace;
 
   const grouped = groups.map((meld, i) => ({
     group_id: i + 1,
