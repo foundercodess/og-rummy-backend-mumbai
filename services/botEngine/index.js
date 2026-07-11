@@ -4,6 +4,7 @@ const gameSessionModel = require('../../models/gameSession.model');
 const userModel = require('../../models/user.model');
 const avatarModel = require('../../models/avatar.model');
 const redisLockService = require('../redisLock.service');
+const botLeaseService = require('../botLease.service');
 const { startPregame } = require('../../realtime/pregameOrchestrator');
 const RummyBotAdapter = require('./rummyBot.adapter');
 
@@ -129,46 +130,61 @@ async function maybeInjectBotsInSession(io, session, config, adapters) {
 
     const existingBotIds = new Set(players.filter(isBotPlayer).map((p) => Number(p.user_id)));
     let injectedCount = 0;
+    const triedIndices = new Set();
 
-    for (let i = 1; i <= config.poolSize && injectedCount < seatsNeeded; i += 1) {
-      const botUser = await ensureBotUser(i, config);
+    while (injectedCount < seatsNeeded && triedIndices.size < config.poolSize) {
+      const index = botLeaseService.pickRandomUnusedBotIndex(config.poolSize, triedIndices);
+      if (index == null) break;
+      triedIndices.add(index);
+
+      const botUser = await ensureBotUser(index, config);
       if (!botUser) continue;
       if (existingBotIds.has(Number(botUser.id))) continue;
 
-      const joinedState = await gameplayService.joinSession({
-        sessionIdOrCode: fresh.id,
-        userId: botUser.id,
-        skipBalanceCheck: true, // bots don't hold real wallet funds
+      const leased = await botLeaseService.acquireBotLease(fresh.id, botUser.id, {
+        refreshDisplayName: true,
       });
+      if (!leased) continue;
 
-      const botPlayer = joinedState.players.find((p) => Number(p.user_id) === Number(botUser.id));
-      if (botPlayer) {
-        await gameSessionModel.updatePlayerMetadata(fresh.id, botUser.id, {
-          ...(botPlayer.metadata || {}),
-          host: false,
-          ready: config.autoReady,
-          is_bot: true,
-          bot_engine: adapter.key,
+      try {
+        const joinedState = await gameplayService.joinSession({
+          sessionIdOrCode: fresh.id,
+          userId: botUser.id,
+          skipBalanceCheck: true, // bots don't hold real wallet funds
         });
+
+        const botPlayer = joinedState.players.find((p) => Number(p.user_id) === Number(botUser.id));
+        if (botPlayer) {
+          await gameSessionModel.updatePlayerMetadata(fresh.id, botUser.id, {
+            ...(botPlayer.metadata || {}),
+            host: false,
+            ready: config.autoReady,
+            is_bot: true,
+            bot_engine: adapter.key,
+          });
+        }
+
+        await gameSessionModel.insertEvent({
+          sessionId: fresh.id,
+          userId: botUser.id,
+          eventType: 'bot_joined',
+          payload: {
+            bot_user_id: botUser.id,
+            bot_engine: adapter.key,
+          },
+        });
+
+        await adapter.onBotInjected({
+          sessionId: fresh.id,
+          userId: botUser.id,
+        });
+
+        existingBotIds.add(Number(botUser.id));
+        injectedCount += 1;
+      } catch (joinErr) {
+        await botLeaseService.releaseBotLease(fresh.id, botUser.id);
+        console.warn(`[BOT][${fresh.id}] Bot join skipped uid=${botUser.id}: ${joinErr.message}`);
       }
-
-      await gameSessionModel.insertEvent({
-        sessionId: fresh.id,
-        userId: botUser.id,
-        eventType: 'bot_joined',
-        payload: {
-          bot_user_id: botUser.id,
-          bot_engine: adapter.key,
-        },
-      });
-
-      await adapter.onBotInjected({
-        sessionId: fresh.id,
-        userId: botUser.id,
-      });
-
-      existingBotIds.add(Number(botUser.id));
-      injectedCount += 1;
     }
 
     if (injectedCount > 0) {

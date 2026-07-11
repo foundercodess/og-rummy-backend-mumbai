@@ -599,12 +599,28 @@ function getInvalidGroupType(cards) {
   return cards.length >= 2 ? 'invalid_sequence_candidate' : 'invalid_single';
 }
 
+function pickDistinctSuitIndices(indices, cards, maxCount = MAX_SET_SIZE) {
+  const picked = [];
+  const usedSuits = new Set();
+  for (const i of indices) {
+    const suit = cards[i]?.suit;
+    if (!suit || usedSuits.has(suit)) continue;
+    usedSuits.add(suit);
+    picked.push(i);
+    if (picked.length >= maxCount) break;
+  }
+  return picked;
+}
+
 function isInvalidSetCandidate(cards, wildRank) {
   if (!Array.isArray(cards) || cards.length < 2) return false;
   const natural = cards.filter((c) => !isJoker(c, wildRank));
   if (natural.length < 2) return false;
   const ranks = new Set(natural.map((c) => c.rank));
-  return ranks.size === 1;
+  if (ranks.size !== 1) return false;
+  // Sets require same rank with distinct suits — duplicate suit copies are not set material.
+  const suits = new Set(natural.map((c) => c.suit).filter(Boolean));
+  return suits.size >= 2;
 }
 
 function getInvalidClusterType(cards, wildRank) {
@@ -664,7 +680,7 @@ function clusterInvalidCards(cards, wildRank) {
     clusters.push(picked.map((i) => cards[i]));
   };
 
-  // 1) Set candidates — same rank, 2+ natural cards.
+  // 1) Set candidates — same rank, 2+ natural cards with distinct suits.
   const byRank = new Map();
   for (let i = 0; i < n; i++) {
     const card = cards[i];
@@ -678,8 +694,9 @@ function clusterInvalidCards(cards, wildRank) {
     .sort((a, b) => b[1].length - a[1].length)
     .forEach(([, idxs]) => {
       const available = idxs.filter((i) => !used.has(i));
-      if (available.length >= 2) {
-        takeCluster(available.slice(0, MAX_SET_SIZE));
+      const distinctSuitIdxs = pickDistinctSuitIndices(available, cards);
+      if (distinctSuitIdxs.length >= 2) {
+        takeCluster(distinctSuitIdxs);
       }
     });
 
@@ -722,7 +739,7 @@ function clusterInvalidCards(cards, wildRank) {
     if (!attached) takeCluster(jokerIdxs);
   }
 
-  // 4) Remaining rank pairs and singles.
+  // 4) Remaining rank pairs (distinct suits only) and singles.
   const remainingByRank = new Map();
   for (let i = 0; i < n; i++) {
     if (used.has(i)) continue;
@@ -736,7 +753,8 @@ function clusterInvalidCards(cards, wildRank) {
     .sort((a, b) => b[1].length - a[1].length)
     .forEach(([, idxs]) => {
       const available = idxs.filter((i) => !used.has(i));
-      if (available.length >= 2) takeCluster(available);
+      const distinctSuitIdxs = pickDistinctSuitIndices(available, cards);
+      if (distinctSuitIdxs.length >= 2) takeCluster(distinctSuitIdxs);
     });
 
   for (let i = 0; i < n; i++) {

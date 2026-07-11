@@ -1186,6 +1186,80 @@ async function leaveTableContinuation({ sourceSessionId, userId }) {
   return getSessionState(sourceSession.id);
 }
 
+async function recordExplicitTableLeave({
+  sourceSessionId,
+  userId,
+  reason = 'table_left',
+  activeSessionExit = false,
+}) {
+  const sourceSession = await getSessionState(sourceSessionId);
+  if (!sourceSession) {
+    const error = new Error('Source session not found');
+    error.code = 'SESSION_NOT_FOUND';
+    throw error;
+  }
+
+  const sourcePlayer = (sourceSession.players || []).find(
+    (player) => Number(player.user_id) === Number(userId)
+  );
+  if (!sourcePlayer) {
+    const error = new Error('Player not found in source session');
+    error.code = 'PLAYER_NOT_FOUND';
+    throw error;
+  }
+
+  const leftUserIds = new Set(
+    (Array.isArray(sourceSession.metadata?.post_result_left_user_ids)
+      ? sourceSession.metadata.post_result_left_user_ids
+      : [])
+      .map((playerId) => Number(playerId))
+      .filter((playerId) => !Number.isNaN(playerId))
+  );
+  leftUserIds.add(Number(userId));
+
+  await gameSessionModel.updateSessionStatus(sourceSession.id, sourceSession.status, {
+    metadata: {
+      ...(sourceSession.metadata || {}),
+      post_result_left_user_ids: Array.from(leftUserIds),
+      phase_updated_at: new Date().toISOString(),
+    },
+  });
+
+  const nextPlayerMetadata = {
+    ...(sourcePlayer.metadata || {}),
+    table_left: true,
+    pool_rejoin_opt_out: true,
+    auto_rematch_opt_out: true,
+    left_at: new Date().toISOString(),
+    connection_status: 'disconnected',
+    is_connected: false,
+  };
+  const nextPlayerStatus = ['joined', 'disconnected', 'eliminated'].includes(
+    String(sourcePlayer.status || '').toLowerCase()
+  )
+    ? 'left'
+    : sourcePlayer.status;
+
+  await gameSessionModel.updatePlayerState(sourceSession.id, userId, {
+    status: nextPlayerStatus,
+    leftAt: new Date(),
+    metadata: nextPlayerMetadata,
+  });
+
+  await gameSessionModel.insertEvent({
+    sessionId: sourceSession.id,
+    userId,
+    eventType: 'table_left',
+    payload: {
+      source_session_id: sourceSession.id,
+      active_session_exit: activeSessionExit === true,
+      reason,
+    },
+  });
+
+  return getSessionState(sourceSession.id);
+}
+
 module.exports = {
   createSession,
   joinSession,
@@ -1195,5 +1269,6 @@ module.exports = {
   resolveRejoinPendingMaxAgeMinutes,
   createOrJoinContinuationSession,
   leaveTableContinuation,
+  recordExplicitTableLeave,
   userAllowedToAccessSessionMetadata,
 };

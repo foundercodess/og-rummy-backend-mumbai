@@ -209,11 +209,39 @@ function verifyUngroupedAutoBucketsPreferRank() {
   ];
   const grouped = groupingService.buildBestGrouping(hand, null);
   const invalidGroups = (grouped.groups || []).filter((group) => group.is_valid_meld !== true);
-  const rank3Bucket = invalidGroups.find((group) => (group.cards || []).length === 3);
-  assert(rank3Bucket, 'Expected rank bucket of 3 cards for leftover rank=3 cards');
-  assert(rank3Bucket.type === 'invalid_set_candidate', 'Expected near-set bucket for three rank-3 cards');
-  const uniqueRanks = new Set((rank3Bucket.cards || []).map((c) => c.rank));
-  assert(uniqueRanks.size === 1 && uniqueRanks.has('3'), 'Expected grouped invalid bucket cards to share same rank');
+  const rank3Bucket = invalidGroups.find(
+    (group) => group.type === 'invalid_set_candidate' && (group.cards || []).length === 2
+  );
+  assert(rank3Bucket, 'Expected distinct-suit near-set bucket for rank-3 cards');
+  const bucketSuits = new Set((rank3Bucket.cards || []).map((c) => c.suit));
+  assert(bucketSuits.size === 2 && bucketSuits.has('hearts') && bucketSuits.has('spades'),
+    'Expected one hearts + one spades in near-set bucket, not duplicate suits');
+  const duplicateHeart = invalidGroups.find(
+    (group) => group.type === 'invalid_single'
+      && (group.cards || []).some((c) => c.card_uid === 'h3b')
+  );
+  assert(duplicateHeart, 'Expected duplicate same-suit 3♥ to remain as invalid_single');
+}
+
+function verifyUngroupedRejectsDuplicateSuitSetBucket() {
+  const hand = [
+    card('h7a', '7', 'hearts', 7),
+    card('h7b', '7', 'hearts', 7),
+    card('c9', '9', 'clubs', 9),
+  ];
+  const grouped = groupingService.buildBestGrouping(hand, null);
+  const invalidGroups = (grouped.groups || []).filter((group) => group.is_valid_meld !== true);
+  const badSetBucket = invalidGroups.find(
+    (group) => group.type === 'invalid_set_candidate'
+      && (group.cards || []).length === 2
+      && (group.cards || []).every((c) => c.rank === '7')
+  );
+  assert(!badSetBucket, 'Expected same-rank same-suit duplicates to never form near-set bucket');
+  const heartSingles = invalidGroups.filter(
+    (group) => group.type === 'invalid_single'
+      && (group.cards || []).some((c) => c.rank === '7' && c.suit === 'hearts')
+  );
+  assert(heartSingles.length === 2, 'Expected each duplicate 7♥ to stay as separate invalid_single');
 }
 
 function verifyUngroupedClustersSequenceGap() {
@@ -568,6 +596,7 @@ function main() {
   verifyWildJokerInvalidSingleSubmittedStillAllowsDeclare();
   verifySingleLeftoverNonJokerStaysInvalid();
   verifyUngroupedAutoBucketsPreferRank();
+  verifyUngroupedRejectsDuplicateSuitSetBucket();
   verifyUngroupedClustersSequenceGap();
   verifyWildJokerSplitLowersPenalty();
   verifyDualJokerKingSetSplitScreenshotCase();

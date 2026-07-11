@@ -13,6 +13,10 @@ const redisLockService = require('../services/redisLock.service');
 const socketRegistry = require('./socketRegistry');
 const { pool } = require('../db');
 const { startTurnTimerFromDeal } = require('./turnSchedulerBridge');
+const {
+  filterTurnEligibleAtDealStart,
+  resolveLastTurnUserId,
+} = require('./turnRotation');
 
 const COUNTDOWN_SECONDS = 3;
 const INTER_DEAL_COUNTDOWN_SECONDS = 5;
@@ -1240,11 +1244,23 @@ async function emitDealFromPregame({
   const turnId = Date.now();
   const turnEndsAt = new Date(Date.parse(turnStartedAt) + (turnTimerSeconds * 1000)).toISOString();
 
+  const poolEliminatedForTurn = Array.from(
+    resolvePoolEliminatedSet(sessionForDeal?.metadata || {}),
+  );
+  const turnEligibleAtDealStart = filterTurnEligibleAtDealStart(participants, {
+    poolEliminatedUserIds: poolEliminatedForTurn,
+  });
+  const lastTurnUserId = resolveLastTurnUserId(
+    turnEligibleAtDealStart,
+    firstTurnPlayer.user_id,
+  );
+
   const nextMetadata = {
     ...(sessionForDeal.metadata || {}),
     phase: 'active',
     phase_updated_at: getNowIso(),
     first_turn_user_id: firstTurnPlayer.user_id,
+    last_turn_user_id: lastTurnUserId,
     toss: includeTossMetadata ? (tossPayload || dealPayload.toss) : null,
     distribution: dealPayload.distribution,
     deal_quality: dealPayload.distribution_quality || null,
@@ -1259,6 +1275,8 @@ async function emitDealFromPregame({
     game_state: {
       ...(dealPayload.game_state || {}),
       initial_turn_id: turnId,
+      first_turn_user_id: firstTurnPlayer.user_id,
+      last_turn_user_id: lastTurnUserId,
     },
     turn: {
       turn_id: turnId,
@@ -1306,6 +1324,7 @@ async function emitDealFromPregame({
       toss_winner_user_id: includeTossMetadata ? firstTurnPlayer.user_id : null,
       winner_user_id: firstTurnPlayer.user_id,
       first_turn_user_id: firstTurnPlayer.user_id,
+      last_turn_user_id: lastTurnUserId,
       distribution_quality: dealPayload.distribution_quality || null,
     },
   });
@@ -1370,7 +1389,11 @@ async function emitDealFromPregame({
       turn_started_at: turnStartedAt,
       turn_ends_at: turnEndsAt,
       turn_timer_seconds: turnTimerSeconds,
+      first_turn_user_id: firstTurnPlayer.user_id,
+      last_turn_user_id: lastTurnUserId,
     },
+    first_turn_user_id: firstTurnPlayer.user_id,
+    last_turn_user_id: lastTurnUserId,
     toss: includeTossMetadata ? (tossPayload || dealPayload.toss) : null,
     turn: {
       turn_id: turnId,

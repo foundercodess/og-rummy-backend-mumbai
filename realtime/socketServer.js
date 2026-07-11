@@ -14,6 +14,7 @@ const userModel = require('../models/user.model');
 const avatarModel = require('../models/avatar.model');
 const groupingService = require('../services/grouping.service');
 const redisLockService = require('../services/redisLock.service');
+const botLeaseService = require('../services/botLease.service');
 const {
   chooseBotDiscardCard,
   getCardValue,
@@ -159,8 +160,8 @@ const TURN_START_GRACE_MS = 1000;
 const BOT_ACTION_DELAY_MIN_MS = Math.max(250, Number(process.env.BOT_ACTION_DELAY_MIN_MS) || 400);
 const BOT_ACTION_DELAY_MAX_MS = Math.max(BOT_ACTION_DELAY_MIN_MS, Number(process.env.BOT_ACTION_DELAY_MAX_MS) || 1400);
 const BOT_ACTION_DELAY_MS = Math.max(0, Number(process.env.BOT_ACTION_DELAY_MS) || 0);
-const BOT_POST_PICK_DELAY_MIN_MS = Math.max(200, Number(process.env.BOT_POST_PICK_DELAY_MIN_MS) || 180);
-const BOT_POST_PICK_DELAY_MAX_MS = Math.max(BOT_POST_PICK_DELAY_MIN_MS, Number(process.env.BOT_POST_PICK_DELAY_MAX_MS) || 700);
+const BOT_POST_PICK_DELAY_MIN_MS = Math.max(2000, Number(process.env.BOT_POST_PICK_DELAY_MIN_MS) || 2000);
+const BOT_POST_PICK_DELAY_MAX_MS = Math.max(BOT_POST_PICK_DELAY_MIN_MS, Number(process.env.BOT_POST_PICK_DELAY_MAX_MS) || 8000);
 const BOT_POST_PICK_DELAY_MS = Math.max(0, Number(process.env.BOT_POST_PICK_DELAY_MS) || 0);
 const BOT_DECLARE_RESPONSE_DELAY_MS = Math.max(300, Number(process.env.BOT_DECLARE_RESPONSE_DELAY_MS) || 650);
 const BOT_AGGRESSION_ENABLED = String(process.env.BOT_AGGRESSION_ENABLED || 'true').trim().toLowerCase() === 'true';
@@ -287,6 +288,32 @@ function getEliminatedUserIdSet(metadata = {}) {
   ];
 
   return new Set(eliminated.map((id) => Number(id)).filter((id) => !Number.isNaN(id)));
+}
+
+function resolvePreviousPoolEliminatedUserIds(session = {}) {
+  return (Array.isArray(session?.metadata?.pool_eliminated_user_ids)
+    ? session.metadata.pool_eliminated_user_ids
+    : [])
+    .map((id) => Number(id))
+    .filter((id) => !Number.isNaN(id));
+}
+
+function resolveNewlyPoolEliminatedUserIds(session = {}, poolProgress = {}) {
+  const previous = new Set(resolvePreviousPoolEliminatedUserIds(session));
+  return (Array.isArray(poolProgress?.eliminatedUserIds) ? poolProgress.eliminatedUserIds : [])
+    .map((id) => Number(id))
+    .filter((id) => !Number.isNaN(id) && !previous.has(id));
+}
+
+function buildPoolEliminationContextFields(session = {}, poolProgress = {}) {
+  const previousPoolEliminatedUserIds = resolvePreviousPoolEliminatedUserIds(session);
+  const poolNewlyEliminatedUserIds = resolveNewlyPoolEliminatedUserIds(session, poolProgress);
+  return {
+    pool_previous_eliminated_user_ids: previousPoolEliminatedUserIds,
+    pool_newly_eliminated_user_ids: poolNewlyEliminatedUserIds,
+    previousPoolEliminatedUserIds,
+    poolNewlyEliminatedUserIds,
+  };
 }
 
 function getTimeoutEliminatedUserIdSet(metadata = {}) {
@@ -1460,6 +1487,7 @@ async function tryTransitionPoolRoundAfterSinglePlayerRemaining(
     joiningFee: rejoinJoiningFee,
     prizePoolSummary,
   });
+  const poolEliminationContext = buildPoolEliminationContextFields(session, poolProgress);
   const resultPayload = {
     session_id: sessionId,
     server_time: new Date().toISOString(),
@@ -1477,6 +1505,8 @@ async function tryTransitionPoolRoundAfterSinglePlayerRemaining(
     pool_round_no: poolProgress.currentRoundNo,
     pool_scores_by_user: poolProgress.scoresByUser,
     pool_eliminated_user_ids: poolProgress.eliminatedUserIds,
+    pool_previous_eliminated_user_ids: poolEliminationContext.pool_previous_eliminated_user_ids,
+    pool_newly_eliminated_user_ids: poolEliminationContext.pool_newly_eliminated_user_ids,
     can_rejoin_table: rejoinContext.can_rejoin_table,
     rejoin_threshold: rejoinContext.rejoin_threshold,
     rejoin_candidate_user_ids: rejoinContext.rejoin_candidate_user_ids,
@@ -1502,6 +1532,7 @@ async function tryTransitionPoolRoundAfterSinglePlayerRemaining(
     settlement: null,
     winnerUserId,
     declarerValid: null,
+    previousPoolEliminatedUserIds: poolEliminationContext.previousPoolEliminatedUserIds,
   });
 
   cleanupTurnState(sessionId);
@@ -1583,7 +1614,17 @@ function buildPoolRejoinContext({
 
   const highestActiveScore = activeScores.length > 0 ? Math.max(...activeScores) : 0;
   const startPoints = highestActiveScore + 1;
-  const rejoinCandidateUserIds = Array.from(eliminatedSet);
+  const rejoinOptedOutUserIds = new Set(
+    (Array.isArray(players) ? players : [])
+      .filter((player) => (
+        player?.metadata?.table_left === true
+        || player?.metadata?.pool_rejoin_opt_out === true
+      ))
+      .map((player) => Number(player?.user_id))
+      .filter((userId) => !Number.isNaN(userId))
+  );
+  const rejoinCandidateUserIds = Array.from(eliminatedSet)
+    .filter((userId) => !rejoinOptedOutUserIds.has(Number(userId)));
   const rejoinStartPointsByUser = {};
   rejoinCandidateUserIds.forEach((userId) => {
     rejoinStartPointsByUser[String(userId)] = startPoints;
@@ -1956,6 +1997,8 @@ async function transitionToNextDeal(io, session, snapshot) {
     declare_by_user_id: snapshot.declare_by_user_id,
     declare_valid: snapshot.declare_valid,
     reason: snapshot.reason,
+    first_turn_user_id: session?.metadata?.first_turn_user_id ?? null,
+    last_turn_user_id: session?.metadata?.last_turn_user_id ?? null,
   });
 
   nextMetadata.deal_scores = dealScoresWithDetails;
@@ -3084,7 +3127,7 @@ function resolveBotActionDelayMs(turn, options = {}) {
   const remainingMs = endsAtTs - Date.now();
   const isBonusTurn = String(turn?.type || '').toLowerCase() === 'bonus';
   const discardReserveMs = options?.phase === 'pick'
-    ? Math.max(BOT_POST_PICK_DELAY_MAX_MS, 700) + 900
+    ? BOT_POST_PICK_DELAY_MAX_MS + 1200
     : 0;
   const safeRemaining = Math.max(250, remainingMs - 350 - discardReserveMs);
   let finalDelay = Math.max(250, Math.min(startDelayMs + randomizedDelay, safeRemaining));
@@ -3112,23 +3155,29 @@ function resolveBotDiscardDelayMs(turn, options = {}) {
 
   const cfgMin = Math.min(BOT_POST_PICK_DELAY_MIN_MS, BOT_POST_PICK_DELAY_MAX_MS);
   const cfgMax = Math.max(BOT_POST_PICK_DELAY_MIN_MS, BOT_POST_PICK_DELAY_MAX_MS);
-  const randomizedDelay = randomIntBetween(cfgMin, cfgMax);
+  let randomizedDelay = randomIntBetween(cfgMin, cfgMax);
 
   const endsAtTs = Date.parse(turn?.ends_at || '');
   if (Number.isNaN(endsAtTs)) return randomizedDelay;
 
   const remainingMs = endsAtTs - Date.now();
-  const safeRemaining = Math.max(250, remainingMs - 350);
-  let finalDelay = Math.max(250, Math.min(randomizedDelay, safeRemaining));
-  if (options?.aggressiveEnabled === true) {
-    const aggressiveMultiplier = BOT_AGGRESSIVE_DISCARD_DELAY_MIN_MULTIPLIER
-      + (Math.random() * (BOT_AGGRESSIVE_DISCARD_DELAY_MAX_MULTIPLIER - BOT_AGGRESSIVE_DISCARD_DELAY_MIN_MULTIPLIER));
-    finalDelay = Math.max(250, Math.floor(finalDelay * aggressiveMultiplier));
-  }
+  const turnExpiryBufferMs = 800;
+  const safeRemaining = Math.max(cfgMin, remainingMs - turnExpiryBufferMs);
+  let finalDelay = Math.min(randomizedDelay, safeRemaining);
+
+  // Soft rigging may shorten discard slightly, but keep human-plausible pacing.
   if (options?.softRiggingEnabled === true) {
     const multiplier = BOT_SOFT_RIGGING_MIN_DISCARD_MULTIPLIER
       + (Math.random() * (BOT_SOFT_RIGGING_MAX_DISCARD_MULTIPLIER - BOT_SOFT_RIGGING_MIN_DISCARD_MULTIPLIER));
-    finalDelay = Math.max(250, Math.floor(finalDelay * multiplier));
+    finalDelay = Math.floor(finalDelay * multiplier);
+  }
+
+  // Human think-time before discard — do not apply aggressive speed multipliers here.
+  const urgencyMs = 1500;
+  if (remainingMs > urgencyMs) {
+    finalDelay = Math.max(cfgMin, finalDelay);
+  } else {
+    finalDelay = Math.max(400, Math.min(finalDelay, safeRemaining));
   }
 
   return finalDelay;
@@ -3871,6 +3920,7 @@ function buildDeclarationTablePlayers({
   settlement = null,
   winnerUserId = null,
   declarerValid = null,
+  previousPoolEliminatedUserIds = null,
 }) {
   const mode = resolveSessionGameMode(session);
   const gameFinal = isGameFinal ?? isFinal;
@@ -3880,7 +3930,26 @@ function buildDeclarationTablePlayers({
   const settlementByUserId = new Map((settlement?.per_player || []).map((entry) => [entry.user_id, entry]));
   const rankByUserId = isFinal ? buildRankByUserId(finalizedResults || []) : new Map();
 
-  return players.map((player) => {
+  const previousPoolEliminatedSet = new Set(
+    (Array.isArray(previousPoolEliminatedUserIds) ? previousPoolEliminatedUserIds : [])
+      .map((id) => Number(id))
+      .filter((id) => !Number.isNaN(id))
+  );
+  const shouldHidePreviousPoolEliminated = (
+    !gameFinal
+    && mode === 'pool'
+    && Array.isArray(previousPoolEliminatedUserIds)
+  );
+
+  const visiblePlayers = shouldHidePreviousPoolEliminated
+    ? players.filter((player) => {
+      const userId = Number(player?.user_id);
+      if (Number.isNaN(userId)) return false;
+      return !previousPoolEliminatedSet.has(userId);
+    })
+    : players;
+
+  return visiblePlayers.map((player) => {
     const playerDistribution = getPlayerDistribution(distribution, player.user_id);
     const playerCards = playerDistribution?.cards || [];
     const playerResponse = state?.responses?.get(player.user_id) || null;
@@ -5624,7 +5693,7 @@ async function finalizePoolSplitOffer(io, sessionId, state) {
     result: finalizedPayload,
     split_offer: null,
   };
-  await gameSessionModel.updateSessionStatus(sessionId, 'completed', {
+  await completeSessionWithBotRelease(sessionId, {
     endedAt: new Date(),
     metadata: nextMetadata,
   });
@@ -5877,6 +5946,9 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
       .map((id) => Number(id))
       .includes(Number(userId));
   }
+  if (explicitlyLeftTable) {
+    poolBuybackEligible = false;
+  }
   const playerEligible = Boolean(
     session
     && sessionActive
@@ -5901,6 +5973,9 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
     }
   }
   if (canRejoin && !poolBuybackEligible && !playerDisconnected && isPresentInSessionRoom === true) {
+    canRejoin = false;
+  }
+  if (explicitlyLeftTable) {
     canRejoin = false;
   }
 
@@ -6554,6 +6629,12 @@ async function ensureRematchBotUser(index) {
   return userModel.findByPhone(phone);
 }
 
+async function completeSessionWithBotRelease(sessionId, fields = {}) {
+  const row = await gameSessionModel.updateSessionStatus(sessionId, 'completed', fields);
+  await botLeaseService.releaseBotsForSession(sessionId);
+  return row;
+}
+
 async function fillSessionWithBotsIfNeeded(sessionId) {
   const session = await gameplayService.getSessionState(sessionId);
   if (!session || session.status !== 'waiting') return session;
@@ -6567,12 +6648,21 @@ async function fillSessionWithBotsIfNeeded(sessionId) {
       .filter((id) => !Number.isNaN(id))
   );
   let injectedCount = 0;
+  const triedIndices = new Set();
 
-  for (let i = 1; i <= REMATCH_BOT_POOL_SIZE && injectedCount < seatsNeeded; i += 1) {
+  while (injectedCount < seatsNeeded && triedIndices.size < REMATCH_BOT_POOL_SIZE) {
+    const index = botLeaseService.pickRandomUnusedBotIndex(REMATCH_BOT_POOL_SIZE, triedIndices);
+    if (index == null) break;
+    triedIndices.add(index);
     // eslint-disable-next-line no-await-in-loop
-    const botUser = await ensureRematchBotUser(i);
+    const botUser = await ensureRematchBotUser(index);
     if (!botUser) continue;
     if (existingBotIds.has(Number(botUser.id))) continue;
+    // eslint-disable-next-line no-await-in-loop
+    const leased = await botLeaseService.acquireBotLease(session.id, botUser.id, {
+      refreshDisplayName: true,
+    });
+    if (!leased) continue;
     try {
       // eslint-disable-next-line no-await-in-loop
       const joinedState = await gameplayService.joinSession({
@@ -6594,6 +6684,8 @@ async function fillSessionWithBotsIfNeeded(sessionId) {
       existingBotIds.add(Number(botUser.id));
       injectedCount += 1;
     } catch (err) {
+      // eslint-disable-next-line no-await-in-loop
+      await botLeaseService.releaseBotLease(session.id, botUser.id);
       warnGame(session.id, `Rematch bot fill join skipped uid=${botUser.id}: ${err.message}`);
     }
   }
@@ -6925,6 +7017,10 @@ async function runAutoRematchFromSource(io, sourceSessionId) {
     const sourcePlayer = sourcePlayersByUserId.get(numericUserId);
     if (sourcePlayer?.metadata?.is_bot !== true) continue;
     try {
+      const leased = await botLeaseService.acquireBotLease(targetSession.id, numericUserId, {
+        refreshDisplayName: true,
+      });
+      if (!leased) continue;
       await gameplayService.joinSession({
         sessionIdOrCode: targetSession.id,
         userId: numericUserId,
@@ -6943,6 +7039,7 @@ async function runAutoRematchFromSource(io, sourceSessionId) {
       }
       joinedUserIds.add(numericUserId);
     } catch (err) {
+      await botLeaseService.releaseBotLease(targetSession.id, numericUserId);
       warnGame(sourceSession.id, `Auto rematch bot carry-forward skipped uid=${numericUserId}: ${err.message}`);
     }
   }
@@ -8072,7 +8169,7 @@ async function finalizeGameByElimination(
       turn_timeout_eliminated_user_ids: Array.from(timeoutEliminatedSet),
     };
 
-    await gameSessionModel.updateSessionStatus(sessionId, 'completed', {
+    await completeSessionWithBotRelease(sessionId, {
       endedAt: new Date(),
       currentTurnUserId: winnerUserId,
       metadata: nextMetadata,
@@ -8178,6 +8275,8 @@ async function finalizeGameByElimination(
       declare_by_user_id: dealSnapshot.declare_by_user_id,
       declare_valid: dealSnapshot.declare_valid,
       reason,
+      first_turn_user_id: session?.metadata?.first_turn_user_id ?? null,
+      last_turn_user_id: session?.metadata?.last_turn_user_id ?? null,
     });
   }
 
@@ -8200,7 +8299,7 @@ async function finalizeGameByElimination(
     } : {}),
   };
 
-  await gameSessionModel.updateSessionStatus(sessionId, 'completed', {
+  await completeSessionWithBotRelease(sessionId, {
     endedAt: new Date(),
     currentTurnUserId: winnerUserId,
     metadata: nextMetadata,
@@ -9331,6 +9430,7 @@ function registerSocketServer(httpServer) {
             joiningFee: rejoinJoiningFee,
             prizePoolSummary,
           });
+          const poolEliminationContext = buildPoolEliminationContextFields(session, poolProgress);
           const intermediatePayload = {
             session_id: sessionId,
             server_time: new Date().toISOString(),
@@ -9348,6 +9448,8 @@ function registerSocketServer(httpServer) {
             pool_round_no: poolProgress.currentRoundNo,
             pool_scores_by_user: poolProgress.scoresByUser,
             pool_eliminated_user_ids: poolProgress.eliminatedUserIds,
+            pool_previous_eliminated_user_ids: poolEliminationContext.pool_previous_eliminated_user_ids,
+            pool_newly_eliminated_user_ids: poolEliminationContext.pool_newly_eliminated_user_ids,
             can_rejoin_table: rejoinContext.can_rejoin_table,
             rejoin_threshold: rejoinContext.rejoin_threshold,
             rejoin_candidate_user_ids: rejoinContext.rejoin_candidate_user_ids,
@@ -9381,6 +9483,7 @@ function registerSocketServer(httpServer) {
             settlement: null,
             winnerUserId,
             declarerValid,
+            previousPoolEliminatedUserIds: poolEliminationContext.previousPoolEliminatedUserIds,
           });
 
           emitDeclarationState(io, session, state, {
@@ -9521,7 +9624,7 @@ function registerSocketServer(httpServer) {
           result: resultPayload,
         };
 
-        await gameSessionModel.updateSessionStatus(sessionId, 'completed', {
+        await completeSessionWithBotRelease(sessionId, {
           endedAt: new Date(),
           currentTurnUserId: winnerUserId,
           metadata: nextMetadata,
@@ -9628,6 +9731,8 @@ function registerSocketServer(httpServer) {
           declare_by_user_id: declarerUserId,
           declare_valid: declarerValid,
           reason,
+          first_turn_user_id: session?.metadata?.first_turn_user_id ?? null,
+          last_turn_user_id: session?.metadata?.last_turn_user_id ?? null,
         });
       }
 
@@ -9662,7 +9767,7 @@ function registerSocketServer(httpServer) {
         result: resultPayload,
       };
 
-      await gameSessionModel.updateSessionStatus(sessionId, 'completed', {
+      await completeSessionWithBotRelease(sessionId, {
         endedAt: new Date(),
         currentTurnUserId: winnerUserId,
         metadata: nextMetadata,
@@ -11678,14 +11783,18 @@ function registerSocketServer(httpServer) {
         const isActiveTwoPlayerExit = isActiveSession
           && Number(sourceSession.max_players) === 2;
         const sourceEliminatedUserIds = getEliminatedUserIdSet(sourceSession.metadata || {});
+        const sourceTimeoutEliminatedUserIds = getTimeoutEliminatedUserIdSet(sourceSession.metadata || {});
         const sourcePlayer = (Array.isArray(sourceSession.players) ? sourceSession.players : [])
           .find((player) => Number(player.user_id) === Number(socket.user.id));
         const alreadyDroppedOrEliminated = sourceEliminatedUserIds.has(Number(socket.user.id))
+          || sourceTimeoutEliminatedUserIds.has(Number(socket.user.id))
           || sourcePlayer?.status === 'eliminated'
           || sourcePlayer?.status === 'left'
           || sourcePlayer?.metadata?.is_dropped === true
+          || sourcePlayer?.metadata?.table_left === true
           || String(sourcePlayer?.metadata?.drop_status || '').toLowerCase() === 'dropped'
-          || String(sourcePlayer?.metadata?.elimination_reason || '').toLowerCase() === 'dropped';
+          || String(sourcePlayer?.metadata?.elimination_reason || '').toLowerCase() === 'dropped'
+          || String(sourcePlayer?.metadata?.elimination_reason || '').toLowerCase() === 'timeout';
         let updatedSourceSession = null;
         let result = null;
         if (isActiveTwoPlayerExit) {
@@ -11694,9 +11803,14 @@ function registerSocketServer(httpServer) {
           result = outcome.result || null;
         } else if (isActiveSession) {
           if (alreadyDroppedOrEliminated) {
-            // Idempotent leave path: user already dropped/eliminated, so only
-            // exit table view without mutating active game state for others.
-            updatedSourceSession = await gameplayService.getSessionState(sourceSession.id);
+            // Idempotent leave path: user already dropped/eliminated — record
+            // explicit exit so pending rejoin / pool buyback no longer surfaces.
+            updatedSourceSession = await gameplayService.recordExplicitTableLeave({
+              sourceSessionId: sourceSession.id,
+              userId: socket.user.id,
+              reason: 'table_left_after_drop',
+              activeSessionExit: true,
+            });
             await emitPendingRejoinGameForUser(io, socket.user.id, 'table_left_after_drop');
           } else {
             const outcome = await dropPlayerFromSession(io, sourceSession.id, socket.user.id);
@@ -12338,6 +12452,7 @@ function registerSocketServer(httpServer) {
                   joiningFee: rejoinJoiningFee,
                   prizePoolSummary,
                 });
+                const poolEliminationContext = buildPoolEliminationContextFields(session, poolProgress);
                 const intermediatePayload = {
                   session_id: sessionId,
                   server_time: new Date().toISOString(),
@@ -12355,6 +12470,8 @@ function registerSocketServer(httpServer) {
                   pool_round_no: poolProgress.currentRoundNo,
                   pool_scores_by_user: poolProgress.scoresByUser,
                   pool_eliminated_user_ids: poolProgress.eliminatedUserIds,
+                  pool_previous_eliminated_user_ids: poolEliminationContext.pool_previous_eliminated_user_ids,
+                  pool_newly_eliminated_user_ids: poolEliminationContext.pool_newly_eliminated_user_ids,
                   can_rejoin_table: rejoinContext.can_rejoin_table,
                   rejoin_threshold: rejoinContext.rejoin_threshold,
                   rejoin_candidate_user_ids: rejoinContext.rejoin_candidate_user_ids,
@@ -12381,10 +12498,12 @@ function registerSocketServer(httpServer) {
                   distribution,
                   state,
                   isFinal: true,
+                  isGameFinal: false,
                   finalizedResults: completeRoundResultsWithPool,
                   settlement: null,
                   winnerUserId,
                   declarerValid: false,
+                  previousPoolEliminatedUserIds: poolEliminationContext.previousPoolEliminatedUserIds,
                 });
 
                 await transitionToNextPoolRound(io, session, intermediatePayload, poolProgress);
