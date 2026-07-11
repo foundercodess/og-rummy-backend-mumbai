@@ -909,18 +909,15 @@ function buildDealPayload({ session, players, tossWinnerUserId, seed }) {
     distribution: {
       players: seats.map((player) => {
         const playerCards = handsByUser[player.user_id];
-        const suitGrouping = groupingService.buildSuitGroups(playerCards, normalizedWildJoker);
-        const submittedGroups = suitGrouping.groups.map((g) => ({
-          group_id: g.group_id,
-          cards: g.cards.map((c) => c.card_uid),
-        }));
+        const bestGrouping = groupingService.buildBestGrouping(playerCards, normalizedWildJoker);
+        const submittedGroups = groupingService.toSubmittedGroupsFromGrouping(bestGrouping);
         return {
           user_id: player.user_id,
           seat_no: player.seat_no,
           cards: playerCards,
-          auto_groups: suitGrouping,
+          auto_groups: bestGrouping,
           submitted_groups: submittedGroups,
-          auto_best_group: false,
+          auto_best_group: true,
           has_picked: false,
           first_turn_cycle_complete: false,
         };
@@ -1247,6 +1244,7 @@ async function emitDealFromPregame({
     ...(sessionForDeal.metadata || {}),
     phase: 'active',
     phase_updated_at: getNowIso(),
+    first_turn_user_id: firstTurnPlayer.user_id,
     toss: includeTossMetadata ? (tossPayload || dealPayload.toss) : null,
     distribution: dealPayload.distribution,
     deal_quality: dealPayload.distribution_quality || null,

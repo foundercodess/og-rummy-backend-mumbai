@@ -1574,6 +1574,22 @@ function hasOnlyZeroPointUngrouped(cards, wildRank) {
   return cards.every(c => isZeroPointUngrouped(c, wildRank));
 }
 
+function toSubmittedGroupsFromGrouping(grouping = {}) {
+  const groups = Array.isArray(grouping?.groups) ? grouping.groups : [];
+  return groups
+    .map((group, idx) => {
+      const cards = Array.isArray(group?.cards)
+        ? group.cards.map((card) => card?.card_uid).filter(Boolean)
+        : [];
+      if (cards.length === 0) return null;
+      return {
+        group_id: group?.group_id || idx + 1,
+        cards,
+      };
+    })
+    .filter(Boolean);
+}
+
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -1582,4 +1598,5 @@ module.exports = {
   evaluateSubmittedGrouping,
   computeDisplayPoint,
   applyGroupDisplayPoints,
+  toSubmittedGroupsFromGrouping,
 };

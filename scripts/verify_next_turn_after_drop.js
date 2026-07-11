@@ -2,25 +2,10 @@
 'use strict';
 
 const assert = require('assert');
-
-function nextTurnUserId(players, currentUserId, options = {}) {
-  const seats = [...(players || [])].sort((a, b) => a.seat_no - b.seat_no);
-  if (seats.length === 0) return null;
-
-  const currentId = Number(currentUserId);
-  const idx = seats.findIndex((p) => Number(p.user_id) === currentId);
-  if (idx >= 0) {
-    return seats[(idx + 1) % seats.length].user_id;
-  }
-
-  const pivotSeat = Number(options.currentSeatNo);
-  if (Number.isFinite(pivotSeat)) {
-    const next = seats.find((p) => Number(p.seat_no) > pivotSeat);
-    return (next ?? seats[0]).user_id;
-  }
-
-  return seats[0].user_id;
-}
+const {
+  anticlockwiseNextTurnUserId,
+  resolveNextDealFirstTurnUserId,
+} = require('../realtime/turnRotation');
 
 const active = [
   { user_id: 1, seat_no: 1 },
@@ -29,21 +14,34 @@ const active = [
 ];
 
 assert.strictEqual(
-  nextTurnUserId(active, 3, { currentSeatNo: 3 }),
+  anticlockwiseNextTurnUserId(active, 3, { currentSeatNo: 3 }),
   5,
-  'After seat-3 drop, turn should go to seat 5'
+  'After seat-3 drop, turn should go anticlockwise (higher seat) to seat 5'
 );
 
 assert.strictEqual(
-  nextTurnUserId(
+  anticlockwiseNextTurnUserId(
     active.filter((p) => p.user_id !== 1),
     1,
     { currentSeatNo: 1 }
   ),
   3,
-  'After seat-1 drop, turn should go to seat 3'
+  'After seat-1 drop, turn should go to the next higher active seat 3'
 );
 
-assert.strictEqual(nextTurnUserId(active, 1), 3, 'Normal rotation from seat 1');
+assert.strictEqual(
+  anticlockwiseNextTurnUserId(active, 1),
+  3,
+  'Normal anticlockwise rotation from seat 1 goes to seat 3'
+);
+
+assert.strictEqual(
+  resolveNextDealFirstTurnUserId(
+    { metadata: { first_turn_user_id: 3 } },
+    active
+  ),
+  5,
+  'Next deal opener rotates anticlockwise from previous deal opener'
+);
 
 console.log('verify_next_turn_after_drop: PASS');

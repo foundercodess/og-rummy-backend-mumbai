@@ -30,6 +30,10 @@ const { socketAuth } = require('./socketAuth');
 const socketRegistry = require('./socketRegistry');
 const { emitActiveNotices, setSocketIO } = require('./socketBus');
 const { startPregame, cancelPregame } = require('./pregameOrchestrator');
+const {
+  anticlockwiseNextTurnUserId,
+  resolveNextDealFirstTurnUserId,
+} = require('./turnRotation');
 const { setTurnTimerStarter } = require('./turnSchedulerBridge');
 const {
   instrumentSocket,
@@ -273,23 +277,7 @@ function isLowConfidenceGrouping(summary = {}) {
 }
 
 function nextTurnUserId(players, currentUserId, options = {}) {
-  const seats = [...(players || [])].sort((a, b) => a.seat_no - b.seat_no);
-  if (seats.length === 0) return null;
-
-  const currentId = Number(currentUserId);
-  const idx = seats.findIndex((p) => Number(p.user_id) === currentId);
-  if (idx >= 0) {
-    return seats[(idx + 1) % seats.length].user_id;
-  }
-
-  // Current player may already be removed (drop/pack/timeout) — advance from their seat.
-  const pivotSeat = Number(options.currentSeatNo);
-  if (Number.isFinite(pivotSeat)) {
-    const next = seats.find((p) => Number(p.seat_no) > pivotSeat);
-    return (next ?? seats[0]).user_id;
-  }
-
-  return seats[0].user_id;
+  return anticlockwiseNextTurnUserId(players, currentUserId, options);
 }
 
 function getEliminatedUserIdSet(metadata = {}) {
@@ -1988,9 +1976,12 @@ async function transitionToNextDeal(io, session, snapshot) {
   io.to(sessionRoom(sessionId)).emit('game:result', payload);
   await emitSessionState(io, sessionId);
 
+  const nextDealParticipants = getActivePlayers(session);
+  const rotatedFirstTurnUserId = resolveNextDealFirstTurnUserId(session, nextDealParticipants);
+
   startPregame(io, sessionId, {
     interDealFastStart: true,
-    preferredFirstTurnUserId: snapshot.winner_user_id,
+    preferredFirstTurnUserId: rotatedFirstTurnUserId || null,
     countdownSeconds: 5,
   }).catch((pregameErr) => {
     errorGame(sessionId, `Failed to start next deal pregame: ${pregameErr.message}`);
@@ -5769,6 +5760,16 @@ async function transitionToNextPoolRound(io, session, payload, roundProgress) {
       await emitPendingRejoinGameForUser(io, uid, 'pool_round_eliminated');
     })
   );
+
+  const nextDealParticipants = (session.players || []).filter((player) => {
+    const userId = Number(player.user_id);
+    if (Number.isNaN(userId)) return false;
+    if (eliminatedSet.has(userId)) return false;
+    if (player?.status === 'left' || player?.status === 'eliminated') return false;
+    return true;
+  });
+  const rotatedFirstTurnUserId = resolveNextDealFirstTurnUserId(session, nextDealParticipants);
+
   if (splitPlan.can_split === true) {
     const splitStartEndsAt = new Date(Date.now() + (POOL_NEXT_DEAL_COUNTDOWN_SECONDS * 1000)).toISOString();
     clearPoolSplitStartTimer(sessionId);
@@ -5782,14 +5783,14 @@ async function transitionToNextPoolRound(io, session, payload, roundProgress) {
       payload: resultPayload,
       round_progress: roundProgress,
       split_plan: splitPlan,
-      preferred_first_turn_user_id: payload?.winner_user_id || null,
+      preferred_first_turn_user_id: rotatedFirstTurnUserId || null,
       split_start_ends_at: splitStartEndsAt,
       startTimeoutHandle,
     });
     await continuePoolDealFlow(
       io,
       sessionId,
-      payload?.winner_user_id || null,
+      rotatedFirstTurnUserId || null,
       'split_available_countdown',
       {
         preserveSplitStartWindow: true,
@@ -5797,7 +5798,7 @@ async function transitionToNextPoolRound(io, session, payload, roundProgress) {
       }
     );
   } else {
-    await continuePoolDealFlow(io, sessionId, payload?.winner_user_id || null, 'split_not_eligible', {
+    await continuePoolDealFlow(io, sessionId, rotatedFirstTurnUserId || null, 'split_not_eligible', {
       countdownSeconds: POOL_NEXT_DEAL_COUNTDOWN_SECONDS,
     });
   }
