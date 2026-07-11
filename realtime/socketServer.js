@@ -1043,6 +1043,7 @@ function buildLastDealResultPayload(session = {}, enrichedDealScores = []) {
   }
 
   if (!players || players.length === 0) {
+    const totalDeals = resolveTotalDeals(session);
     players = buildDeclarationTablePlayers({
       session,
       distribution: metadata.distribution || null,
@@ -1051,6 +1052,7 @@ function buildLastDealResultPayload(session = {}, enrichedDealScores = []) {
         declareByUserId: lastDeal.declare_by_user_id || null,
       },
       isFinal: true,
+      isGameFinal: dealNo >= totalDeals,
       finalizedResults: lastDeal.results || [],
       settlement: null,
       winnerUserId: lastDeal.winner_user_id,
@@ -1120,6 +1122,7 @@ function buildLastPoolRoundResultPayload(session = {}) {
         declareByUserId: metaResult.declare_by_user_id || null,
       },
       isFinal: true,
+      isGameFinal: metaResult?.is_final === true,
       finalizedResults,
       settlement: null,
       winnerUserId,
@@ -1506,6 +1509,7 @@ async function tryTransitionPoolRoundAfterSinglePlayerRemaining(
     distribution: session.metadata?.distribution || null,
     state: { responses: new Map(), declareByUserId: null },
     isFinal: true,
+    isGameFinal: false,
     finalizedResults: roundResultsWithPool,
     settlement: null,
     winnerUserId,
@@ -1950,6 +1954,7 @@ async function transitionToNextDeal(io, session, snapshot) {
     distribution: session.metadata?.distribution || null,
     state: { responses: new Map(), declareByUserId: snapshot.declare_by_user_id || null },
     isFinal: true,
+    isGameFinal: false,
     finalizedResults: latestDeal.results,
     settlement: null,
     winnerUserId: snapshot.winner_user_id,
@@ -2077,6 +2082,13 @@ function isFirstDropEligible(playerDistribution) {
   if (playerDistribution.has_picked === true) return false;
   if (playerDistribution.first_turn_cycle_complete === true) return false;
   return true;
+}
+
+function resolveFirstRoundNoChanceDeclarePenalty(points, playerDistribution) {
+  if (!isFirstDropEligible(playerDistribution)) return points;
+  const numericPoints = Number(points);
+  if (!Number.isFinite(numericPoints) || numericPoints <= 0) return points;
+  return Math.min(MAX_ROUND_LOSS_POINTS, Math.ceil(numericPoints / 2));
 }
 
 function markDepartingPlayerFirstTurnCycleComplete(playersDistribution, departingUserId) {
@@ -3761,34 +3773,60 @@ function isPlayerDropped(player, playerDistribution, result = null) {
   );
 }
 
+function isPlayerInactiveForDeclaration(session, player, distribution) {
+  const userId = Number(player?.user_id);
+  if (Number.isNaN(userId)) return false;
+  const playerDistribution = getPlayerDistribution(distribution, userId);
+  if (isPlayerDropped(player, playerDistribution)) return true;
+  if (getEliminatedUserIdSet(session?.metadata || {}).has(userId)) return true;
+  if (getTimeoutEliminatedUserIdSet(session?.metadata || {}).has(userId)) return true;
+  if (String(player?.status || '').toLowerCase() === 'eliminated') return true;
+  if (player?.metadata?.elimination_reason === 'pool_limit') return true;
+  return false;
+}
+
 function prefillDroppedPlayersInDeclareResponses(session, distribution, players, responses, submittedAt) {
+  prefillInactivePlayersInDeclareResponses(session, distribution, players, responses, submittedAt);
+}
+
+function prefillInactivePlayersInDeclareResponses(session, distribution, players, responses, submittedAt) {
   if (!distribution || !responses) return;
+  const wildJoker = distribution?.wild_joker || null;
   (Array.isArray(players) ? players : []).forEach((player) => {
     const userId = player?.user_id;
     if (userId == null || responses.has(userId)) return;
+    if (!isPlayerInactiveForDeclaration(session, player, distribution)) return;
     const playerDistribution = getPlayerDistribution(distribution, userId);
-    if (!isPlayerDropped(player, playerDistribution)) return;
+    const playerCards = playerDistribution?.cards || [];
+    const autoGrouping = groupingService.buildBestGrouping(playerCards, wildJoker);
     responses.set(userId, {
       submitted_at: submittedAt || new Date().toISOString(),
       auto: true,
-      groups: [],
+      groups: toSubmittedGroupsFromGrouping(autoGrouping),
     });
   });
 }
 
 function resolvePlayerStatus({
   isFinal = false,
+  isGameFinal = null,
   isDropped = false,
   isWinner = false,
   submitted = false,
   userId = null,
   declareByUserId = null,
   declarerValid = null,
+  mode = null,
 }) {
   if (isDropped) return 'dropped';
   if (isFinal !== true) return submitted ? 'submitted' : 'pending';
+  const gameFinal = isGameFinal ?? true;
   if (userId === declareByUserId && declarerValid === false) return 'invalid_declaration';
-  if (isWinner) return 'won';
+  if (isWinner) {
+    if (gameFinal) return 'won';
+    if (mode === 'pool' || isDealLikeMode(mode)) return 'deal_winner';
+    return 'won';
+  }
   return 'lost';
 }
 
@@ -3810,6 +3848,8 @@ function resolveStatusColor(playerStatus = null) {
     case 'submitted':
       return '#2563EB';
     case 'won':
+    case 'deal_winner':
+    case 'round_winner':
       return '#16A34A';
     case 'tie':
       return '#0EA5E9';
@@ -3835,12 +3875,14 @@ function buildDeclarationTablePlayers({
   distribution,
   state,
   isFinal = false,
+  isGameFinal = null,
   finalizedResults = [],
   settlement = null,
   winnerUserId = null,
   declarerValid = null,
 }) {
   const mode = resolveSessionGameMode(session);
+  const gameFinal = isGameFinal ?? isFinal;
   const players = Array.isArray(session?.players) ? session.players : [];
   const wildJoker = distribution?.wild_joker || null;
   const resultByUserId = new Map((finalizedResults || []).map((result) => [result.user_id, result]));
@@ -3857,21 +3899,41 @@ function buildDeclarationTablePlayers({
     const settlementEntry = settlementByUserId.get(player.user_id) || null;
     const isWinner = result?.is_winner ?? (isFinal ? player.user_id === winnerUserId : null);
     const isDropped = isPlayerDropped(player, playerDistribution, result);
+    const isInactiveForDeclare = isPlayerInactiveForDeclaration(session, player, distribution);
     const playerStatus = resolvePlayerStatus({
       isFinal,
+      isGameFinal: gameFinal,
       isDropped,
       isWinner,
       submitted,
       userId: player.user_id,
       declareByUserId: state?.declareByUserId,
       declarerValid,
+      mode,
     });
     const submissionStatus = resolveSubmissionStatus({
       isFinal,
       submitted,
       submissionMode: result?.submission_mode ?? submissionMode,
     });
-    const resolvedPlayerStatus = result?.player_status ?? playerStatus;
+    const resolvedPlayerStatus = (() => {
+      if (!isFinal) {
+        if (isInactiveForDeclare) {
+          return resolveLivePlayerStatus(session, player);
+        }
+        return result?.player_status ?? playerStatus;
+      }
+      const fromResult = result?.player_status;
+      if (
+        fromResult === 'eliminated'
+        || fromResult === 'timeout'
+        || fromResult === 'dropped'
+        || fromResult === 'invalid_declaration'
+      ) {
+        return fromResult;
+      }
+      return playerStatus;
+    })();
     let roundPoints = result?.round_points ?? result?.points ?? null;
     let totalScore = result?.total_score
       ?? (mode === 'pool' ? (result?.cumulative_points ?? null) : null);
@@ -3901,7 +3963,7 @@ function buildDeclarationTablePlayers({
     } else if (submitted) {
       cards = playerCards;
       const submittedGroups = playerResponse?.groups || [];
-      if (isDropped && submittedGroups.length === 0) {
+      if ((isDropped || isInactiveForDeclare) && submittedGroups.length === 0) {
         grouping = groupingService.buildBestGrouping(playerCards, wildJoker);
       } else {
         grouping = groupingService.evaluateSubmittedGrouping(playerCards, wildJoker, submittedGroups);
@@ -3986,6 +4048,7 @@ function attachWonAmountToResults(finalizedResults = [], settlement = null) {
 function buildResultShapeFieldsForDeclareState({
   session,
   isFinal = false,
+  isGameFinal = null,
   reason = null,
   winnerUserId = null,
   declarerValid = null,
@@ -3994,6 +4057,7 @@ function buildResultShapeFieldsForDeclareState({
   state = null,
 }) {
   const mode = resolveSessionGameMode(session);
+  const gameFinal = isGameFinal ?? isFinal;
   const entryFee = roundCurrency(Number(session?.contest?.entry) || 0);
   const poolLimit = mode === 'pool' ? resolvePoolLimit(session) : null;
   const poolScoresByUser = mode === 'pool'
@@ -4037,7 +4101,7 @@ function buildResultShapeFieldsForDeclareState({
   });
   return {
     status: isFinal ? 'completed' : 'declaring',
-    is_final: isFinal === true,
+    is_final: gameFinal === true,
     reason,
     declare_by_user_id: state?.declareByUserId ?? null,
     declare_valid: declarerValid,
@@ -4076,11 +4140,13 @@ function buildDeclarationStatePayload({
   distribution = null,
   reason = null,
   isFinal = false,
+  isGameFinal = null,
   finalizedResults = [],
   settlement = null,
   winnerUserId = null,
   declarerValid = null,
 }) {
+  const gameFinal = isGameFinal ?? isFinal;
   const allPlayers = Array.isArray(session?.players) ? session.players : [];
   const participantUserIds = Array.isArray(state?.participantUserIds) && state.participantUserIds.length > 0
     ? state.participantUserIds
@@ -4098,6 +4164,7 @@ function buildDeclarationStatePayload({
   const resultShapeFields = buildResultShapeFieldsForDeclareState({
     session,
     isFinal,
+    isGameFinal: gameFinal,
     reason,
     winnerUserId,
     declarerValid,
@@ -4128,6 +4195,7 @@ function buildDeclarationStatePayload({
       distribution: activeDistribution,
       state,
       isFinal,
+      isGameFinal: gameFinal,
       finalizedResults,
       settlement,
       winnerUserId,
@@ -4144,6 +4212,7 @@ function emitDeclarationState(io, session, state, options = {}) {
     distribution: options.distribution,
     reason: options.reason || null,
     isFinal: options.isFinal === true,
+    isGameFinal: options.isGameFinal,
     finalizedResults: options.finalizedResults || [],
     settlement: options.settlement || null,
     winnerUserId: options.winnerUserId || null,
@@ -5666,10 +5735,13 @@ async function transitionToNextPoolRound(io, session, payload, roundProgress) {
   delete nextMetadata.turn_timeout_eliminated_user_ids;
   const splitPlan = buildPoolSplitPlan(session, roundProgress, payload);
   console.log("splitPlan", splitPlan);
+  const splitCandidateUserIds = splitPlan.can_split === true
+    ? (splitPlan.active_user_ids || [])
+    : [];
   const resultPayload = {
     ...payload,
     can_split: splitPlan.can_split === true,
-    split_candidate_user_ids: splitPlan.can_split === true ? (splitPlan.active_user_ids || []) : [],
+    split_candidate_user_ids: splitCandidateUserIds,
   };
   nextMetadata.result = resultPayload;
 
@@ -9028,6 +9100,18 @@ function registerSocketServer(httpServer) {
         if (player.user_id === declarerUserId && !declarerValid) {
           points = 80;
           logGame(sessionId, `Applying 80pt penalty to invalid declarer uid=${player.user_id}`);
+        } else if (!alreadyScoredThisDeal && !isDropped && !isTimeoutEliminated) {
+          const halfPenalty = resolveFirstRoundNoChanceDeclarePenalty(
+            points,
+            playerDistribution
+          );
+          if (halfPenalty !== points) {
+            logGame(
+              sessionId,
+              `No-turn half penalty for uid=${player.user_id}: ${points} -> ${halfPenalty}`
+            );
+            points = halfPenalty;
+          }
         }
 
         if (!state.responses.has(player.user_id)) {
@@ -9070,30 +9154,47 @@ function registerSocketServer(httpServer) {
         logGame(sessionId, `Declarer valid — winner=uid=${winnerUserId}`);
       }
 
-      let finalizedResults = results.map((item) => ({
-        ...item,
-        is_winner: item.user_id === winnerUserId,
-        player_status: resolvePlayerStatus({
-          isFinal: true,
-          isDropped: item.dropped === true,
-          isWinner: item.user_id === winnerUserId,
-          userId: item.user_id,
-          declareByUserId: declarerUserId,
-          declarerValid,
-        }),
-        status_color: resolveStatusColor(resolvePlayerStatus({
-          isFinal: true,
-          isDropped: item.dropped === true,
-          isWinner: item.user_id === winnerUserId,
-          userId: item.user_id,
-          declareByUserId: declarerUserId,
-          declarerValid,
-        })),
-      }));
-
       const mode = resolveSessionGameMode(session);
       const totalDeals = resolveTotalDeals(session);
       const currentDeal = resolveCurrentDeal(session);
+
+      const preliminaryFinalized = results.map((item) => ({
+        ...item,
+        is_winner: item.user_id === winnerUserId,
+      }));
+
+      let isGameFinalForStatus = true;
+      if (isDealLikeMode(mode) && currentDeal < totalDeals) {
+        isGameFinalForStatus = false;
+      } else if (mode === 'pool') {
+        const poolProgressPreview = buildPoolRoundProgress(session, preliminaryFinalized);
+        isGameFinalForStatus = poolProgressPreview.activeUserIds.length <= 1;
+      }
+
+      let finalizedResults = preliminaryFinalized.map((item) => ({
+        ...item,
+        player_status: resolvePlayerStatus({
+          isFinal: true,
+          isGameFinal: isGameFinalForStatus,
+          isDropped: item.dropped === true,
+          isWinner: item.is_winner === true,
+          userId: item.user_id,
+          declareByUserId: declarerUserId,
+          declarerValid,
+          mode,
+        }),
+        status_color: resolveStatusColor(resolvePlayerStatus({
+          isFinal: true,
+          isGameFinal: isGameFinalForStatus,
+          isDropped: item.dropped === true,
+          isWinner: item.is_winner === true,
+          userId: item.user_id,
+          declareByUserId: declarerUserId,
+          declarerValid,
+          mode,
+        })),
+      }));
+
       const dealSnapshot = buildDealResultSnapshot({
         dealNo: currentDeal,
         reason,
@@ -9112,6 +9213,7 @@ function registerSocketServer(httpServer) {
           distribution,
           reason,
           isFinal: true,
+          isGameFinal: false,
           finalizedResults,
           settlement: null,
           winnerUserId,
@@ -9273,6 +9375,7 @@ function registerSocketServer(httpServer) {
             distribution,
             state,
             isFinal: true,
+            isGameFinal: false,
             finalizedResults: completeRoundResultsWithPool,
             settlement: null,
             winnerUserId,
@@ -9283,6 +9386,7 @@ function registerSocketServer(httpServer) {
             distribution,
             reason,
             isFinal: true,
+            isGameFinal: false,
             finalizedResults: completeRoundResultsWithPool,
             settlement: null,
             winnerUserId,
@@ -10194,7 +10298,11 @@ function registerSocketServer(httpServer) {
         }
         console.log(`[SOCKET] uid=${socket.user.id} joined session=${session.id} status=${session.status}`);
 
-        callback({ success: true, session: buildJoinAckSessionPayload(liveSession) });
+        const joinAckBase = await gameplayService.getSessionState(liveSession.id);
+        const joinAckSession = enrichSessionDistributionWithGroupingSnapshots(
+          joinAckBase || liveSession
+        );
+        callback({ success: true, session: buildJoinAckSessionPayload(joinAckSession) });
       } catch (err) {
         console.warn(`[SOCKET] uid=${socket.user.id} session:join failed:`, err.message);
         callback({ success: false, message: err.message });

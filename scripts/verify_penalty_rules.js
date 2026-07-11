@@ -15,7 +15,7 @@ function createIso(offsetMs = 0) {
 function loadPenaltyHarness() {
   const filePath = path.join(__dirname, '..', 'realtime', 'socketServer.js');
   const source = fs.readFileSync(filePath, 'utf8');
-  const instrumented = `${source}\nmodule.exports.__test = { resolveDropLossPoints, buildPlayerStatusPayload, isFirstDropEligible, buildSessionPrizePoolFields };`;
+  const instrumented = `${source}\nmodule.exports.__test = { resolveDropLossPoints, buildPlayerStatusPayload, isFirstDropEligible, resolveFirstRoundNoChanceDeclarePenalty, buildSessionPrizePoolFields };`;
   const noop = () => {};
   const module = { exports: {} };
 
@@ -200,6 +200,49 @@ function testLeavePenalty(harness) {
   assert(harness.resolveDropLossPoints(leftPool, 11) === 80, 'Expected leave penalty = 80');
 }
 
+function testNoChanceDeclareHalfPenalty(harness) {
+  const noChanceDistribution = {
+    user_id: 11,
+    has_picked: false,
+    first_turn_cycle_complete: false,
+  };
+  const hadTurnDistribution = {
+    user_id: 12,
+    has_picked: false,
+    first_turn_cycle_complete: true,
+  };
+  const pickedDistribution = {
+    user_id: 13,
+    has_picked: true,
+    first_turn_cycle_complete: false,
+  };
+
+  assert(
+    harness.resolveFirstRoundNoChanceDeclarePenalty(42, noChanceDistribution) === 21,
+    'Expected no-turn declare penalty to halve 42 -> 21'
+  );
+  assert(
+    harness.resolveFirstRoundNoChanceDeclarePenalty(41, noChanceDistribution) === 21,
+    'Expected no-turn declare penalty to ceil 41/2 -> 21'
+  );
+  assert(
+    harness.resolveFirstRoundNoChanceDeclarePenalty(80, noChanceDistribution) === 40,
+    'Expected no-turn declare penalty to halve capped 80 -> 40'
+  );
+  assert(
+    harness.resolveFirstRoundNoChanceDeclarePenalty(42, hadTurnDistribution) === 42,
+    'Expected full penalty when player turn cycle completed without pick'
+  );
+  assert(
+    harness.resolveFirstRoundNoChanceDeclarePenalty(42, pickedDistribution) === 42,
+    'Expected full penalty when player already picked'
+  );
+  assert(
+    harness.resolveFirstRoundNoChanceDeclarePenalty(0, noChanceDistribution) === 0,
+    'Expected zero points to remain zero'
+  );
+}
+
 function testDealsPrizePoolUsesTableSeats(harness) {
   const session = {
     max_players: 2,
@@ -219,6 +262,7 @@ function testDealsPrizePoolUsesTableSeats(harness) {
 function main() {
   const harness = loadPenaltyHarness();
   testPoolDropPenalties(harness);
+  testNoChanceDeclareHalfPenalty(harness);
   testDealsDropPenalty(harness);
   testDealsPrizePoolUsesTableSeats(harness);
   testLeavePenalty(harness);

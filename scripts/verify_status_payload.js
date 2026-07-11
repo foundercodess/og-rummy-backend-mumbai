@@ -99,6 +99,14 @@ function main() {
   assert(resolvePlayerStatus({ isFinal: false, submitted: true }) === 'submitted', 'Expected submitted player_status');
   assert(resolvePlayerStatus({ isFinal: true, isWinner: true }) === 'won', 'Expected won player_status');
   assert(
+    resolvePlayerStatus({ isFinal: true, isGameFinal: false, isWinner: true, mode: 'deals_2' }) === 'deal_winner',
+    'Expected deal_winner player_status for intermediate deal'
+  );
+  assert(
+    resolvePlayerStatus({ isFinal: true, isGameFinal: false, isWinner: true, mode: 'pool' }) === 'deal_winner',
+    'Expected deal_winner player_status for intermediate pool deal'
+  );
+  assert(
     resolvePlayerStatus({ isFinal: true, userId: 7, declareByUserId: 7, declarerValid: false }) === 'invalid_declaration',
     'Expected invalid_declaration player_status'
   );
@@ -111,6 +119,8 @@ function main() {
   assert(resolveStatusColor('pending') === '#F59E0B', 'Expected pending color');
   assert(resolveStatusColor('submitted') === '#2563EB', 'Expected submitted color');
   assert(resolveStatusColor('won') === '#16A34A', 'Expected won color');
+  assert(resolveStatusColor('deal_winner') === '#16A34A', 'Expected deal_winner color');
+  assert(resolveStatusColor('round_winner') === '#16A34A', 'Expected round_winner color');
   assert(resolveStatusColor('lost') === '#DC2626', 'Expected lost color');
   assert(resolveStatusColor('invalid_declaration') === '#EA580C', 'Expected invalid declaration color');
   assert(resolveStatusColor('dropped') === '#6B7280', 'Expected dropped color');

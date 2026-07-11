@@ -392,6 +392,123 @@ function verifyTwoSequencesZeroSetPoints() {
   );
 }
 
+function verifyAceWildFinishReadyScreenshotCase() {
+  const wildJoker = card('wA', 'A', 'diamonds', 0, true);
+  const hand14 = [
+    card('h9a', '9', 'hearts', 9),
+    card('h10', '10', 'hearts', 10),
+    card('hJ', 'J', 'hearts', 10),
+    card('s8', '8', 'spades', 8),
+    card('s9', '9', 'spades', 9),
+    card('s10', '10', 'spades', 10),
+    card('c10', '10', 'clubs', 10),
+    card('sA1', 'A', 'spades', 10),
+    card('sA2', 'A', 'spades', 10),
+    card('h8', '8', 'hearts', 8),
+    card('h9b', '9', 'hearts', 9),
+    card('cA', 'A', 'clubs', 10),
+    card('h2', '2', 'hearts', 2),
+    card('h3', '3', 'hearts', 3),
+  ];
+
+  const trappedLayout = groupingService.evaluateSubmittedGrouping(hand14, wildJoker, [
+    { group_id: 1, cards: ['h9a', 'h10', 'hJ'] },
+    { group_id: 2, cards: ['s8', 's9', 's10'] },
+    { group_id: 3, cards: ['c10', 'sA1', 'sA2'] },
+    { group_id: 4, cards: ['h8', 'h9b', 'cA'] },
+    { group_id: 5, cards: ['h2', 'h3'] },
+  ]);
+  const manualFinishLayout = groupingService.evaluateSubmittedGrouping(hand14, wildJoker, [
+    { group_id: 1, cards: ['h9a', 'h10', 'hJ'] },
+    { group_id: 2, cards: ['s8', 's9', 's10'] },
+    { group_id: 3, cards: ['c10'] },
+    { group_id: 4, cards: ['cA', 'h8', 'sA1', 'h9b'] },
+    { group_id: 5, cards: ['sA2', 'h2', 'h3'] },
+  ]);
+  const bestGrouping = groupingService.buildBestGrouping(hand14, wildJoker);
+
+  assert(trappedLayout.summary.display_point === 5, 'Expected trapped min-display layout to score 5');
+  assert(manualFinishLayout.summary.display_point === 10, 'Expected manual finish layout to show 10 on loose 10C');
+  assert(
+    bestGrouping.summary.can_finish_after_one_discard === true,
+    'Expected finish-ready best grouping for 14-card turn'
+  );
+  assert(
+    bestGrouping.summary.finish_card_uid === 'c10',
+    `Expected 10C as finish card, got ${bestGrouping.summary.finish_card_uid}`
+  );
+  assert(
+    bestGrouping.summary.declare_display_after_finish === 0,
+    'Expected zero declare score after finishing'
+  );
+  assert(
+    (bestGrouping.ungrouped_cards || []).length === 1
+      && bestGrouping.ungrouped_cards[0]?.card_uid === 'c10',
+    'Expected lone ungrouped 10C for finish'
+  );
+  assert(
+    bestGrouping.summary.display_point === manualFinishLayout.summary.display_point,
+    `Expected finish-aware display (${bestGrouping.summary.display_point}) to match manual finish layout (10)`
+  );
+
+  const validMeldUids = new Set();
+  (bestGrouping.groups || [])
+    .filter((group) => group.is_valid_meld === true)
+    .forEach((group) => {
+      (group.cards || []).forEach((c) => validMeldUids.add(c.card_uid));
+    });
+  assert(!validMeldUids.has('c10'), 'Expected finish card to stay out of valid melds');
+  assert(bestGrouping.summary.pure_sequence_count >= 2, 'Expected at least two pure sequences');
+  assert(bestGrouping.summary.sequence_count >= 2, 'Expected at least two sequences');
+}
+
+function verifyFinishReadyLoneLowCardCase() {
+  const wildJoker = { rank: '7', card_id: 'h7' };
+  const cards = [
+    card('ps4', '4', 'spades', 4),
+    card('ps5', '5', 'spades', 5),
+    card('ps6', '6', 'spades', 6),
+    card('d10', '10', 'diamonds', 10),
+    card('jas', 'A', 'spades', 10, true),
+    card('dq', 'Q', 'diamonds', 10),
+    card('dk', 'K', 'diamonds', 10),
+    card('s2', '2', 'spades', 2),
+    card('d2', '2', 'diamonds', 2),
+    card('c2', '2', 'clubs', 2),
+    card('h5', '5', 'hearts', 5),
+    card('c5', '5', 'clubs', 5),
+    card('jad', 'A', 'diamonds', 10, true),
+    card('c4lone', '4', 'clubs', 4),
+  ];
+  const bestGrouping = groupingService.buildBestGrouping(cards, wildJoker);
+  assert(
+    bestGrouping.summary.can_finish_after_one_discard === true,
+    'Expected finish-ready grouping for lone leftover finish card'
+  );
+  assert(
+    ['h5', 'c4lone'].includes(bestGrouping.summary.finish_card_uid),
+    `Expected a valid finish card, got ${bestGrouping.summary.finish_card_uid}`
+  );
+  assert(
+    (bestGrouping.ungrouped_cards || []).length === 1,
+    'Expected exactly one loose finish card on a 14-card turn'
+  );
+  assert(
+    bestGrouping.summary.declare_display_after_finish === 0,
+    'Expected zero declare score after finishing'
+  );
+  const validMeldUids = new Set();
+  (bestGrouping.groups || [])
+    .filter((group) => group.is_valid_meld === true)
+    .forEach((group) => {
+      (group.cards || []).forEach((c) => validMeldUids.add(c.card_uid));
+    });
+  assert(
+    !validMeldUids.has(bestGrouping.summary.finish_card_uid),
+    'Expected finish card to stay out of valid melds'
+  );
+}
+
 function main() {
   const wildJoker = card('WJ', '5', null, 0, true);
 
@@ -454,6 +571,8 @@ function main() {
   verifyUngroupedClustersSequenceGap();
   verifyWildJokerSplitLowersPenalty();
   verifyDualJokerKingSetSplitScreenshotCase();
+  verifyAceWildFinishReadyScreenshotCase();
+  verifyFinishReadyLoneLowCardCase();
   verifyNoPureSequenceKeepsFullDisplayPoint();
   verifyPurePlusSetCountsSetPoints();
   verifyTwoSequencesZeroSetPoints();

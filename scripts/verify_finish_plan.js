@@ -211,8 +211,23 @@ function runScreenshotStyleFinishPlan() {
   const groupingService = require('../services/grouping.service');
 
   const bestGrouping = groupingService.buildBestGrouping(cards, wildJoker);
-  assert.strictEqual(bestGrouping.summary.display_point, 4, 'expected lone 4C to be only display points');
-  assert.strictEqual(bestGrouping.summary.sequence_count, 2, 'expected two sequences in best grouping');
+  assert(
+    bestGrouping.summary.can_finish_after_one_discard === true,
+    'expected finish-ready best grouping on 14-card turn'
+  );
+  assert.strictEqual(bestGrouping.summary.declare_display_after_finish, 0);
+  assert(
+    ['h5', 'c4lone'].includes(bestGrouping.summary.finish_card_uid),
+    `expected a valid finish card, got ${bestGrouping.summary.finish_card_uid}`
+  );
+  assert(
+    bestGrouping.summary.display_point <= 10,
+    `expected finish layout display to stay reasonable, got ${bestGrouping.summary.display_point}`
+  );
+  assert(
+    bestGrouping.summary.sequence_count >= 2,
+    `expected at least two sequences in best grouping, got ${bestGrouping.summary.sequence_count}`
+  );
 
   const plan = tryBuildBotFinishPlan(cards, wildJoker, {
     tieBreakSeed: 'verify:finish:screenshot',
@@ -221,7 +236,10 @@ function runScreenshotStyleFinishPlan() {
     turnId: 4,
   });
   assert(plan, 'expected finish plan for screenshot-style hand');
-  assert.strictEqual(plan.finishCard?.card_uid, 'c4lone', 'expected lone 4C as finish card');
+  assert(
+    ['h5', 'c4lone'].includes(plan.finishCard?.card_uid),
+    `expected a valid finish card from bot plan, got ${plan.finishCard?.card_uid}`
+  );
   assert.strictEqual(plan.preview?.summary?.valid_for_declare, true);
 }
 

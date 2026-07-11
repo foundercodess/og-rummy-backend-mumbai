@@ -27,6 +27,8 @@ const MAX_SET_SIZE = 4;
 const MAX_SEQ_SIZE = 5;
 const MAX_TOTAL_GROUPS = 6;
 const MAX_OPTIMAL_SEARCH_CARDS = 14;
+const FINISH_HAND_CARD_COUNT = 14;
+const DECLARE_HAND_CARD_COUNT = 13;
 
 const GROUP_TYPE_PRIORITY = {
   pure_sequence: 0, impure_sequence: 1, set: 2,
@@ -1097,6 +1099,184 @@ function _searchOptimalPartition(hand, wildRank, melds) {
   return { groups: bestGroups, ungrouped: bestUngrouped };
 }
 
+function _resolveOptimalTrace(hand, wildRank) {
+  const melds = _enumerateMelds(hand, wildRank);
+  if (hand.length <= MAX_OPTIMAL_SEARCH_CARDS) {
+    return _searchOptimalPartition(hand, wildRank, melds);
+  }
+  const { dp, par, idx } = _runDP(hand, wildRank, melds);
+  let trace = _pickBestDpTrace(hand, wildRank, dp, par, idx);
+  trace = _refineWithForcedJokerMelds(hand, wildRank, trace);
+  return trace;
+}
+
+function _isFinishReadyAfterDiscard(hand, wildJoker, groups, finishCard) {
+  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  if (!finishCard?.card_uid) return false;
+  const finishUid = String(finishCard.card_uid).trim();
+  for (const group of groups) {
+    if ((group.cards || []).some((card) => String(card?.card_uid || '').trim() === finishUid)) {
+      return false;
+    }
+  }
+  const nextHand = hand.filter((card) => String(card?.card_uid || '').trim() !== finishUid);
+  if (nextHand.length !== DECLARE_HAND_CARD_COUNT) return false;
+  const submitted = groups.map((group, idx) => ({
+    group_id: idx + 1,
+    cards: (group.cards || []).map((card) => card.card_uid),
+  }));
+  try {
+    const evaluated = evaluateSubmittedGrouping(nextHand, wildJoker, submitted);
+    return evaluated.summary.valid_for_declare === true
+      && Number(evaluated.summary.display_point) === 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+function _pickBetterFinishTrace(hand, wildJoker, left, right) {
+  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  if (!left) return right;
+  if (!right) return left;
+  const leftValue = cardPoints(left.ungrouped[0], wildRank);
+  const rightValue = cardPoints(right.ungrouped[0], wildRank);
+  if (leftValue !== rightValue) return leftValue > rightValue ? left : right;
+  const leftTie = _traceTieBreak(hand, wildRank, left.groups, left.ungrouped);
+  const rightTie = _traceTieBreak(hand, wildRank, right.groups, right.ungrouped);
+  return _compareTieBreak(leftTie, rightTie) >= 0 ? left : right;
+}
+
+function _searchFinishReadyPartition(hand, wildJoker, melds) {
+  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const n = hand.length;
+  const meldsByBit = _indexMeldsByBit(melds, n);
+  const fullMask = (1 << n) - 1;
+  const groups = [];
+  const ungrouped = [];
+  let best = null;
+  let bestFinishValue = -1;
+  let bestTie = null;
+
+  const consider = () => {
+    if (ungrouped.length !== 1) return false;
+    const finishCard = ungrouped[0];
+    if (!_isFinishReadyAfterDiscard(hand, wildJoker, groups, finishCard)) return false;
+    const finishValue = cardPoints(finishCard, wildRank);
+    const tie = _traceTieBreak(hand, wildRank, groups, ungrouped);
+    if (
+      finishValue > bestFinishValue
+      || (finishValue === bestFinishValue && _compareTieBreak(tie, bestTie) > 0)
+    ) {
+      bestFinishValue = finishValue;
+      bestTie = tie;
+      best = {
+        groups: groups.map((g) => ({ type: g.type, cards: g.cards.slice() })),
+        ungrouped: ungrouped.slice(),
+        finishCard,
+      };
+    }
+    return false;
+  };
+
+  const dfs = (remainingMask) => {
+    if (remainingMask === 0) return consider();
+    const i = _lowestBitIndex(remainingMask);
+    const bit = 1 << i;
+
+    ungrouped.push(hand[i]);
+    dfs(remainingMask ^ bit);
+    ungrouped.pop();
+
+    for (const meld of meldsByBit[i]) {
+      if ((meld.mask & remainingMask) !== meld.mask) continue;
+      groups.push({ type: meld.type, cards: _cardsFromMask(hand, meld.mask) });
+      dfs(remainingMask ^ meld.mask);
+      groups.pop();
+    }
+    return false;
+  };
+
+  dfs(fullMask);
+  return best;
+}
+
+function _assembleFinishTraceFromNextHand(hand, wildJoker, finishCard, nextTrace) {
+  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const groups = nextTrace.groups.map((g) => ({ type: g.type, cards: g.cards.slice() }));
+  const leftovers = (nextTrace.ungrouped || []).slice();
+
+  for (const extra of leftovers) {
+    let placed = false;
+    for (const group of groups) {
+      if (group.type === 'impure_sequence') {
+        const trial = [...group.cards, extra];
+        if (isImpureSequence(trial, wildRank) && trial.length <= MAX_SEQ_SIZE) {
+          group.cards = trial;
+          placed = true;
+          break;
+        }
+      } else if (group.type === 'set') {
+        const trial = [...group.cards, extra];
+        if (isSet(trial, wildRank) && trial.length <= MAX_SET_SIZE) {
+          group.cards = trial;
+          placed = true;
+          break;
+        }
+      }
+    }
+    if (!placed) {
+      for (let gi = 0; gi < groups.length && !placed; gi++) {
+        const group = groups[gi];
+        if (group.type !== 'impure_sequence' && group.type !== 'set') continue;
+        for (let ci = 0; ci < group.cards.length && !placed; ci++) {
+          const swapped = group.cards.filter((_, idx) => idx !== ci);
+          const trial = [...swapped, extra];
+          if (
+            (group.type === 'impure_sequence' && isImpureSequence(trial, wildRank))
+            || (group.type === 'set' && isSet(trial, wildRank))
+          ) {
+            group.cards = trial;
+            placed = true;
+          }
+        }
+      }
+    }
+    if (!placed) {
+      return null;
+    }
+  }
+
+  return {
+    groups,
+    ungrouped: [finishCard],
+    finishCard,
+  };
+}
+
+function _buildFinishReadyFromDiscardScan(hand, wildJoker) {
+  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  let best = null;
+  for (let i = 0; i < hand.length; i++) {
+    const finishCard = hand[i];
+    const nextHand = hand.filter((_, idx) => idx !== i);
+    const nextTrace = _resolveOptimalTrace(nextHand, wildRank);
+    const assembled = _assembleFinishTraceFromNextHand(hand, wildJoker, finishCard, nextTrace);
+    if (!assembled) continue;
+    if (!_isFinishReadyAfterDiscard(hand, wildJoker, assembled.groups, finishCard)) continue;
+    best = _pickBetterFinishTrace(hand, wildJoker, best, assembled);
+  }
+  return best;
+}
+
+function _tryBuildFinishReadyTrace(hand, wildJoker) {
+  if (hand.length !== FINISH_HAND_CARD_COUNT) return null;
+  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const melds = _enumerateMelds(hand, wildRank);
+  const fromPartition = _searchFinishReadyPartition(hand, wildJoker, melds);
+  const fromScan = _buildFinishReadyFromDiscardScan(hand, wildJoker);
+  return _pickBetterFinishTrace(hand, wildJoker, fromPartition, fromScan);
+}
+
 // ─── buildBestGrouping ────────────────────────────────────────────────────────
 
 function buildBestGrouping(cards, wildJoker, options) {
@@ -1106,14 +1286,21 @@ function buildBestGrouping(cards, wildJoker, options) {
 
   if (n === 0) return _emptyResult();
 
-  const melds = _enumerateMelds(hand, wildRank);
+  let finishMeta = null;
   let trace;
-  if (n <= MAX_OPTIMAL_SEARCH_CARDS) {
-    trace = _searchOptimalPartition(hand, wildRank, melds);
-  } else {
-    const { dp, par, idx } = _runDP(hand, wildRank, melds);
-    trace = _pickBestDpTrace(hand, wildRank, dp, par, idx);
-    trace = _refineWithForcedJokerMelds(hand, wildRank, trace);
+  if (n === FINISH_HAND_CARD_COUNT) {
+    const finishTrace = _tryBuildFinishReadyTrace(hand, wildJoker);
+    if (finishTrace) {
+      trace = finishTrace;
+      finishMeta = {
+        can_finish_after_one_discard: true,
+        finish_card_uid: finishTrace.finishCard?.card_uid || null,
+        declare_display_after_finish: 0,
+      };
+    }
+  }
+  if (!trace) {
+    trace = _resolveOptimalTrace(hand, wildRank);
   }
   const { groups, ungrouped } = trace;
 
@@ -1160,6 +1347,9 @@ function buildBestGrouping(cards, wildJoker, options) {
     grouping_confidence: null,
     decision_margin: null,
     alternative_count: null,
+    can_finish_after_one_discard: finishMeta?.can_finish_after_one_discard === true,
+    finish_card_uid: finishMeta?.finish_card_uid || null,
+    declare_display_after_finish: finishMeta?.declare_display_after_finish ?? null,
   };
   const displayPoint = computeDisplayPoint({
     validForDeclare,
@@ -1204,6 +1394,9 @@ function _emptyResult() {
       grouping_confidence: null,
       decision_margin: null,
       alternative_count: null,
+      can_finish_after_one_discard: false,
+      finish_card_uid: null,
+      declare_display_after_finish: null,
     },
   };
 }
@@ -1367,6 +1560,9 @@ function buildSuitGroups(cards, wildJoker) {
       grouping_confidence: null,
       decision_margin: null,
       alternative_count: null,
+      can_finish_after_one_discard: false,
+      finish_card_uid: null,
+      declare_display_after_finish: null,
     },
   };
 }
