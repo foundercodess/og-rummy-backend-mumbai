@@ -1051,8 +1051,25 @@ async function leaveTableContinuation({ sourceSessionId, userId }) {
   }
 
   const phase = String(sourceSession.metadata?.phase || '').toLowerCase();
-  const isPrelockLeave = ['waiting', 'ready'].includes(sourceSession.status)
-    && !['countdown', 'toss', 'dealing', 'active', 'declaration_window'].includes(phase);
+  const countdownLockAt = Math.max(
+    1,
+    Number(process.env.MATCH_COUNTDOWN_LOCK_AT_SECONDS) || 3
+  );
+  const countdown = sourceSession.metadata?.countdown || {};
+  const endsAtMs = countdown?.ends_at ? Date.parse(countdown.ends_at) : NaN;
+  const secondsLeft = Number.isFinite(endsAtMs)
+    ? Math.max(0, Math.ceil((endsAtMs - Date.now()) / 1000))
+    : null;
+  const entryLocked = sourceSession.metadata?.entry_locked === true
+    || (secondsLeft != null && secondsLeft <= countdownLockAt);
+  const isCountdownFreeLeave = phase === 'countdown' && !entryLocked;
+  const isPrelockLeave = (
+    ['waiting', 'ready'].includes(sourceSession.status)
+    && (
+      !['countdown', 'toss', 'dealing', 'active', 'declaration_window'].includes(phase)
+      || isCountdownFreeLeave
+    )
+  );
   if (isPrelockLeave) {
     await query('BEGIN');
     try {

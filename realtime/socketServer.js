@@ -219,26 +219,12 @@ const POOL_REJOIN_THRESHOLD_BY_LIMIT = {
 // Bots must not drop once cumulative pool score exceeds these limits.
 const POOL_BOT_DROP_BLOCK_SCORE_BY_LIMIT = {
   101: 80,
-  201: 160,
+  201: 150,
 };
-const POOL_SPLIT_DROP_TABLE_BY_LIMIT = {
-  101: [
-    { min: 0, max: 25, drops: 8 },
-    { min: 26, max: 50, drops: 6 },
-    { min: 51, max: 75, drops: 5 },
-    { min: 76, max: 100, drops: 4 },
-  ],
-  201: [
-    { min: 0, max: 25, drops: 8 },
-    { min: 26, max: 50, drops: 6 },
-    { min: 51, max: 75, drops: 5 },
-    { min: 76, max: 100, drops: 4 },
-    { min: 101, max: 125, drops: 3 },
-    { min: 126, max: 150, drops: 2 },
-    { min: 151, max: 175, drops: 1 },
-    { min: 176, max: 200, drops: 0 },
-  ],
-};
+/** First-drop penalty used as the unit for "drops remaining" in split (101→20, 201→25). */
+function resolvePoolSplitDropUnit(poolLimit) {
+  return Number(poolLimit) >= 201 ? 25 : 20;
+}
 
 function resolvePickSource(source) {
   if (source === 'discard') return 'discard';
@@ -1380,8 +1366,14 @@ function buildPoolRoundProgress(session = {}, roundResults = []) {
 
   const players = Array.isArray(session?.players) ? session.players : [];
   const activeUserIds = players
-    .map((player) => Number(player.user_id))
-    .filter((userId) => !Number.isNaN(userId) && !eliminatedSet.has(userId));
+    .filter((player) => {
+      const userId = Number(player?.user_id);
+      if (Number.isNaN(userId) || eliminatedSet.has(userId)) return false;
+      const status = String(player?.status || '').toLowerCase();
+      if (status === 'eliminated' || status === 'left') return false;
+      return true;
+    })
+    .map((player) => Number(player.user_id));
 
   const currentRoundNo = Math.max(1, Number(session?.metadata?.pool_round_no) || 1);
   return {
@@ -1561,7 +1553,7 @@ function isBotPoolDropBlockedByScore(session, userId) {
   const blockScore = resolvePoolBotDropBlockScore(poolLimit);
   const scoresByUser = session?.metadata?.pool_scores_by_user || {};
   const currentScore = Number(scoresByUser[String(userId)]) || 0;
-  return currentScore > blockScore;
+  return currentScore >= blockScore;
 }
 
 function buildPoolRejoinContext({
@@ -1662,22 +1654,21 @@ function distributeByWeights(totalAmount, weightedRows = []) {
   return withAmount;
 }
 
+/**
+ * Drops remaining = how many first-drop penalties fit under the pool limit
+ * after the player's cumulative score (includes the round just finished).
+ * Example 101 Pool: score 0 → 5, score 20 → 4, score 80 → 1.
+ */
 function resolvePoolSplitDropsRemaining(poolLimit, totalScore) {
   const safeLimit = Number(poolLimit) >= 201 ? 201 : 101;
-  const table = POOL_SPLIT_DROP_TABLE_BY_LIMIT[safeLimit] || POOL_SPLIT_DROP_TABLE_BY_LIMIT[101];
+  const dropUnit = resolvePoolSplitDropUnit(safeLimit);
   const score = Math.max(0, Number(totalScore) || 0);
-  for (const slab of table) {
-    if (score >= slab.min && score <= slab.max) {
-      return slab.drops;
-    }
-  }
-  return 0;
+  if (score >= safeLimit) return 0;
+  const remainingCapacity = Math.max(0, (safeLimit - 1) - score);
+  return Math.floor(remainingCapacity / dropUnit);
 }
 
 function buildPoolSplitPlan(session = {}, roundProgress = {}, payload = null) {
-  console.log("buildPoolSplitPlan", session, roundProgress, payload);
-  console.log("POOL_SPLIT_ENABLED", POOL_SPLIT_ENABLED);
-  console.log("session?.metadata?.pool_split_enabled", session?.metadata?.pool_split_enabled);
   if (!POOL_SPLIT_ENABLED && session?.metadata?.pool_split_enabled !== true) {
     return { can_split: false, reason: 'split_feature_disabled' };
   }
@@ -1685,14 +1676,29 @@ function buildPoolSplitPlan(session = {}, roundProgress = {}, payload = null) {
   if (mode !== 'pool') {
     return { can_split: false, reason: 'not_pool_mode' };
   }
+
+  const players = Array.isArray(session?.players) ? session.players : [];
+  const playersByUser = new Map(players.map((player) => [Number(player.user_id), player]));
+  const eliminatedSet = new Set(
+    (Array.isArray(roundProgress?.eliminatedUserIds) ? roundProgress.eliminatedUserIds : [])
+      .map((userId) => Number(userId))
+      .filter((userId) => !Number.isNaN(userId))
+  );
   const activeUserIds = (Array.isArray(roundProgress?.activeUserIds) ? roundProgress.activeUserIds : [])
     .map((userId) => Number(userId))
-    .filter((userId) => !Number.isNaN(userId));
+    .filter((userId) => {
+      if (Number.isNaN(userId) || eliminatedSet.has(userId)) return false;
+      const player = playersByUser.get(userId);
+      const status = String(player?.status || '').toLowerCase();
+      if (status === 'eliminated' || status === 'left') return false;
+      return true;
+    });
+  // Offer split whenever 2–3 players remain (including 2-max tables with a bot).
+  // Admin profit is enforced by bots accepting/rejecting — never by hiding the button.
   if (activeUserIds.length < 2 || activeUserIds.length > 3) {
     return { can_split: false, reason: 'active_players_out_of_range' };
   }
   const poolLimit = resolvePoolLimit(session);
-  const playersByUser = new Map((session.players || []).map((player) => [Number(player.user_id), player]));
   const rowsWeighted = activeUserIds
     .map((userId) => {
       const player = playersByUser.get(userId) || {};
@@ -1735,17 +1741,17 @@ function buildPoolSplitPlan(session = {}, roundProgress = {}, payload = null) {
       drops_remaining: row.drops_remaining,
       split_weight: row.weight,
       split_amount: row.amount,
+      amount: row.amount,
       decision: 'pending',
     }));
 
   const adminProfitProtection = evaluateAdminProfitProtection(session, rowsWithAmount, {
     participantUserIds: activeUserIds,
   });
-  if (adminProfitProtection.decision !== 'ACCEPT') {
-    logGame(session?.id || 'pool_split', `[SPLIT_PROTECTION] ${JSON.stringify(adminProfitProtection)}`);
-    return { can_split: false, reason: 'admin_profit_protection' };
-  }
-  logGame(session?.id || 'pool_split', `[SPLIT_PROTECTION] ${JSON.stringify(adminProfitProtection)}`);
+  logGame(
+    session?.id || 'pool_split',
+    `[SPLIT_PROTECTION] offer_visible decision=${adminProfitProtection.decision} ${JSON.stringify(adminProfitProtection)}`
+  );
 
   return {
     can_split: true,
@@ -1754,6 +1760,8 @@ function buildPoolSplitPlan(session = {}, roundProgress = {}, payload = null) {
     rows: rowsWithAmount,
     score_model: 'pool_loss_cumulative',
     source_status: payload?.status || 'round_completed',
+    // Informational only — bots reject when not ACCEPT; UI still shows Split.
+    admin_profit_protection: adminProfitProtection,
   };
 }
 
@@ -3252,6 +3260,10 @@ function shouldBotStrategicallyDrop(session, userId, cards = [], wildJoker = nul
   if (isDealLikeMode(mode)) return false;
   if (!Array.isArray(cards) || cards.length === 0) return false;
   if (isBotPoolDropBlockedByScore(session, userId)) return false;
+  // Points: never middle-drop (company loss). First-drop only when still eligible.
+  if (mode === 'points' && !isFirstDropEligible(options?.playerDistribution)) {
+    return false;
+  }
 
   const playContext = buildBotPlayContext(session, userId);
   const turnId = Number(options?.turn?.turn_id) || 0;
@@ -3395,6 +3407,14 @@ function shouldBotTakeEarlyDrop(session, userId, handCards = [], distribution = 
   if (!['pool', 'points'].includes(mode)) return false;
   if (isDealLikeMode(mode)) return false;
   if (isBotPoolDropBlockedByScore(session, userId)) return false;
+
+  const playerDistribution = getPlayerDistribution(distribution, userId);
+  // Points: never middle-drop. Pool: also respect first/middle eligibility for block score.
+  if (mode === 'points' && !isFirstDropEligible(playerDistribution)) {
+    return false;
+  }
+  // Pool: block any drop (first or middle) once score threshold is reached — already covered
+  // by isBotPoolDropBlockedByScore above.
 
   const playContext = buildBotPlayContext(session, userId);
   if (mode === 'pool' && playContext.scoreHeadroom > BOT_POOL_COMFORTABLE_HEADROOM) {
@@ -5421,27 +5441,11 @@ function emitPoolSplitState(io, sessionId, state, reason = 'state') {
 }
 
 function shouldBotAcceptSplitOffer(session = {}, state = {}, userId) {
+  // Bots only accept when the split is not a loss for admin.
   const protection = evaluateAdminProfitProtection(session, state?.rows || [], {
     participantUserIds: state?.eligible_user_ids || [],
   });
-  if (protection.decision !== 'ACCEPT') return false;
-
-  const rows = Array.isArray(state?.rows) ? state.rows : [];
-  const row = rows.find((entry) => Number(entry?.user_id) === Number(userId));
-  if (!row) return false;
-
-  const splitAmount = Number(row?.amount) || Number(row?.split_amount) || 0;
-  const dropsRemaining = Number(row?.drops_remaining);
-  const entryFee = roundCurrency(Number(session?.contest?.entry) || 0);
-  const scoreByUser = session?.metadata?.pool_scores_by_user || {};
-  const totalScore = Number(scoreByUser[String(userId)]) || 0;
-  const poolLimit = resolvePoolLimit(session);
-  const nearElimination = Number.isFinite(poolLimit) && (poolLimit - totalScore) <= 18;
-  const minGain = entryFee > 0 ? roundCurrency(entryFee * BOT_SPLIT_MIN_GAIN_MULTIPLIER) : 0;
-
-  if (nearElimination && splitAmount > 0) return true;
-  if (Number.isFinite(dropsRemaining) && dropsRemaining <= 1 && splitAmount > 0) return true;
-  return splitAmount >= minGain && splitAmount > 0;
+  return protection.decision === 'ACCEPT';
 }
 
 function buildSplitOfferExplainability(session = {}, state = {}, userId) {
@@ -5662,6 +5666,8 @@ async function finalizePoolSplitOffer(io, sessionId, state) {
     status: 'split_finalized',
     is_final: true,
     reason: 'pool_split_accepted',
+    can_split: false,
+    split_candidate_user_ids: [],
     settlement,
     split_offer_id: state.offer_id,
     split_window_end_at: state.expires_at,
@@ -11938,12 +11944,13 @@ function registerSocketServer(httpServer) {
           throw new Error('You are not eligible to start split');
         }
         const session = await gameplayService.getSessionState(sessionId);
-        const startProtection = evaluateAdminProfitProtection(session || {}, splitPlan.rows || [], {
-          participantUserIds: splitPlan.active_user_ids || [],
-        });
-        logGame(sessionId, `[SPLIT_PROTECTION] ${JSON.stringify(startProtection)}`);
-        if (startProtection.decision !== 'ACCEPT') {
-          throw new Error('Split is blocked by admin profit protection');
+        // Never block the human from starting split. Bots accept/reject based on
+        // admin profit protection after the offer is opened.
+        if (session) {
+          const startProtection = evaluateAdminProfitProtection(session, splitPlan.rows || [], {
+            participantUserIds: splitPlan.active_user_ids || [],
+          });
+          logGame(sessionId, `[SPLIT_PROTECTION] start_offer ${JSON.stringify(startProtection)}`);
         }
         const offerId = `${sessionId}:split:${Date.now()}`;
         const startedAt = new Date().toISOString();
@@ -12041,13 +12048,15 @@ function registerSocketServer(httpServer) {
         const acceptedSet = new Set((state.accepted_user_ids || []).map((id) => Number(id)));
         const rejectedSet = new Set((state.rejected_user_ids || []).map((id) => Number(id)));
         if (accept) {
+          // Humans may always accept. Bot auto-response enforces admin profit.
           const liveSession = await gameplayService.getSessionState(sessionId);
-          const acceptProtection = evaluateAdminProfitProtection(liveSession || {}, state?.rows || [], {
-            participantUserIds: state?.eligible_user_ids || [],
-          });
-          logGame(sessionId, `[SPLIT_PROTECTION] ${JSON.stringify(acceptProtection)}`);
-          if (acceptProtection.decision !== 'ACCEPT') {
-            throw new Error('Split accept blocked by admin profit protection');
+          if (liveSession) {
+            const acceptProtection = evaluateAdminProfitProtection(
+              liveSession,
+              state?.rows || [],
+              { participantUserIds: state?.eligible_user_ids || [] }
+            );
+            logGame(sessionId, `[SPLIT_PROTECTION] human_accept ${JSON.stringify(acceptProtection)}`);
           }
         }
         if (accept) {
@@ -12793,13 +12802,16 @@ module.exports = {
     shouldBotStrategicallyDrop,
     isBotPoolDropBlockedByScore,
     resolvePoolBotDropBlockScore,
+    resolvePoolSplitDropsRemaining,
+    buildPoolSplitPlan,
+    evaluateAdminProfitProtection,
+    shouldBotAcceptSplitOffer,
     canMeaningfullyImproveWithPickedCard,
     isHopelessHandForDrop,
     doesStructureBlockStrategicDrop,
     buildBotPlayContext,
     tryBuildBotFinishPlan,
     tryBuildFinishPlan,
-    evaluateAdminProfitProtection,
     activeBotActionBySession,
     getActiveBotActionState,
     executeBotTurnAction,

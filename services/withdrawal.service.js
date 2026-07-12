@@ -13,7 +13,7 @@ const MAX_BANK_ACCOUNTS = Number(process.env.MAX_BANK_ACCOUNTS_PER_USER || 5);
 const WITHDRAWAL_MIN_ACCOUNT_AGE_HOURS = Number(process.env.WITHDRAWAL_MIN_ACCOUNT_AGE_HOURS || 24);
 const WITHDRAWAL_NEW_ACCOUNT_MAX_AMOUNT = Number(process.env.WITHDRAWAL_NEW_ACCOUNT_MAX_AMOUNT || 5000);
 const WITHDRAWAL_MAX_PROCESSING_COUNT = Number(process.env.WITHDRAWAL_MAX_PROCESSING_COUNT || 3);
-const WITHDRAWAL_REQUIRE_APPROVED_KYC = process.env.WITHDRAWAL_REQUIRE_APPROVED_KYC === 'true';
+const WITHDRAWAL_REQUIRE_APPROVED_KYC = process.env.WITHDRAWAL_REQUIRE_APPROVED_KYC !== 'false';
 const BYPASS_WITHDRAWAL_BALANCE_CHECK = process.env.BYPASS_WITHDRAWAL_BALANCE_CHECK === 'true';
 const WITHDRAWAL_PAYOUT_SYNC_MIN_AGE_MINUTES = Number(process.env.WITHDRAWAL_PAYOUT_SYNC_MIN_AGE_MINUTES || 2);
 const WITHDRAWAL_PAYOUT_SYNC_BATCH_LIMIT = Number(process.env.WITHDRAWAL_PAYOUT_SYNC_BATCH_LIMIT || 50);
@@ -208,7 +208,23 @@ async function validateUserWithdrawalEligibility(userId, { amount = null } = {})
       [userId]
     );
     const kyc = kycRes.rows[0];
-    if (!kyc || kyc.status !== 'approved') {
+    const status = String(kyc?.status || '').toLowerCase();
+    if (!kyc || !status) {
+      const error = new Error('Complete your KYC before requesting a withdrawal');
+      error.code = 'KYC_NOT_SUBMITTED';
+      throw error;
+    }
+    if (status === 'submitted') {
+      const error = new Error('Your KYC is under review. You can withdraw after approval');
+      error.code = 'KYC_PENDING';
+      throw error;
+    }
+    if (status === 'rejected') {
+      const error = new Error('Your KYC was rejected. Please re-submit KYC to withdraw');
+      error.code = 'KYC_REJECTED';
+      throw error;
+    }
+    if (status !== 'approved') {
       const error = new Error('KYC approval is required before withdrawal');
       error.code = 'KYC_NOT_APPROVED';
       throw error;

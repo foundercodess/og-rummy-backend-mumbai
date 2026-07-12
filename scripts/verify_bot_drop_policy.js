@@ -176,7 +176,19 @@ function runEarlyDropTests() {
       wildJoker
     ),
     false,
-    'Bot must not drop in pool 101 when cumulative score is above 80'
+    'Bot must not drop in pool 101 when cumulative score is at/above 80'
+  );
+
+  assert.strictEqual(
+    __testHooks.shouldBotTakeEarlyDrop(
+      makeSession({ mode: 'pool', poolScores: { [String(userId)]: 150 }, poolLimit: 201 }),
+      userId,
+      deadHand,
+      deadDist,
+      wildJoker
+    ),
+    false,
+    'Bot must not drop in pool 201 when cumulative score is at/above 150'
   );
 
   assert.strictEqual(
@@ -188,10 +200,9 @@ function runEarlyDropTests() {
       wildJoker
     ),
     false,
-    'Bot must not drop in pool 201 when cumulative score is above 160'
+    'Bot must not drop in pool 201 when cumulative score is above 150'
   );
 }
-
 function runStrategicDropTests() {
   const userId = 888;
   const session = makeSession({
@@ -295,7 +306,7 @@ function runStrategicDropTests() {
 
   const blockedScore201Session = makeSession({
     mode: 'pool',
-    poolScores: { [String(userId)]: 165 },
+    poolScores: { [String(userId)]: 150 },
     poolLimit: 201,
     userId,
     hasPicked: true,
@@ -313,7 +324,7 @@ function runStrategicDropTests() {
       }
     ),
     false,
-    'Bot must not strategically drop in pool 201 when cumulative score is above 160'
+    'Bot must not strategically drop in pool 201 when cumulative score is at/above 150'
   );
 
   const firstDealSession = makeSession({

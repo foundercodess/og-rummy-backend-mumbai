@@ -18,7 +18,12 @@ const {
   resolveLastTurnUserId,
 } = require('./turnRotation');
 
-const COUNTDOWN_SECONDS = 3;
+const COUNTDOWN_SECONDS = Math.max(3, Number(process.env.MATCH_COUNTDOWN_SECONDS) || 10);
+/** Free leave while seconds_left is above this; entry lock + back disabled at this value. */
+const COUNTDOWN_ENTRY_LOCK_AT_SECONDS = Math.max(
+  1,
+  Math.min(COUNTDOWN_SECONDS - 1, Number(process.env.MATCH_COUNTDOWN_LOCK_AT_SECONDS) || 3)
+);
 const INTER_DEAL_COUNTDOWN_SECONDS = 5;
 const TOSS_ANIMATION_SECONDS_DEFAULT = 5;
 const TOSS_ANIMATION_SECONDS_TWO_PLAYER = 2;
@@ -1521,21 +1526,8 @@ async function startPregame(io, sessionId, options = {}) {
 
   try {
     let liveSession = session;
-    if (shouldDebitEntryAtMatchFilled(session)) {
-      const debitResult = await debitEntriesOnMatchFilled({ sessionId, sequence });
-      await gameSessionModel.insertEvent({
-        sessionId,
-        eventType: 'entry_debit_locked',
-        payload: {
-          sequence,
-          debited_user_ids: debitResult.debited_user_ids || [],
-          entry_fee: debitResult.entry_fee || null,
-          skipped: debitResult.skipped === true,
-        },
-      });
-      const refreshedAfterDebit = await gameplayService.getSessionState(sessionId);
-      if (refreshedAfterDebit) liveSession = refreshedAfterDebit;
-    }
+    // Entry fee locks when countdown reaches COUNTDOWN_ENTRY_LOCK_AT_SECONDS,
+    // so players can leave for free from MATCH_COUNTDOWN…(lock+1).
 
     await gameSessionModel.insertEvent({
       sessionId,
@@ -1545,6 +1537,7 @@ async function startPregame(io, sessionId, options = {}) {
         started_at: startedAt.toISOString(),
         ends_at: endsAt.toISOString(),
         seconds: countdownSeconds,
+        lock_at_seconds: COUNTDOWN_ENTRY_LOCK_AT_SECONDS,
       },
     });
 
@@ -1554,7 +1547,9 @@ async function startPregame(io, sessionId, options = {}) {
         started_at: startedAt.toISOString(),
         ends_at: endsAt.toISOString(),
         seconds: countdownSeconds,
+        lock_at_seconds: COUNTDOWN_ENTRY_LOCK_AT_SECONDS,
       },
+      entry_locked: false,
     });
 
     if (!useInterDealFastStart) {
@@ -1565,11 +1560,13 @@ async function startPregame(io, sessionId, options = {}) {
         status: 'ready',
         server_time: getNowIso(),
         event: 'match:filled',
+        entry_locked: false,
         countdown: {
           sequence,
           started_at: startedAt.toISOString(),
           ends_at: endsAt.toISOString(),
           seconds: countdownSeconds,
+          lock_at_seconds: COUNTDOWN_ENTRY_LOCK_AT_SECONDS,
         },
         players: liveSession.players.map((p) => ({
           user_id: p.user_id,
@@ -1584,7 +1581,46 @@ async function startPregame(io, sessionId, options = {}) {
     const tick = async () => {
       const now = new Date();
       const secondsLeft = Math.max(0, Math.ceil((endsAt.getTime() - now.getTime()) / 1000));
-      const latestSession = await gameplayService.getSessionState(sessionId);
+      let latestSession = await gameplayService.getSessionState(sessionId);
+
+      if (
+        !useInterDealFastStart
+        && shouldDebitEntryAtMatchFilled(latestSession || session)
+        && secondsLeft <= COUNTDOWN_ENTRY_LOCK_AT_SECONDS
+        && latestSession?.metadata?.entry_locked !== true
+      ) {
+        try {
+          const debitResult = await debitEntriesOnMatchFilled({ sessionId, sequence });
+          await gameSessionModel.insertEvent({
+            sessionId,
+            eventType: 'entry_debit_locked',
+            payload: {
+              sequence,
+              locked_at_seconds_left: secondsLeft,
+              debited_user_ids: debitResult.debited_user_ids || [],
+              entry_fee: debitResult.entry_fee || null,
+              skipped: debitResult.skipped === true,
+            },
+          });
+          await setSessionPhaseMetadata(sessionId, 'countdown', {
+            countdown: {
+              sequence,
+              started_at: startedAt.toISOString(),
+              ends_at: endsAt.toISOString(),
+              seconds: countdownSeconds,
+            },
+            entry_locked: true,
+            entry_locked_at: getNowIso(),
+            entry_locked_at_seconds_left: secondsLeft,
+          });
+          latestSession = await gameplayService.getSessionState(sessionId);
+          if (latestSession) liveSession = latestSession;
+        } catch (err) {
+          if (err?.code === 'INSUFFICIENT_BALANCE_AT_LOCK') throw err;
+          console.error(`[PREGAME][${sessionId}] Entry lock debit failed:`, err.message);
+          throw err;
+        }
+      }
 
       io.to(sessionRoom(sessionId)).emit('game:countdown', {
         session_id: sessionId,
@@ -1593,11 +1629,13 @@ async function startPregame(io, sessionId, options = {}) {
         status: latestSession?.status || 'ready',
         server_time: now.toISOString(),
         event: 'game:countdown',
+        entry_locked: latestSession?.metadata?.entry_locked === true,
         countdown: {
           sequence,
           started_at: startedAt.toISOString(),
           ends_at: endsAt.toISOString(),
           seconds_left: secondsLeft,
+          lock_at_seconds: COUNTDOWN_ENTRY_LOCK_AT_SECONDS,
         },
         players: latestSession?.players?.map((p) => ({
           user_id: p.user_id, seat_no: p.seat_no, name: p.name, metadata: p.metadata,

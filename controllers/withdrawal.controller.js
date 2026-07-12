@@ -17,6 +17,9 @@ function mapWithdrawalError(err, res) {
     'INVALID_CALLBACK',
     'USER_BLOCKED',
     'WITHDRAWALS_FROZEN',
+    'KYC_NOT_SUBMITTED',
+    'KYC_PENDING',
+    'KYC_REJECTED',
     'KYC_NOT_APPROVED',
     'SUSPICIOUS_ACCOUNT',
   ]);
