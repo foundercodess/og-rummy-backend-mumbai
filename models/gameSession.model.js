@@ -76,29 +76,54 @@ async function findLatestRejoinableSessionForUser(userId, options = {}) {
      FROM game_sessions gs
      JOIN game_session_players gsp ON gsp.game_session_id = gs.id
      WHERE gsp.user_id = $1
-       AND gs.status = 'active'
        AND gs.updated_at >= (NOW() - make_interval(mins => $2::int))
        AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
        AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
-       AND gsp.status IN ('joined', 'disconnected')
-       AND (
-         gsp.status = 'disconnected'
-         OR COALESCE(gsp.metadata->>'connection_status', '') = 'disconnected'
-         OR COALESCE((gsp.metadata->>'is_connected')::boolean, false) = false
-       )
-       AND COALESCE((gsp.metadata->>'is_dropped')::boolean, false) = false
+       AND COALESCE((gsp.metadata->>'pending_rejoin_opt_out')::boolean, false) = false
        AND COALESCE((gsp.metadata->>'auto_rematch_opt_out')::boolean, false) = false
-       AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
-       AND COALESCE(gsp.metadata->>'drop_status', '') <> 'dropped'
-       AND COALESCE(gsp.metadata->>'elimination_reason', '') NOT IN ('dropped', 'timeout')
-       AND NOT COALESCE(gs.metadata->'post_result_left_user_ids', '[]'::jsonb)
-         @> jsonb_build_array($1::int)
+       AND (
+         (
+           -- Classic disconnect pending rejoin (all table sizes)
+           gs.status = 'active'
+           AND gsp.status IN ('joined', 'disconnected')
+           AND (
+             gsp.status = 'disconnected'
+             OR COALESCE(gsp.metadata->>'connection_status', '') = 'disconnected'
+             OR COALESCE((gsp.metadata->>'is_connected')::boolean, false) = false
+           )
+           AND COALESCE((gsp.metadata->>'is_dropped')::boolean, false) = false
+           AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
+           AND COALESCE(gsp.metadata->>'drop_status', '') <> 'dropped'
+           AND COALESCE(gsp.metadata->>'elimination_reason', '') NOT IN ('dropped', 'timeout')
+           AND NOT COALESCE(gs.metadata->'post_result_left_user_ids', '[]'::jsonb)
+             @> jsonb_build_array($1::int)
+         )
+         OR (
+           -- 6-player soft pending rejoin: drop / soft leave / disconnect while game ongoing
+           gs.max_players = 6
+           AND gs.status IN ('active', 'ready')
+           AND gsp.status IN ('joined', 'disconnected', 'eliminated')
+           AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
+           AND NOT COALESCE(gs.metadata->'pool_eliminated_user_ids', '[]'::jsonb)
+             @> jsonb_build_array($1::int)
+           AND (
+             COALESCE((gsp.metadata->>'soft_table_away')::boolean, false) = true
+             OR COALESCE((gsp.metadata->>'is_dropped')::boolean, false) = true
+             OR COALESCE(gsp.metadata->>'drop_status', '') = 'dropped'
+             OR COALESCE(gsp.metadata->>'elimination_reason', '') IN ('dropped', 'timeout')
+             OR gsp.status = 'disconnected'
+             OR COALESCE(gsp.metadata->>'connection_status', '') = 'disconnected'
+             OR COALESCE((gsp.metadata->>'is_connected')::boolean, false) = false
+           )
+         )
+       )
        AND NOT EXISTS (
          SELECT 1
          FROM game_sessions gs2
          JOIN game_session_players gsp2 ON gsp2.game_session_id = gs2.id
          WHERE gsp2.user_id = $1
-           AND gs2.status = 'active'
+           AND gs2.id <> gs.id
+           AND gs2.status IN ('waiting', 'ready', 'active')
            AND COALESCE((gs2.metadata->>'practice_mode')::boolean, false) = false
            AND COALESCE((gs2.metadata->>'practice_bot_only')::boolean, false) = false
            AND gsp2.status IN ('joined', 'disconnected')
@@ -129,16 +154,40 @@ async function findLatestActiveSessionForUser(userId, options = {}) {
      FROM game_sessions gs
      JOIN game_session_players gsp ON gsp.game_session_id = gs.id
      WHERE gsp.user_id = $1
-       AND gs.status = 'active'
        AND gs.updated_at >= (NOW() - make_interval(mins => $2::int))
        AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
        AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
-       AND gsp.status IN ('joined', 'disconnected')
-       AND COALESCE((gsp.metadata->>'is_dropped')::boolean, false) = false
+       AND COALESCE((gsp.metadata->>'pending_rejoin_opt_out')::boolean, false) = false
        AND COALESCE((gsp.metadata->>'auto_rematch_opt_out')::boolean, false) = false
-       AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
-       AND COALESCE(gsp.metadata->>'drop_status', '') <> 'dropped'
-       AND COALESCE(gsp.metadata->>'elimination_reason', '') NOT IN ('dropped', 'timeout')
+       AND (
+         (
+           gs.status = 'active'
+           AND gsp.status IN ('joined', 'disconnected')
+           AND COALESCE((gsp.metadata->>'is_dropped')::boolean, false) = false
+           AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
+           AND COALESCE(gsp.metadata->>'drop_status', '') <> 'dropped'
+           AND COALESCE(gsp.metadata->>'elimination_reason', '') NOT IN ('dropped', 'timeout')
+           AND NOT COALESCE(gs.metadata->'post_result_left_user_ids', '[]'::jsonb)
+             @> jsonb_build_array($1::int)
+         )
+         OR (
+           gs.max_players = 6
+           AND gs.status IN ('active', 'ready')
+           AND gsp.status IN ('joined', 'disconnected', 'eliminated')
+           AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
+           AND NOT COALESCE(gs.metadata->'pool_eliminated_user_ids', '[]'::jsonb)
+             @> jsonb_build_array($1::int)
+           AND (
+             COALESCE((gsp.metadata->>'soft_table_away')::boolean, false) = true
+             OR COALESCE((gsp.metadata->>'is_dropped')::boolean, false) = true
+             OR COALESCE(gsp.metadata->>'drop_status', '') = 'dropped'
+             OR COALESCE(gsp.metadata->>'elimination_reason', '') IN ('dropped', 'timeout')
+             OR gsp.status = 'disconnected'
+             OR COALESCE(gsp.metadata->>'connection_status', '') = 'disconnected'
+             OR COALESCE((gsp.metadata->>'is_connected')::boolean, false) = false
+           )
+         )
+       )
        AND NOT COALESCE(gs.metadata->'post_result_left_user_ids', '[]'::jsonb)
          @> jsonb_build_array($1::int)
      ORDER BY

@@ -276,6 +276,71 @@ function getEliminatedUserIdSet(metadata = {}) {
   return new Set(eliminated.map((id) => Number(id)).filter((id) => !Number.isNaN(id)));
 }
 
+/** Pool threshold only — do not mix with deal drop / turn timeout eliminations. */
+function getPoolEliminatedUserIdSet(metadata = {}) {
+  return new Set(
+    (Array.isArray(metadata?.pool_eliminated_user_ids) ? metadata.pool_eliminated_user_ids : [])
+      .map((id) => Number(id))
+      .filter((id) => !Number.isNaN(id))
+  );
+}
+
+function isPoolThresholdEliminatedPlayer(session, player, userId = null) {
+  const uid = Number(userId != null ? userId : player?.user_id);
+  if (Number.isNaN(uid)) return false;
+  if (getPoolEliminatedUserIdSet(session?.metadata || {}).has(uid)) return true;
+  return String(player?.metadata?.elimination_reason || '').toLowerCase() === 'pool_limit';
+}
+
+/**
+ * Seat is out of the current deal / match (drop, timeout, pool wipe, exit).
+ * Used for presence reconnect — not for choosing pool-threshold copy.
+ */
+function isSeatOutOfActivePlayForPresence(session, player, userId = null) {
+  const uid = Number(userId != null ? userId : player?.user_id);
+  if (Number.isNaN(uid)) return false;
+  if (String(player?.status || '').toLowerCase() === 'eliminated') return true;
+  if (getEliminatedUserIdSet(session?.metadata || {}).has(uid)) return true;
+  if (getTimeoutEliminatedUserIdSet(session?.metadata || {}).has(uid)) return true;
+  if (player?.metadata?.is_dropped === true) return true;
+  if (String(player?.metadata?.drop_status || '').toLowerCase() === 'dropped') return true;
+  const reason = String(player?.metadata?.elimination_reason || '').toLowerCase();
+  return ['pool_limit', 'dropped', 'timeout', 'player_exit'].includes(reason);
+}
+
+/**
+ * Banner copy for out-of-play statuses. Empty for active/disconnected so
+ * presence reconnects do not spam misleading elimination UI.
+ */
+function buildOutOfPlayBannerMessages(playerStatus, { isPoolThreshold = false } = {}) {
+  const status = String(playerStatus || '').toLowerCase();
+  if (status === 'timeout') {
+    return {
+      content_message: 'You timed out. Please wait for others to finish the game.',
+      action_message: 'Please wait for next round to start.',
+    };
+  }
+  if (status === 'dropped') {
+    return {
+      content_message: 'You have dropped this game. Please wait for others to finish the game. or click "Switch" to start a new game.',
+      action_message: 'Please wait for next round to start.',
+    };
+  }
+  if (status === 'eliminated' && isPoolThreshold) {
+    return {
+      content_message: 'You reached the pool threshold and are eliminated.',
+      action_message: 'Please wait for game completion or use rejoin option if available.',
+    };
+  }
+  if (status === 'eliminated') {
+    return {
+      content_message: 'You are out of this deal. Please wait for others to finish.',
+      action_message: 'Please wait for next round to start.',
+    };
+  }
+  return {};
+}
+
 function resolvePreviousPoolEliminatedUserIds(session = {}) {
   return (Array.isArray(session?.metadata?.pool_eliminated_user_ids)
     ? session.metadata.pool_eliminated_user_ids
@@ -699,6 +764,8 @@ function resetPlayerMetadataForNextDeal(metadata = {}) {
   delete nextMetadata.drop_status;
   delete nextMetadata.dropped_at;
   delete nextMetadata.elimination_reason;
+  // soft_table_away intentionally retained so away players keep pending-rejoin
+  // until they reconnect for the next deal.
 
   return nextMetadata;
 }
@@ -1365,15 +1432,12 @@ function buildPoolRoundProgress(session = {}, roundResults = []) {
   });
 
   const players = Array.isArray(session?.players) ? session.players : [];
+  // Pool "active" = not pool-eliminated by score/limit. Do NOT use player.status here:
+  // mid-deal drop/timeout temporarily sets status=eliminated while the player remains
+  // in the pool until their cumulative score crosses the limit.
   const activeUserIds = players
-    .filter((player) => {
-      const userId = Number(player?.user_id);
-      if (Number.isNaN(userId) || eliminatedSet.has(userId)) return false;
-      const status = String(player?.status || '').toLowerCase();
-      if (status === 'eliminated' || status === 'left') return false;
-      return true;
-    })
-    .map((player) => Number(player.user_id));
+    .map((player) => Number(player.user_id))
+    .filter((userId) => !Number.isNaN(userId) && !eliminatedSet.has(userId));
 
   const currentRoundNo = Math.max(1, Number(session?.metadata?.pool_round_no) || 1);
   return {
@@ -1689,8 +1753,11 @@ function buildPoolSplitPlan(session = {}, roundProgress = {}, payload = null) {
     .filter((userId) => {
       if (Number.isNaN(userId) || eliminatedSet.has(userId)) return false;
       const player = playersByUser.get(userId);
+      // Only exclude players who explicitly left the table — deal-drop uses
+      // status=eliminated temporarily and must still be eligible for split/next round.
+      if (player?.metadata?.table_left === true) return false;
       const status = String(player?.status || '').toLowerCase();
-      if (status === 'eliminated' || status === 'left') return false;
+      if (status === 'left') return false;
       return true;
     });
   // Offer split whenever 2–3 players remain (including 2-max tables with a bot).
@@ -5836,11 +5903,14 @@ async function transitionToNextPoolRound(io, session, payload, roundProgress) {
     })
   );
 
+  // Prefer pool elimination set over stale player.status: mid-deal drop leaves
+  // status=eliminated on the in-memory session even after we reset DB rows above.
   const nextDealParticipants = (session.players || []).filter((player) => {
     const userId = Number(player.user_id);
     if (Number.isNaN(userId)) return false;
     if (eliminatedSet.has(userId)) return false;
-    if (player?.status === 'left' || player?.status === 'eliminated') return false;
+    if (player?.metadata?.table_left === true) return false;
+    if (String(player?.status || '').toLowerCase() === 'left') return false;
     return true;
   });
   const rotatedFirstTurnUserId = resolveNextDealFirstTurnUserId(session, nextDealParticipants);
@@ -5906,7 +5976,9 @@ function isUserPresentInSessionRoom(io, sessionId, userId) {
 function buildRejoinPendingGamePayload(session, userId, reason = 'connect', options = {}) {
   const { isPresentInSessionRoom = null } = options;
   const player = (session?.players || []).find((item) => Number(item.user_id) === Number(userId)) || null;
-  const sessionActive = String(session?.status || '').toLowerCase() === 'active';
+  const sessionStatus = String(session?.status || '').toLowerCase();
+  const sessionActive = sessionStatus === 'active';
+  const sessionOngoing = sessionActive || sessionStatus === 'ready';
   const playerStatus = String(player?.status || '').toLowerCase();
   const playerConnection = String(player?.connection_status || '').toLowerCase();
   const playerDisconnected = playerStatus === 'disconnected'
@@ -5914,7 +5986,9 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
     || player?.metadata?.is_connected === false;
   const playerDropped = player?.metadata?.is_dropped === true
     || String(player?.metadata?.drop_status || '').toLowerCase() === 'dropped'
-    || String(player?.metadata?.elimination_reason || '').toLowerCase() === 'dropped';
+    || String(player?.metadata?.elimination_reason || '').toLowerCase() === 'dropped'
+    || String(player?.metadata?.elimination_reason || '').toLowerCase() === 'timeout';
+  const softTableAway = player?.metadata?.soft_table_away === true;
   const playerLeftTable = player?.metadata?.table_left === true
     || String(player?.status || '').toLowerCase() === 'left';
   const postResultLeftUserIds = (
@@ -5926,6 +6000,8 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
     .filter((id) => !Number.isNaN(id));
   const explicitlyLeftTable = playerLeftTable
     || postResultLeftUserIds.includes(Number(userId));
+  const pendingRejoinOptOut = player?.metadata?.pending_rejoin_opt_out === true
+    || player?.metadata?.auto_rematch_opt_out === true;
   const poolEliminatedUserIds = (
     Array.isArray(session?.metadata?.pool_eliminated_user_ids)
       ? session.metadata.pool_eliminated_user_ids
@@ -5934,6 +6010,7 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
     .map((id) => Number(id))
     .filter((id) => !Number.isNaN(id));
   const isPoolEliminated = poolEliminatedUserIds.includes(Number(userId));
+  const isSixPlayerSoft = Number(session?.max_players) === 6 && sessionOngoing;
   const sessionPhase = String(session?.metadata?.phase || '').toLowerCase();
   const poolRejoinWindow = ['inter_deal', 'countdown'].includes(sessionPhase);
   let poolBuybackEligible = false;
@@ -5952,22 +6029,49 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
       .map((id) => Number(id))
       .includes(Number(userId));
   }
-  if (explicitlyLeftTable) {
+  // Hard leave / opt-out always blocks paid pool buyback (unchanged).
+  if (explicitlyLeftTable || pendingRejoinOptOut) {
     poolBuybackEligible = false;
   }
-  const playerEligible = Boolean(
+
+  // Classic disconnect resume — unchanged for 2P and non-soft cases.
+  const classicPlayerEligible = Boolean(
     session
     && sessionActive
     && ['joined', 'disconnected'].includes(playerStatus)
     && !playerDropped
     && !explicitlyLeftTable
+    && !pendingRejoinOptOut
   );
+
+  // 6P only: free disconnect-style return after drop / soft leave / disconnect.
+  // Never covers pool score elimination (that remains paid buyback only).
+  const softSixPlayerEligible = Boolean(
+    session
+    && isSixPlayerSoft
+    && player
+    && !isPoolEliminated
+    && !explicitlyLeftTable
+    && !pendingRejoinOptOut
+    && ['joined', 'disconnected', 'eliminated'].includes(playerStatus)
+  );
+
   const needsTableRejoin = playerDisconnected
+    || softTableAway
     || isPresentInSessionRoom === false
     || poolBuybackEligible;
+
   let canRejoin = Boolean(
-    (playerEligible && needsTableRejoin) || poolBuybackEligible
+    ((classicPlayerEligible || softSixPlayerEligible) && needsTableRejoin)
+    || poolBuybackEligible
   );
+
+  // Dropped but still sitting in the room → no banner until they leave/disconnect.
+  if (canRejoin && softSixPlayerEligible && playerDropped && !softTableAway
+    && !playerDisconnected && isPresentInSessionRoom === true) {
+    canRejoin = false;
+  }
+
   if (canRejoin && !poolBuybackEligible) {
     const maxAgeMinutes = typeof gameplayService.resolveRejoinPendingMaxAgeMinutes === 'function'
       ? gameplayService.resolveRejoinPendingMaxAgeMinutes()
@@ -5978,10 +6082,17 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
       canRejoin = false;
     }
   }
-  if (canRejoin && !poolBuybackEligible && !playerDisconnected && isPresentInSessionRoom === true) {
+  if (canRejoin && !poolBuybackEligible && !playerDisconnected && !softTableAway
+    && isPresentInSessionRoom === true) {
     canRejoin = false;
   }
-  if (explicitlyLeftTable) {
+  // Hard leave / switch opt-out still blocks (soft leave never sets these).
+  if (explicitlyLeftTable || pendingRejoinOptOut) {
+    canRejoin = false;
+  }
+  // Pool buyback path may re-enable only via poolBuybackEligible above; free soft
+  // rejoin must never apply to pool-eliminated players.
+  if (isPoolEliminated && !poolBuybackEligible) {
     canRejoin = false;
   }
 
@@ -6001,6 +6112,7 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
       current_turn_user_id: session.current_turn_user_id,
       started_at: session.started_at,
       updated_at: session.updated_at,
+      max_players: session.max_players,
       game: session.game ? {
         id: session.game.id,
         name: session.game.name,
@@ -6147,6 +6259,9 @@ function buildPlayerStatusPayload(session, player, reason = null) {
   )
     ? resolveDropLossPoints(session, player.user_id, { forceMiddleDrop })
     : null;
+  const banners = buildOutOfPlayBannerMessages(playerStatus, {
+    isPoolThreshold: isPoolThresholdEliminatedPlayer(session, player),
+  });
   return {
     session_id: session.id,
     server_time: new Date().toISOString(),
@@ -6161,8 +6276,7 @@ function buildPlayerStatusPayload(session, player, reason = null) {
     left_at: player.left_at || null,
     metadata: player.metadata || {},
     points_to_lose: pointsToLose,
-    content_message: 'You have dropped this game. Please wait for others to finish the game. or click "Switch" to start a new game.',
-    action_message: 'Please wait for next round to start.',
+    ...banners,
   };
 }
 
@@ -6211,9 +6325,9 @@ async function setPlayerConnectionState(io, sessionId, userId, isConnected, reas
   }
 
   const sessionForPresence = await gameplayService.getSessionState(sessionId);
-  const eliminatedSet = getEliminatedUserIdSet(sessionForPresence?.metadata || {});
-  const isPoolEliminated = eliminatedSet.has(Number(userId)) || player.status === 'eliminated';
-  if (isPoolEliminated) {
+  // Out of this deal / match (drop, timeout, pool wipe, exit) — update presence only.
+  // Do NOT re-broadcast pool-threshold banners on reconnect; those fire at elimination time.
+  if (isSeatOutOfActivePlayForPresence(sessionForPresence, player, userId)) {
     const timestamp = new Date().toISOString();
     const nextMetadata = {
       ...(player.metadata || {}),
@@ -6223,25 +6337,39 @@ async function setPlayerConnectionState(io, sessionId, userId, isConnected, reas
       last_presence_updated_at: timestamp,
       ...(isConnected ? { connected_at: timestamp } : { disconnected_at: timestamp }),
     };
+    if (isConnected) {
+      nextMetadata.soft_table_away = false;
+      delete nextMetadata.soft_table_away_at;
+      delete nextMetadata.soft_table_away_reason;
+    }
     const metadataChanged = player.metadata?.connection_status !== nextMetadata.connection_status
-      || player.metadata?.is_connected !== isConnected;
+      || player.metadata?.is_connected !== isConnected
+      || Boolean(player.metadata?.soft_table_away) !== Boolean(nextMetadata.soft_table_away);
+
+    // Preserve DB status: do not promote a still-active seat to eliminated on reconnect.
+    const nextDbStatus = String(player.status || '').toLowerCase() === 'eliminated'
+      || isPoolThresholdEliminatedPlayer(sessionForPresence, player, userId)
+      ? 'eliminated'
+      : player.status;
+
     if (metadataChanged) {
       await gameSessionModel.updatePlayerState(sessionId, userId, {
-        status: 'eliminated',
+        status: nextDbStatus,
         metadata: nextMetadata,
       });
     }
     const session = await gameplayService.getSessionState(sessionId);
     if (metadataChanged && session) {
-      emitPlayerStatusOverride(io, session, (session.players || []).find(
+      const livePlayer = (session.players || []).find(
         (item) => Number(item.user_id) === Number(userId)
-      ) || player, {
-        status: 'eliminated',
-        player_status: 'eliminated',
+      ) || { ...player, metadata: nextMetadata, status: nextDbStatus };
+      const playerStatus = resolveLivePlayerStatus(session, livePlayer, reason);
+      // Presence-only: chips/status sync without repeating elimination banners.
+      emitPlayerStatusOverride(io, session, livePlayer, {
+        status: nextDbStatus,
+        player_status: playerStatus,
         connection_status: nextMetadata.connection_status,
         metadata: nextMetadata,
-        content_message: 'You reached the pool threshold and are eliminated.',
-        action_message: 'Please wait for game completion or use rejoin option if available.',
       }, reason);
     }
     return { session, changed: metadataChanged, playerFound: true };
@@ -6268,13 +6396,17 @@ async function setPlayerConnectionState(io, sessionId, userId, isConnected, reas
 
   if (isConnected) {
     nextMetadata.connected_at = timestamp;
+    nextMetadata.soft_table_away = false;
     delete nextMetadata.disconnected_at;
+    delete nextMetadata.soft_table_away_at;
+    delete nextMetadata.soft_table_away_reason;
   } else {
     nextMetadata.disconnected_at = timestamp;
   }
 
   const metadataChanged = player.metadata?.connection_status !== nextConnectionStatus
-    || player.metadata?.is_connected !== isConnected;
+    || player.metadata?.is_connected !== isConnected
+    || Boolean(player.metadata?.soft_table_away) !== Boolean(nextMetadata.soft_table_away);
   const changed = currentConnectionStatus !== nextConnectionStatus || nextStatus !== player.status || metadataChanged;
   if (changed) {
     await gameSessionModel.updatePlayerState(sessionId, userId, {
@@ -11620,6 +11752,14 @@ function registerSocketServer(httpServer) {
               ? { session: await gameplayService.getSessionState(sourceSession.id), result: null }
               : await dropPlayerFromSession(io, sourceSession.id, socket.user.id)
           );
+        // Switching tables permanently opts out of pending rejoin on the source.
+        if (!isActiveTwoPlayerExit && typeof gameplayService.markPendingRejoinOptOut === 'function') {
+          await gameplayService.markPendingRejoinOptOut({
+            sessionId: sourceSession.id,
+            userId: socket.user.id,
+            reason: 'switched_table',
+          });
+        }
         const config = resolveTransitionConfig(payload, sourceSession);
         const targetSession = await gameplayService.createSession({
           gameId: config.gameId,
@@ -11666,6 +11806,13 @@ function registerSocketServer(httpServer) {
         const preferredFirstTurnUserId = Number(sourceSession?.metadata?.result?.winner_user_id);
         if (sourceSession?.id) {
           clearAutoRematchTimer(sourceSession.id);
+          if (typeof gameplayService.markPendingRejoinOptOut === 'function') {
+            await gameplayService.markPendingRejoinOptOut({
+              sessionId: sourceSession.id,
+              userId: socket.user.id,
+              reason: 'switched_table_play_now',
+            });
+          }
         }
         const config = resolveTransitionConfig(payload, sourceSession);
         const targetSession = await gameplayService.createSession({
@@ -11786,8 +11933,11 @@ function registerSocketServer(httpServer) {
       try {
         const sourceSession = await requireSourceSessionForTransition(payload, socket.user.id);
         const isActiveSession = sourceSession.status === 'active';
+        const isReadySession = String(sourceSession.status || '').toLowerCase() === 'ready';
         const isActiveTwoPlayerExit = isActiveSession
           && Number(sourceSession.max_players) === 2;
+        const isSixPlayerSoftExit = Number(sourceSession.max_players) === 6
+          && (isActiveSession || isReadySession);
         const sourceEliminatedUserIds = getEliminatedUserIdSet(sourceSession.metadata || {});
         const sourceTimeoutEliminatedUserIds = getTimeoutEliminatedUserIdSet(sourceSession.metadata || {});
         const sourcePlayer = (Array.isArray(sourceSession.players) ? sourceSession.players : [])
@@ -11804,9 +11954,25 @@ function registerSocketServer(httpServer) {
         let updatedSourceSession = null;
         let result = null;
         if (isActiveTwoPlayerExit) {
+          // Detach exiting player first so they do not receive game:result from
+          // finalize — intentional leave should return to lobby, not the result UI.
+          leaveOtherSessionRooms(socket, null);
           const outcome = await finalizeActiveTwoPlayerExit(io, sourceSession.id, socket.user.id, 'player_left_table_exit');
           updatedSourceSession = outcome.session;
           result = outcome.result || null;
+        } else if (isSixPlayerSoftExit) {
+          // 6P only: drop mid-hand if needed, then soft-away (disconnect-style pending rejoin).
+          // Never settles the table; never charges pool buyback.
+          if (isActiveSession && !alreadyDroppedOrEliminated) {
+            const outcome = await dropPlayerFromSession(io, sourceSession.id, socket.user.id);
+            updatedSourceSession = outcome?.session || null;
+            result = outcome?.result || null;
+          }
+          updatedSourceSession = await gameplayService.recordSoftTableAway({
+            sourceSessionId: sourceSession.id,
+            userId: socket.user.id,
+            reason: alreadyDroppedOrEliminated ? 'soft_table_away_after_drop' : 'soft_table_away_leave',
+          });
         } else if (isActiveSession) {
           if (alreadyDroppedOrEliminated) {
             // Idempotent leave path: user already dropped/eliminated — record
@@ -11817,27 +11983,36 @@ function registerSocketServer(httpServer) {
               reason: 'table_left_after_drop',
               activeSessionExit: true,
             });
-            await emitPendingRejoinGameForUser(io, socket.user.id, 'table_left_after_drop');
           } else {
             const outcome = await dropPlayerFromSession(io, sourceSession.id, socket.user.id);
             updatedSourceSession = outcome?.session || null;
             result = outcome?.result || null;
-            await emitPendingRejoinGameForUser(io, socket.user.id, 'table_left_after_drop');
           }
         } else {
           updatedSourceSession = await gameplayService.leaveTableContinuation({
             sourceSessionId: sourceSession.id,
             userId: socket.user.id,
           });
+          // // Detach leaver first so they do not receive the post-leave session:state
+          // // (players list no longer includes them; clients historically crashed on that).
+          // leaveOtherSessionRooms(socket, null);
           emitSessionStatePayload(io, updatedSourceSession);
-          await emitPendingRejoinGameForUser(io, socket.user.id, 'table_left');
         }
-        leaveOtherSessionRooms(socket, null);
+        // Detach from room before emitting pending so presence checks see them away.
+        // if (isActiveTwoPlayerExit || isSixPlayerSoftExit || isActiveSession) {
+          leaveOtherSessionRooms(socket, null);
+        // }
+        await emitPendingRejoinGameForUser(
+          io,
+          socket.user.id,
+          isSixPlayerSoftExit ? 'soft_table_away' : 'table_left'
+        );
 
         callback({
           success: true,
           data: {
             left: true,
+            soft_away: isSixPlayerSoftExit === true,
             source_session_id: sourceSession.id,
             source_session: updatedSourceSession,
             result,

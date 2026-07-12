@@ -1137,6 +1137,16 @@ async function leaveTableContinuation({ sourceSessionId, userId }) {
     }
   }
 
+  // 6P ongoing (e.g. pool inter_deal `ready`): soft away so disconnect-style
+  // pending rejoin remains available. Never apply to 2P or finished games.
+  if (isSixPlayerSoftRejoinSession(sourceSession)) {
+    return recordSoftTableAway({
+      sourceSessionId: sourceSession.id,
+      userId,
+      reason: 'soft_table_away_continuation',
+    });
+  }
+
   const leftUserIds = new Set(
     (Array.isArray(sourceSession.metadata?.post_result_left_user_ids) ? sourceSession.metadata.post_result_left_user_ids : [])
       .map((playerId) => Number(playerId))
@@ -1247,6 +1257,8 @@ async function recordExplicitTableLeave({
     table_left: true,
     pool_rejoin_opt_out: true,
     auto_rematch_opt_out: true,
+    pending_rejoin_opt_out: true,
+    soft_table_away: false,
     left_at: new Date().toISOString(),
     connection_status: 'disconnected',
     is_connected: false,
@@ -1277,6 +1289,115 @@ async function recordExplicitTableLeave({
   return getSessionState(sourceSession.id);
 }
 
+/**
+ * 6-player only: leave the UI like a disconnect without hard opting out of
+ * pending rejoin. Seat stays reserved; deal-drop state is preserved.
+ * Does NOT charge or touch pool buyback eligibility flags.
+ */
+async function recordSoftTableAway({
+  sourceSessionId,
+  userId,
+  reason = 'soft_table_away',
+}) {
+  const sourceSession = await getSessionState(sourceSessionId);
+  if (!sourceSession) {
+    const error = new Error('Source session not found');
+    error.code = 'SESSION_NOT_FOUND';
+    throw error;
+  }
+  if (Number(sourceSession.max_players) !== 6) {
+    const error = new Error('Soft table away is only allowed on 6-player tables');
+    error.code = 'SOFT_AWAY_NOT_ALLOWED';
+    throw error;
+  }
+
+  const sourcePlayer = (sourceSession.players || []).find(
+    (player) => Number(player.user_id) === Number(userId)
+  );
+  if (!sourcePlayer) {
+    const error = new Error('Player not found in source session');
+    error.code = 'PLAYER_NOT_FOUND';
+    throw error;
+  }
+
+  const playerStatus = String(sourcePlayer.status || '').toLowerCase();
+  const isDealDropped = sourcePlayer?.metadata?.is_dropped === true
+    || String(sourcePlayer?.metadata?.drop_status || '').toLowerCase() === 'dropped'
+    || String(sourcePlayer?.metadata?.elimination_reason || '').toLowerCase() === 'dropped'
+    || String(sourcePlayer?.metadata?.elimination_reason || '').toLowerCase() === 'timeout'
+    || playerStatus === 'eliminated';
+
+  const timestamp = new Date().toISOString();
+  const nextPlayerMetadata = {
+    ...(sourcePlayer.metadata || {}),
+    soft_table_away: true,
+    soft_table_away_at: timestamp,
+    soft_table_away_reason: reason,
+    // Keep seat reclaimable via pending rejoin — do NOT hard-leave.
+    table_left: false,
+    pool_rejoin_opt_out: false,
+    auto_rematch_opt_out: false,
+    pending_rejoin_opt_out: false,
+    connection_status: 'disconnected',
+    is_connected: false,
+    disconnected_at: timestamp,
+  };
+
+  await gameSessionModel.updatePlayerState(sourceSession.id, userId, {
+    status: isDealDropped ? 'eliminated' : 'disconnected',
+    leftAt: null,
+    metadata: nextPlayerMetadata,
+  });
+
+  await gameSessionModel.insertEvent({
+    sessionId: sourceSession.id,
+    userId,
+    eventType: 'soft_table_away',
+    payload: {
+      source_session_id: sourceSession.id,
+      reason,
+      deal_dropped: isDealDropped,
+    },
+  });
+
+  return getSessionState(sourceSession.id);
+}
+
+/** Hard opt-out of disconnect-style pending rejoin (e.g. switched to another table). */
+async function markPendingRejoinOptOut({
+  sessionId,
+  userId,
+  reason = 'pending_rejoin_opt_out',
+}) {
+  const player = await gameSessionModel.findPlayer(sessionId, userId);
+  if (!player) return null;
+
+  const timestamp = new Date().toISOString();
+  await gameSessionModel.updatePlayerState(sessionId, userId, {
+    metadata: {
+      ...(player.metadata || {}),
+      pending_rejoin_opt_out: true,
+      pending_rejoin_opt_out_at: timestamp,
+      pending_rejoin_opt_out_reason: reason,
+      soft_table_away: false,
+    },
+  });
+
+  await gameSessionModel.insertEvent({
+    sessionId,
+    userId,
+    eventType: 'pending_rejoin_opt_out',
+    payload: { reason },
+  });
+
+  return getSessionState(sessionId);
+}
+
+function isSixPlayerSoftRejoinSession(session = {}) {
+  return Number(session?.max_players) === 6
+    && ['active', 'ready'].includes(String(session?.status || '').toLowerCase());
+}
+
 module.exports = {
   createSession,
   joinSession,
@@ -1287,5 +1408,8 @@ module.exports = {
   createOrJoinContinuationSession,
   leaveTableContinuation,
   recordExplicitTableLeave,
+  recordSoftTableAway,
+  markPendingRejoinOptOut,
+  isSixPlayerSoftRejoinSession,
   userAllowedToAccessSessionMetadata,
 };
