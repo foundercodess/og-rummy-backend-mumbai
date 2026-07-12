@@ -11745,21 +11745,35 @@ function registerSocketServer(httpServer) {
           || sourcePlayer?.metadata?.is_dropped === true
           || String(sourcePlayer?.metadata?.drop_status || '').toLowerCase() === 'dropped'
           || String(sourcePlayer?.metadata?.elimination_reason || '').toLowerCase() === 'dropped';
-        const outcome = isActiveTwoPlayerExit
-          ? await finalizeActiveTwoPlayerExit(io, sourceSession.id, socket.user.id, 'player_switch_exit')
-          : (
-            alreadyDroppedOrEliminated
-              ? { session: await gameplayService.getSessionState(sourceSession.id), result: null }
-              : await dropPlayerFromSession(io, sourceSession.id, socket.user.id)
-          );
-        // Switching tables permanently opts out of pending rejoin on the source.
-        if (!isActiveTwoPlayerExit && typeof gameplayService.markPendingRejoinOptOut === 'function') {
+
+        // Switching permanently opts out of pending rejoin on the source table
+        // (including 2P finalize, which would otherwise emit a pending-rejoin hint).
+        if (typeof gameplayService.markPendingRejoinOptOut === 'function') {
           await gameplayService.markPendingRejoinOptOut({
             sessionId: sourceSession.id,
             userId: socket.user.id,
             reason: 'switched_table',
           });
         }
+
+        let outcome;
+        if (isActiveTwoPlayerExit) {
+          // Detach from the source room before finalize so this socket does not
+          // receive game:result (opponent still does). Client then boots into
+          // the new matchmaking session instead of the result overlay.
+          leaveOtherSessionRooms(socket, null);
+          outcome = await finalizeActiveTwoPlayerExit(
+            io,
+            sourceSession.id,
+            socket.user.id,
+            'player_switch_exit'
+          );
+        } else {
+          outcome = alreadyDroppedOrEliminated
+            ? { session: await gameplayService.getSessionState(sourceSession.id), result: null }
+            : await dropPlayerFromSession(io, sourceSession.id, socket.user.id);
+        }
+
         const config = resolveTransitionConfig(payload, sourceSession);
         const targetSession = await gameplayService.createSession({
           gameId: config.gameId,
