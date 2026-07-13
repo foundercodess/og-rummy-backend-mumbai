@@ -1291,7 +1291,7 @@ async function recordExplicitTableLeave({
 
 /**
  * 6-player only: leave the UI like a disconnect without hard opting out of
- * pending rejoin. Seat stays reserved; deal-drop state is preserved.
+ * pending rejoin. Seat stays reserved; deal-drop / invalid-pack state is preserved.
  * Does NOT charge or touch pool buyback eligibility flags.
  */
 async function recordSoftTableAway({
@@ -1321,11 +1321,15 @@ async function recordSoftTableAway({
   }
 
   const playerStatus = String(sourcePlayer.status || '').toLowerCase();
-  const isDealDropped = sourcePlayer?.metadata?.is_dropped === true
-    || String(sourcePlayer?.metadata?.drop_status || '').toLowerCase() === 'dropped'
-    || String(sourcePlayer?.metadata?.elimination_reason || '').toLowerCase() === 'dropped'
-    || String(sourcePlayer?.metadata?.elimination_reason || '').toLowerCase() === 'timeout'
-    || playerStatus === 'eliminated';
+  const meta = sourcePlayer.metadata || {};
+  const isDealPacked = meta.packed_in_current_deal === true
+    || meta.invalid_declaration === true;
+  const isDealDropped = meta.is_dropped === true
+    || String(meta.drop_status || '').toLowerCase() === 'dropped'
+    || String(meta.elimination_reason || '').toLowerCase() === 'dropped'
+    || String(meta.elimination_reason || '').toLowerCase() === 'timeout'
+    // Pool wipe / true seat elimination — not invalid-declare pack (DB often stays joined).
+    || (playerStatus === 'eliminated' && !isDealPacked);
 
   const timestamp = new Date().toISOString();
   const nextPlayerMetadata = {
@@ -1344,6 +1348,7 @@ async function recordSoftTableAway({
   };
 
   await gameSessionModel.updatePlayerState(sourceSession.id, userId, {
+    // Pack stays disconnect-style so classic + soft listing both see a rejoinable seat.
     status: isDealDropped ? 'eliminated' : 'disconnected',
     leftAt: null,
     metadata: nextPlayerMetadata,
@@ -1357,6 +1362,80 @@ async function recordSoftTableAway({
       source_session_id: sourceSession.id,
       reason,
       deal_dropped: isDealDropped,
+      deal_packed: isDealPacked,
+    },
+  });
+
+  return getSessionState(sourceSession.id);
+}
+
+/**
+ * Non-6 tables: leave after deal-out (e.g. invalid declare pack) without hard
+ * opt-out, so classic disconnect pending rejoin can still surface.
+ */
+async function recordDisconnectAwayForPendingRejoin({
+  sourceSessionId,
+  userId,
+  reason = 'disconnect_away',
+}) {
+  const sourceSession = await getSessionState(sourceSessionId);
+  if (!sourceSession) {
+    const error = new Error('Source session not found');
+    error.code = 'SESSION_NOT_FOUND';
+    throw error;
+  }
+
+  const sourcePlayer = (sourceSession.players || []).find(
+    (player) => Number(player.user_id) === Number(userId)
+  );
+  if (!sourcePlayer) {
+    const error = new Error('Player not found in source session');
+    error.code = 'PLAYER_NOT_FOUND';
+    throw error;
+  }
+
+  const playerStatus = String(sourcePlayer.status || '').toLowerCase();
+  const meta = sourcePlayer.metadata || {};
+  const isDealPacked = meta.packed_in_current_deal === true
+    || meta.invalid_declaration === true;
+  const keepEliminated = playerStatus === 'eliminated'
+    && !isDealPacked
+    && (
+      meta.is_dropped === true
+      || String(meta.drop_status || '').toLowerCase() === 'dropped'
+      || String(meta.elimination_reason || '').toLowerCase() === 'pool_limit'
+      || String(meta.elimination_reason || '').toLowerCase() === 'timeout'
+    );
+
+  const timestamp = new Date().toISOString();
+  const nextPlayerMetadata = {
+    ...(sourcePlayer.metadata || {}),
+    soft_table_away: Number(sourceSession.max_players) === 6,
+    soft_table_away_at: timestamp,
+    soft_table_away_reason: reason,
+    table_left: false,
+    pool_rejoin_opt_out: false,
+    auto_rematch_opt_out: false,
+    pending_rejoin_opt_out: false,
+    connection_status: 'disconnected',
+    is_connected: false,
+    disconnected_at: timestamp,
+  };
+
+  await gameSessionModel.updatePlayerState(sourceSession.id, userId, {
+    status: keepEliminated ? 'eliminated' : 'disconnected',
+    leftAt: null,
+    metadata: nextPlayerMetadata,
+  });
+
+  await gameSessionModel.insertEvent({
+    sessionId: sourceSession.id,
+    userId,
+    eventType: 'disconnect_away_pending_rejoin',
+    payload: {
+      source_session_id: sourceSession.id,
+      reason,
+      deal_packed: isDealPacked,
     },
   });
 
@@ -1409,6 +1488,7 @@ module.exports = {
   leaveTableContinuation,
   recordExplicitTableLeave,
   recordSoftTableAway,
+  recordDisconnectAwayForPendingRejoin,
   markPendingRejoinOptOut,
   isSixPlayerSoftRejoinSession,
   userAllowedToAccessSessionMetadata,

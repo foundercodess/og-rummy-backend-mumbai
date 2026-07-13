@@ -111,6 +111,8 @@ async function findLatestRejoinableSessionForUser(userId, options = {}) {
              OR COALESCE((gsp.metadata->>'is_dropped')::boolean, false) = true
              OR COALESCE(gsp.metadata->>'drop_status', '') = 'dropped'
              OR COALESCE(gsp.metadata->>'elimination_reason', '') IN ('dropped', 'timeout')
+             OR COALESCE((gsp.metadata->>'packed_in_current_deal')::boolean, false) = true
+             OR COALESCE((gsp.metadata->>'invalid_declaration')::boolean, false) = true
              OR gsp.status = 'disconnected'
              OR COALESCE(gsp.metadata->>'connection_status', '') = 'disconnected'
              OR COALESCE((gsp.metadata->>'is_connected')::boolean, false) = false
@@ -182,6 +184,8 @@ async function findLatestActiveSessionForUser(userId, options = {}) {
              OR COALESCE((gsp.metadata->>'is_dropped')::boolean, false) = true
              OR COALESCE(gsp.metadata->>'drop_status', '') = 'dropped'
              OR COALESCE(gsp.metadata->>'elimination_reason', '') IN ('dropped', 'timeout')
+             OR COALESCE((gsp.metadata->>'packed_in_current_deal')::boolean, false) = true
+             OR COALESCE((gsp.metadata->>'invalid_declaration')::boolean, false) = true
              OR gsp.status = 'disconnected'
              OR COALESCE(gsp.metadata->>'connection_status', '') = 'disconnected'
              OR COALESCE((gsp.metadata->>'is_connected')::boolean, false) = false

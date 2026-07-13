@@ -293,6 +293,24 @@ function isPoolThresholdEliminatedPlayer(session, player, userId = null) {
 }
 
 /**
+ * Mid-pool wipe on an unfinished table: "Back to Table" must open a fresh
+ * same-contest matchmaking room — never a reserved rematch against the live pool.
+ * Completed games keep the existing same-table continuation path.
+ */
+function shouldOpenFreshMatchmakingOnTableBack(session = {}, userId = null) {
+  const status = String(session?.status || '').toLowerCase();
+  if (status === 'completed') return false;
+  if (!['waiting', 'ready', 'active'].includes(status)) return false;
+  if (resolveSessionGameMode(session) !== 'pool') return false;
+
+  const uid = Number(userId);
+  if (Number.isNaN(uid)) return false;
+  const player = (Array.isArray(session.players) ? session.players : [])
+    .find((item) => Number(item?.user_id) === uid);
+  return isPoolThresholdEliminatedPlayer(session, player || {}, uid);
+}
+
+/**
  * Seat is out of the current deal / match (drop, timeout, pool wipe, exit).
  * Used for presence reconnect — not for choosing pool-threshold copy.
  */
@@ -380,6 +398,182 @@ function getTurnEliminatedUserIdSet(metadata = {}) {
     ? metadata.turn_eliminated_user_ids
     : [];
   return new Set(eliminated.map((id) => Number(id)).filter((id) => !Number.isNaN(id)));
+}
+
+function isInvalidDeclarationPackedPlayer(player = {}, metadata = {}) {
+  const playerMeta = player?.metadata && typeof player.metadata === 'object'
+    ? player.metadata
+    : {};
+  if (playerMeta.packed_in_current_deal === true) return true;
+  if (playerMeta.invalid_declaration === true) return true;
+  return false;
+}
+
+/** Fixed wrong-show penalty — never hand / ungrouped points. */
+function resolveInvalidDeclarationPenaltyPoints(player = {}) {
+  const prior = Number(player?.metadata?.invalid_declaration_penalty_points);
+  if (Number.isFinite(prior) && prior > 0) {
+    return Math.min(MAX_ROUND_LOSS_POINTS, Math.max(0, Math.floor(prior)));
+  }
+  return MAX_ROUND_LOSS_POINTS;
+}
+
+/**
+ * Merge pack flags onto in-memory players so finalize / result builders do not
+ * fall back to scoreFromBestGrouping when DB persist has not been reloaded yet.
+ */
+function applyInvalidDeclarationPackToSessionPlayers(
+  session,
+  userId,
+  {
+    penaltyPoints = MAX_ROUND_LOSS_POINTS,
+    cumulativePoints = null,
+    eliminated = false,
+  } = {}
+) {
+  const uid = Number(userId);
+  if (!session || Number.isNaN(uid)) return session;
+  const players = (Array.isArray(session.players) ? session.players : []).map((player) => {
+    if (Number(player?.user_id) !== uid) return player;
+    return {
+      ...player,
+      metadata: {
+        ...(player.metadata || {}),
+        invalid_declaration: true,
+        packed_in_current_deal: true,
+        invalid_declaration_penalty_points: penaltyPoints,
+        ...(cumulativePoints != null ? { cumulative_points: cumulativePoints } : {}),
+        ...(eliminated ? { elimination_reason: 'pool_limit' } : {}),
+      },
+    };
+  });
+  return { ...session, players };
+}
+
+/**
+ * Classify seat for table:leave / soft-away.
+ * Invalid-declare pack is per-deal only — it must NOT force hard leave / pending opt-out.
+ */
+function buildTableLeaveSeatFlags(session = {}, player = {}, userId = null) {
+  const uid = Number(userId != null ? userId : player?.user_id);
+  const meta = player?.metadata && typeof player.metadata === 'object'
+    ? player.metadata
+    : {};
+  const status = String(player?.status || '').toLowerCase();
+  const eliminationReason = String(meta.elimination_reason || '').toLowerCase();
+
+  const isTurnEliminated = !Number.isNaN(uid)
+    && getTurnEliminatedUserIdSet(session?.metadata || {}).has(uid);
+  const isTimeoutEliminated = !Number.isNaN(uid)
+    && getTimeoutEliminatedUserIdSet(session?.metadata || {}).has(uid);
+  const isPoolEliminated = !Number.isNaN(uid)
+    && (
+      getPoolEliminatedUserIdSet(session?.metadata || {}).has(uid)
+      || eliminationReason === 'pool_limit'
+    );
+  const isDealDropped = meta.is_dropped === true
+    || String(meta.drop_status || '').toLowerCase() === 'dropped'
+    || eliminationReason === 'dropped'
+    || eliminationReason === 'timeout';
+  const isDealPacked = isInvalidDeclarationPackedPlayer(player);
+  const alreadyHardLeft = meta.table_left === true || status === 'left';
+
+  // Skip dropPlayerFromSession — seat already out of this deal's rotation.
+  const skipRedundantDrop = isDealDropped
+    || isDealPacked
+    || isTurnEliminated
+    || isTimeoutEliminated
+    || isPoolEliminated
+    || status === 'eliminated'
+    || alreadyHardLeft;
+
+  // Hide pending rejoin permanently. Pack / turn_eliminated alone is NOT this.
+  const forceHardLeave = alreadyHardLeft
+    || isPoolEliminated
+    || isDealDropped
+    || isTimeoutEliminated;
+
+  return {
+    uid,
+    isTurnEliminated,
+    isTimeoutEliminated,
+    isPoolEliminated,
+    isDealDropped,
+    isDealPacked,
+    alreadyHardLeft,
+    skipRedundantDrop,
+    forceHardLeave,
+  };
+}
+
+/** Persist pack flags so later session:state / finalize do not re-score the seat. */
+async function persistInvalidDeclarationPackMetadata(
+  sessionId,
+  userId,
+  {
+    penaltyPoints = 80,
+    cumulativePoints = null,
+    eliminated = false,
+  } = {}
+) {
+  const player = await gameSessionModel.findPlayer(sessionId, userId);
+  if (!player) return null;
+  const nextMetadata = {
+    ...(player.metadata || {}),
+    invalid_declaration: true,
+    packed_in_current_deal: true,
+    invalid_declaration_penalty_points: penaltyPoints,
+    ...(cumulativePoints != null ? { cumulative_points: cumulativePoints } : {}),
+    ...(eliminated ? { elimination_reason: 'pool_limit' } : {}),
+  };
+  return gameSessionModel.updatePlayerMetadata(sessionId, userId, nextMetadata);
+}
+
+/**
+ * Lock the player's manual declare layout into the in-memory declare window.
+ * Must run before invalid-pack result builders so result UI does not fall back
+ * to buildBestGrouping when responses were never written.
+ */
+function recordManualDeclareResponse(state, userId, groups = []) {
+  if (!state?.responses || userId == null) return;
+  state.responses.set(userId, {
+    submitted_at: new Date().toISOString(),
+    auto: false,
+    groups: Array.isArray(groups) ? groups : [],
+  });
+}
+
+/**
+ * Persist last manual arrangement on distribution so later finalize / inactive
+ * prefills can show the same groups (instead of inventing a best layout).
+ */
+async function persistPlayerSubmittedGroups(sessionId, userId, groups = []) {
+  const session = await gameplayService.getSessionState(sessionId);
+  if (!session) return null;
+  const distribution = session.metadata?.distribution;
+  if (!distribution || !Array.isArray(distribution.players)) return session;
+
+  const nextPlayers = distribution.players.map((pd) => {
+    if (Number(pd?.user_id) !== Number(userId)) return pd;
+    // Never persist UIDs that are no longer in the hand (finish / sync drift).
+    const safeGroups = coerceSubmittedGroupsForHand(groups, pd?.cards || []);
+    return {
+      ...pd,
+      submitted_groups: safeGroups,
+    };
+  });
+  const nextMetadata = {
+    ...(session.metadata || {}),
+    distribution: {
+      ...distribution,
+      players: nextPlayers,
+    },
+    phase_updated_at: new Date().toISOString(),
+  };
+  await gameSessionModel.updateSessionStatus(sessionId, session.status, {
+    metadata: nextMetadata,
+  });
+  return gameplayService.getSessionState(sessionId);
 }
 
 function getActivePlayers(session) {
@@ -763,7 +957,16 @@ function resetPlayerMetadataForNextDeal(metadata = {}) {
   delete nextMetadata.is_dropped;
   delete nextMetadata.drop_status;
   delete nextMetadata.dropped_at;
+  delete nextMetadata.drop_type;
   delete nextMetadata.elimination_reason;
+  // Per-deal pack / invalid-show flags must not carry into the next hand —
+  // otherwise clients keep spectator UI while the seat is playable again.
+  delete nextMetadata.is_packed;
+  delete nextMetadata.packed;
+  delete nextMetadata.packed_in_current_deal;
+  delete nextMetadata.invalid_declaration;
+  delete nextMetadata.invalid_declaration_penalty_points;
+  delete nextMetadata.timeout_eliminated;
   // soft_table_away intentionally retained so away players keep pending-rejoin
   // until they reconnect for the next deal.
 
@@ -1424,6 +1627,13 @@ function buildPoolRoundProgress(session = {}, roundResults = []) {
     const userId = Number(result?.user_id);
     if (Number.isNaN(userId)) return;
     const key = String(userId);
+    // Penalty already written into pool_scores_by_user at pack time — do not add again.
+    if (result?.pool_score_already_applied === true) {
+      if ((scoresByUser[key] || 0) >= poolLimit) {
+        eliminatedSet.add(userId);
+      }
+      return;
+    }
     const points = Math.max(0, Number(result?.points) || 0);
     scoresByUser[key] = (scoresByUser[key] || 0) + points;
     if (scoresByUser[key] >= poolLimit) {
@@ -3595,6 +3805,57 @@ function sanitizeSubmittedGroups(groups, handCards) {
     .filter(Boolean);
 }
 
+/**
+ * Display-only: keep groups that still match the hand; drop stale/unknown UIDs.
+ * Never throws — used by result / leave / finalize so one bad layout cannot stick the table.
+ */
+function coerceSubmittedGroupsForHand(groups, handCards) {
+  if (!Array.isArray(groups)) return [];
+  const handCardIds = new Set(
+    (Array.isArray(handCards) ? handCards : [])
+      .map((card) => card?.card_uid)
+      .filter(Boolean)
+  );
+  const used = new Set();
+  const next = [];
+
+  groups.forEach((group, idx) => {
+    const rawCards = Array.isArray(group?.cards) ? group.cards : [];
+    const cardIds = rawCards
+      .map((card) => (typeof card === 'string' ? card : card?.card_uid))
+      .filter((cardId) => Boolean(cardId) && handCardIds.has(cardId) && !used.has(cardId));
+    cardIds.forEach((cardId) => used.add(cardId));
+    if (cardIds.length === 0) return;
+    next.push({
+      group_id: group?.group_id || idx + 1,
+      cards: cardIds,
+    });
+  });
+
+  return next;
+}
+
+/**
+ * Prefer manual/auto submitted layout on result screens; never throw.
+ * Falls back to best grouping when layout is missing or incompatible with the hand.
+ */
+function resolveResultHandGrouping(playerCards, wildJoker, groups = null) {
+  const handCards = Array.isArray(playerCards) ? playerCards : [];
+  const coerced = coerceSubmittedGroupsForHand(groups, handCards);
+  if (coerced.length > 0) {
+    try {
+      return groupingService.evaluateSubmittedGrouping(handCards, wildJoker, coerced);
+    } catch (_) {
+      // Fall through to best.
+    }
+  }
+  try {
+    return groupingService.buildBestGrouping(handCards, wildJoker);
+  } catch (_) {
+    return null;
+  }
+}
+
 function resolveSubmittedGroupsInput(rawGroups, fallbackGroups, handCards) {
   const sourceGroups = Array.isArray(rawGroups) ? rawGroups : fallbackGroups;
   return sanitizeSubmittedGroups(sourceGroups, handCards || []);
@@ -3905,8 +4166,10 @@ function isPlayerInactiveForDeclaration(session, player, distribution) {
   if (Number.isNaN(userId)) return false;
   const playerDistribution = getPlayerDistribution(distribution, userId);
   if (isPlayerDropped(player, playerDistribution)) return true;
+  if (isInvalidDeclarationPackedPlayer(player)) return true;
   if (getEliminatedUserIdSet(session?.metadata || {}).has(userId)) return true;
   if (getTimeoutEliminatedUserIdSet(session?.metadata || {}).has(userId)) return true;
+  if (getTurnEliminatedUserIdSet(session?.metadata || {}).has(userId)) return true;
   if (String(player?.status || '').toLowerCase() === 'eliminated') return true;
   if (player?.metadata?.elimination_reason === 'pool_limit') return true;
   return false;
@@ -3925,6 +4188,19 @@ function prefillInactivePlayersInDeclareResponses(session, distribution, players
     if (!isPlayerInactiveForDeclaration(session, player, distribution)) return;
     const playerDistribution = getPlayerDistribution(distribution, userId);
     const playerCards = playerDistribution?.cards || [];
+    // Prefer last known layout (manual declare / finish arrangement) over inventing best.
+    // True auto-declare (no stored groups) still falls through to buildBestGrouping.
+    const storedGroups = Array.isArray(playerDistribution?.submitted_groups)
+      ? playerDistribution.submitted_groups
+      : [];
+    if (storedGroups.length > 0) {
+      responses.set(userId, {
+        submitted_at: submittedAt || new Date().toISOString(),
+        auto: false,
+        groups: storedGroups,
+      });
+      return;
+    }
     const autoGrouping = groupingService.buildBestGrouping(playerCards, wildJoker);
     responses.set(userId, {
       submitted_at: submittedAt || new Date().toISOString(),
@@ -3995,6 +4271,95 @@ function resolveStatusColor(playerStatus = null) {
     default:
       return '#6B7280';
   }
+}
+
+/**
+ * Normalize hand arrangement groups (submitted_groups / auto_groups) to
+ * evaluateSubmittedGrouping shape: [{ group_id, cards: [card_uid, ...] }].
+ */
+function normalizeArrangementGroupsForTip(playerDistribution = null) {
+  const submitted = Array.isArray(playerDistribution?.submitted_groups)
+    ? playerDistribution.submitted_groups
+    : null;
+  if (submitted && submitted.length > 0) {
+    return submitted.map((group, idx) => ({
+      group_id: group?.group_id || idx + 1,
+      cards: (Array.isArray(group?.cards) ? group.cards : [])
+        .map((card) => (typeof card === 'string' ? card : card?.card_uid))
+        .filter((uid) => typeof uid === 'string' && uid.length > 0),
+    })).filter((group) => group.cards.length > 0);
+  }
+
+  const autoGroups = Array.isArray(playerDistribution?.auto_groups?.groups)
+    ? playerDistribution.auto_groups.groups
+    : null;
+  if (autoGroups && autoGroups.length > 0) {
+    return autoGroups.map((group, idx) => ({
+      group_id: group?.group_id || idx + 1,
+      cards: (Array.isArray(group?.cards) ? group.cards : [])
+        .map((card) => (typeof card === 'string' ? card : card?.card_uid))
+        .filter((uid) => typeof uid === 'string' && uid.length > 0),
+    })).filter((group) => group.cards.length > 0);
+  }
+
+  return [];
+}
+
+/**
+ * View-only educational tip for every mode: attach best_grouping whenever a
+ * better layout exists than the displayed / last-arranged hand. Never changes scores.
+ * Covers manual declare, auto-declare, drop, timeout, and all other hand outcomes.
+ */
+function resolveBestDeclareGroupingTip({
+  playerCards,
+  wildJoker,
+  grouping,
+  playerDistribution = null,
+} = {}) {
+  if (!Array.isArray(playerCards) || playerCards.length === 0) {
+    return { best_grouping: null, best_score: null };
+  }
+
+  let best;
+  try {
+    best = groupingService.buildBestGrouping(playerCards, wildJoker);
+  } catch (_) {
+    return { best_grouping: null, best_score: null };
+  }
+
+  const bestPoint = Number(best?.summary?.display_point);
+  if (!Number.isFinite(bestPoint)) {
+    return { best_grouping: null, best_score: null };
+  }
+
+  let baselinePoint = Number(grouping?.summary?.display_point);
+  const arrangementGroups = normalizeArrangementGroupsForTip(playerDistribution);
+  if (arrangementGroups.length > 0) {
+    try {
+      const arranged = groupingService.evaluateSubmittedGrouping(
+        playerCards,
+        wildJoker,
+        arrangementGroups
+      );
+      const arrangedPoint = Number(arranged?.summary?.display_point);
+      if (Number.isFinite(arrangedPoint)) {
+        baselinePoint = Number.isFinite(baselinePoint)
+          ? Math.max(baselinePoint, arrangedPoint)
+          : arrangedPoint;
+      }
+    } catch (_) {
+      // Ignore bad/stale arrangement snapshots; fall back to displayed grouping.
+    }
+  }
+
+  if (!Number.isFinite(baselinePoint) || bestPoint >= baselinePoint) {
+    return { best_grouping: null, best_score: null };
+  }
+
+  return {
+    best_grouping: best,
+    best_score: Math.min(MAX_ROUND_LOSS_POINTS, Math.max(0, Math.floor(bestPoint))),
+  };
 }
 
 function buildDeclarationTablePlayers({
@@ -4095,25 +4460,50 @@ function buildDeclarationTablePlayers({
         totalScore = previousScore + (Number.isFinite(dropPenalty) ? dropPenalty : 0);
       }
     }
+    // Wrong-show is always full max loss — never hand/ungrouped display points.
+    if (
+      isFinal
+      && !isWinner
+      && (
+        result?.player_status === 'invalid_declaration'
+        || resolvedPlayerStatus === 'invalid_declaration'
+        || isInvalidDeclarationPackedPlayer(player)
+      )
+    ) {
+      roundPoints = MAX_ROUND_LOSS_POINTS;
+    }
     const scoreModel = result?.score_model
       ?? (mode === 'pool' ? 'pool_loss_cumulative' : (isDealLikeMode(mode) ? 'deal_base_plus_minus' : null));
     const resolvedWonAmount = settlementEntry?.amount ?? (isFinal ? 0 : null);
 
     let cards = null;
     let grouping = null;
+    let bestGrouping = null;
+    let bestScore = null;
 
     if (isFinal) {
       cards = playerCards;
-      grouping = playerResponse
-        ? groupingService.evaluateSubmittedGrouping(playerCards, wildJoker, playerResponse.groups || [])
-        : groupingService.buildBestGrouping(playerCards, wildJoker);
+      const responseGroups = playerResponse?.groups || null;
+      const storedGroups = Array.isArray(playerDistribution?.submitted_groups)
+        ? playerDistribution.submitted_groups
+        : null;
+      // Manual declare/response first; stored finish/declare layout next; best last.
+      // Never throw — leave/finalize used to get stuck on stale card UIDs.
+      grouping = resolveResultHandGrouping(
+        playerCards,
+        wildJoker,
+        responseGroups || storedGroups
+      );
     } else if (submitted) {
       cards = playerCards;
       const submittedGroups = playerResponse?.groups || [];
       if ((isDropped || isInactiveForDeclare) && submittedGroups.length === 0) {
-        grouping = groupingService.buildBestGrouping(playerCards, wildJoker);
+        const storedGroups = Array.isArray(playerDistribution?.submitted_groups)
+          ? playerDistribution.submitted_groups
+          : [];
+        grouping = resolveResultHandGrouping(playerCards, wildJoker, storedGroups);
       } else {
-        grouping = groupingService.evaluateSubmittedGrouping(playerCards, wildJoker, submittedGroups);
+        grouping = resolveResultHandGrouping(playerCards, wildJoker, submittedGroups);
       }
     }
 
@@ -4123,6 +4513,15 @@ function buildDeclarationTablePlayers({
       || result?.player_status === 'timeout'
       || result?.player_status === 'dropped'
       || result?.dropped === true;
+
+    const tip = resolveBestDeclareGroupingTip({
+      playerCards,
+      wildJoker,
+      grouping,
+      playerDistribution,
+    });
+    bestGrouping = tip.best_grouping;
+    bestScore = tip.best_score;
 
     if ((mode === 'pool' || isDealLikeMode(mode)) && isFinal && grouping?.summary != null && !isWinner && !isTimeoutOrDropped) {
       const displayPoint = Number(grouping.summary.display_point);
@@ -4154,6 +4553,8 @@ function buildDeclarationTablePlayers({
         : (isDropped ? 'auto' : (submitted ? 'submitted' : 'pending')),
       cards,
       grouping,
+      best_grouping: bestGrouping,
+      best_score: bestScore,
       score: roundPoints,
       // mode === 'pool'
       //   ? roundPoints
@@ -5988,6 +6389,8 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
     || String(player?.metadata?.drop_status || '').toLowerCase() === 'dropped'
     || String(player?.metadata?.elimination_reason || '').toLowerCase() === 'dropped'
     || String(player?.metadata?.elimination_reason || '').toLowerCase() === 'timeout';
+  const playerDealPacked = player?.metadata?.packed_in_current_deal === true
+    || player?.metadata?.invalid_declaration === true;
   const softTableAway = player?.metadata?.soft_table_away === true;
   const playerLeftTable = player?.metadata?.table_left === true
     || String(player?.status || '').toLowerCase() === 'left';
@@ -6066,8 +6469,8 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
     || poolBuybackEligible
   );
 
-  // Dropped but still sitting in the room → no banner until they leave/disconnect.
-  if (canRejoin && softSixPlayerEligible && playerDropped && !softTableAway
+  // Dropped / packed but still sitting in the room → no banner until they leave/disconnect.
+  if (canRejoin && softSixPlayerEligible && (playerDropped || playerDealPacked) && !softTableAway
     && !playerDisconnected && isPresentInSessionRoom === true) {
     canRejoin = false;
   }
@@ -6209,7 +6612,8 @@ async function syncConnectedPresenceForPendingSession(io, socket) {
 function resolveLivePlayerStatus(session, player, reason = null) {
   const userId = Number(player?.user_id);
   const timeoutEliminatedSet = getTimeoutEliminatedUserIdSet(session?.metadata || {});
-  const eliminatedSet = getEliminatedUserIdSet(session?.metadata || {});
+  const turnEliminatedSet = getTurnEliminatedUserIdSet(session?.metadata || {});
+  const poolEliminatedSet = getPoolEliminatedUserIdSet(session?.metadata || {});
 
   if (reason === 'timeout_eliminated' || timeoutEliminatedSet.has(userId)) {
     return 'timeout';
@@ -6224,11 +6628,28 @@ function resolveLivePlayerStatus(session, player, reason = null) {
     return 'dropped';
   }
 
+  // Invalid declare pack is per-deal — do not collapse it into pool "eliminated".
   if (
-    eliminatedSet.has(userId)
+    reason === 'invalid_declaration_packed'
+    || isInvalidDeclarationPackedPlayer(player)
+  ) {
+    if (poolEliminatedSet.has(userId)
+      || player?.metadata?.elimination_reason === 'pool_limit') {
+      return 'eliminated';
+    }
+    return 'invalid_declaration';
+  }
+
+  if (
+    poolEliminatedSet.has(userId)
     || player?.status === 'eliminated'
     || player?.metadata?.elimination_reason === 'pool_limit'
   ) {
+    return 'eliminated';
+  }
+
+  // Deal-out via turn_eliminated without pack metadata (legacy / edge).
+  if (turnEliminatedSet.has(userId)) {
     return 'eliminated';
   }
 
@@ -7826,6 +8247,11 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
         (entry) => Number(entry.user_id) === Number(refreshedTurn.user_id)
       );
       if (botPlayer) {
+        await persistInvalidDeclarationPackMetadata(sessionId, refreshedTurn.user_id, {
+          penaltyPoints: 80,
+          cumulativePoints: nextScore,
+          eliminated: crossedPoolLimitNow,
+        });
         emitPlayerStatusOverride(io, refreshed, botPlayer, {
           status: crossedPoolLimitNow ? 'eliminated' : botPlayer.status,
           player_status: crossedPoolLimitNow ? 'eliminated' : 'invalid_declaration',
@@ -8150,6 +8576,10 @@ async function finalizeGameByElimination(
     ...Array.from(getTimeoutEliminatedUserIdSet(session.metadata || {})),
     ...timeoutEliminatedUserIds,
   ].map((id) => Number(id)).filter((id) => !Number.isNaN(id)));
+  const turnEliminatedSet = getTurnEliminatedUserIdSet(session.metadata || {});
+  // Wrong-show last-standing: pack flags may still be missing on stale players[].
+  // Never score those seats from hand/ungrouped points — always full 80.
+  const isInvalidDeclareFinalize = String(reason || '').includes('invalid_declaration');
 
   let finalizedResults = players.map((player) => {
     const playerDistribution = getPlayerDistribution(distribution, player.user_id);
@@ -8157,13 +8587,24 @@ async function finalizeGameByElimination(
     const scoring = scoreFromBestGrouping(playerCards, wildJoker);
     const isWinner = Number(player.user_id) === Number(winnerUserId);
     const isDropped = isPlayerDropped(player, playerDistribution);
+    const uid = Number(player.user_id);
+    const isInvalidPacked = isInvalidDeclarationPackedPlayer(player)
+      || (
+        isInvalidDeclareFinalize
+        && !isWinner
+        && !isDropped
+        && !timeoutEliminatedSet.has(uid)
+        && turnEliminatedSet.has(uid)
+      );
     let points = scoring.points;
     if (isDropped) {
       const droppedPenalty = resolveDropLossPoints(session, player.user_id);
       if (Number.isFinite(droppedPenalty)) {
         points = droppedPenalty;
       }
-    } else if (timeoutEliminatedSet.has(Number(player.user_id))) {
+    } else if (isInvalidPacked) {
+      points = resolveInvalidDeclarationPenaltyPoints(player);
+    } else if (timeoutEliminatedSet.has(uid)) {
       const timeoutPenalty = resolveDropLossPoints(session, player.user_id, { forceMiddleDrop: true });
       if (Number.isFinite(timeoutPenalty)) {
         points = timeoutPenalty;
@@ -8173,21 +8614,24 @@ async function finalizeGameByElimination(
       ? 'won'
       : isDropped
         ? 'dropped'
-        : timeoutEliminatedSet.has(Number(player.user_id))
-          ? 'timeout'
-          : 'lost';
+        : isInvalidPacked
+          ? 'invalid_declaration'
+          : timeoutEliminatedSet.has(uid)
+            ? 'timeout'
+            : 'lost';
 
     return {
       user_id: player.user_id,
       seat_no: player.seat_no,
       points: isWinner ? 0 : points,
+      round_points: isWinner ? 0 : points,
       grouped_points: scoring.grouping.summary.grouped_points,
       ungrouped_points: scoring.grouping.summary.ungrouped_points,
-      valid_for_declare: scoring.grouping.summary.valid_for_declare,
+      valid_for_declare: isInvalidPacked ? false : scoring.grouping.summary.valid_for_declare,
       invalid_group_count: Number(scoring.grouping.summary.invalid_group_count) || 0,
       all_cards_grouped: scoring.grouping.summary.all_cards_grouped !== false,
-      submission_mode: 'auto',
-      submission_status: 'auto',
+      submission_mode: isInvalidPacked ? 'manual' : 'auto',
+      submission_status: isInvalidPacked ? 'manual' : 'auto',
       player_status: playerStatus,
       status_color: resolveStatusColor(playerStatus),
       dropped: isDropped,
@@ -8285,7 +8729,9 @@ async function finalizeGameByElimination(
     resultPayload.players = buildDeclarationTablePlayers({
       session,
       distribution,
-      state: { responses: new Map(), declareByUserId: null },
+      // Prefer live declare responses (manual invalid layout) over empty map.
+      state: activeDeclareBySession.get(sessionId)
+        || { responses: new Map(), declareByUserId: null },
       isFinal: true,
       finalizedResults,
       settlement,
@@ -8398,7 +8844,9 @@ async function finalizeGameByElimination(
   resultPayload.players = buildDeclarationTablePlayers({
     session,
     distribution,
-    state: { responses: new Map(), declareByUserId: null },
+    // Prefer live declare responses (manual invalid layout) over empty map.
+    state: activeDeclareBySession.get(sessionId)
+      || { responses: new Map(), declareByUserId: null },
     isFinal: true,
     finalizedResults,
     settlement,
@@ -9302,6 +9750,7 @@ function registerSocketServer(httpServer) {
       );
 
       const timeoutEliminatedSet = getTimeoutEliminatedUserIdSet(session.metadata || {});
+      const turnEliminatedSet = getTurnEliminatedUserIdSet(session.metadata || {});
       const results = roundPlayers.map((player) => {
         const playerDistribution = getPlayerDistribution(distribution, player.user_id);
         const playerCards = playerDistribution?.cards || [];
@@ -9313,7 +9762,11 @@ function registerSocketServer(httpServer) {
         const isDropped = isPlayerDropped(player, playerDistribution);
         const isTimeoutEliminated = timeoutEliminatedSet.has(userId);
         let points = scoring.points;
-        const alreadyScoredThisDeal = player?.metadata?.packed_in_current_deal === true;
+        const alreadyScoredThisDeal = isInvalidDeclarationPackedPlayer(
+          player,
+          session.metadata || {}
+        );
+        let poolScoreAlreadyApplied = false;
 
         if (isDropped) {
           const droppedPenalty = resolveDropLossPoints(session, player.user_id);
@@ -9330,15 +9783,18 @@ function registerSocketServer(httpServer) {
         }
 
         if (alreadyScoredThisDeal) {
-          // Invalid-declaration pack already applied pool/deal penalty for this round.
-          points = 0;
-          logGame(sessionId, `Skipping declaration scoring for packed uid=${player.user_id} (already settled this deal)`);
-        }
-
-        if (player.user_id === declarerUserId && !declarerValid) {
-          points = 80;
+          // Invalid-declaration pack already applied pool penalty for this round.
+          // Keep display points = penalty, but do not add them again to pool totals.
+          points = resolveInvalidDeclarationPenaltyPoints(player);
+          poolScoreAlreadyApplied = true;
+          logGame(
+            sessionId,
+            `Skipping pool re-score for packed uid=${player.user_id} (already settled this deal @ ${points}pts)`
+          );
+        } else if (player.user_id === declarerUserId && !declarerValid) {
+          points = MAX_ROUND_LOSS_POINTS;
           logGame(sessionId, `Applying 80pt penalty to invalid declarer uid=${player.user_id}`);
-        } else if (!alreadyScoredThisDeal && !isDropped && !isTimeoutEliminated) {
+        } else if (!isDropped && !isTimeoutEliminated) {
           const halfPenalty = resolveFirstRoundNoChanceDeclarePenalty(
             points,
             playerDistribution
@@ -9363,6 +9819,8 @@ function registerSocketServer(httpServer) {
           user_id: player.user_id,
           seat_no: player.seat_no,
           points,
+          round_points: points,
+          pool_score_already_applied: poolScoreAlreadyApplied,
           grouped_points: scoring.grouping.summary.grouped_points,
           ungrouped_points: scoring.grouping.summary.ungrouped_points,
           valid_for_declare: scoring.grouping.summary.valid_for_declare,
@@ -9375,6 +9833,7 @@ function registerSocketServer(httpServer) {
             ? (state.responses.get(player.user_id)?.auto ? 'auto' : 'manual')
             : 'not_submitted',
           dropped: isDropped || isTimeoutEliminated,
+          packed_in_current_deal: alreadyScoredThisDeal,
         };
       });
 
@@ -9384,8 +9843,14 @@ function registerSocketServer(httpServer) {
           if (a.points !== b.points) return a.points - b.points;
           return a.seat_no - b.seat_no;
         });
-        // Invalid declarer cannot win ties by seat order. Prefer a non-declarer winner when available.
-        const sortedNonDeclarer = sorted.filter((item) => Number(item.user_id) !== Number(declarerUserId));
+        // Invalid declarer cannot win. Prefer active non-declarer seats.
+        const sortedNonDeclarer = sorted.filter((item) => {
+          const uid = Number(item.user_id);
+          if (uid === Number(declarerUserId)) return false;
+          if (turnEliminatedSet.has(uid)) return false;
+          if (item.dropped === true || item.packed_in_current_deal === true) return false;
+          return true;
+        });
         winnerUserId = sortedNonDeclarer[0]?.user_id || sorted[0]?.user_id || declarerUserId;
         logGame(sessionId, `Declarer invalid — winner re-resolved to uid=${winnerUserId} (${sorted[0]?.points}pts)`);
       } else {
@@ -11736,16 +12201,13 @@ function registerSocketServer(httpServer) {
         const sourceSession = await requireSourceSessionForTransition(payload, socket.user.id);
         const isActiveTwoPlayerExit = sourceSession.status === 'active'
           && Number(sourceSession.max_players) === 2;
-        const sourceEliminatedUserIds = getEliminatedUserIdSet(sourceSession.metadata || {});
         const sourcePlayer = (Array.isArray(sourceSession.players) ? sourceSession.players : [])
           .find((player) => Number(player.user_id) === Number(socket.user.id));
-        const alreadyDroppedOrEliminated = sourceEliminatedUserIds.has(Number(socket.user.id))
-          || sourcePlayer?.status === 'eliminated'
-          || sourcePlayer?.status === 'left'
-          || sourcePlayer?.metadata?.is_dropped === true
-          || String(sourcePlayer?.metadata?.drop_status || '').toLowerCase() === 'dropped'
-          || String(sourcePlayer?.metadata?.elimination_reason || '').toLowerCase() === 'dropped';
-
+        const leaveFlags = buildTableLeaveSeatFlags(
+          sourceSession,
+          sourcePlayer || {},
+          socket.user.id
+        );
         // Switching permanently opts out of pending rejoin on the source table
         // (including 2P finalize, which would otherwise emit a pending-rejoin hint).
         if (typeof gameplayService.markPendingRejoinOptOut === 'function') {
@@ -11769,7 +12231,7 @@ function registerSocketServer(httpServer) {
             'player_switch_exit'
           );
         } else {
-          outcome = alreadyDroppedOrEliminated
+          outcome = leaveFlags.skipRedundantDrop
             ? { session: await gameplayService.getSessionState(sourceSession.id), result: null }
             : await dropPlayerFromSession(io, sourceSession.id, socket.user.id);
         }
@@ -11884,15 +12346,47 @@ function registerSocketServer(httpServer) {
         const sourceSession = await requireSourceSessionForTransition(payload, socket.user.id);
         const preferredFirstTurnUserId = Number(sourceSession?.metadata?.result?.winner_user_id);
         clearAutoRematchTimer(sourceSession.id);
-        const continuation = await gameplayService.createOrJoinContinuationSession({
-          sourceSessionId: sourceSession.id,
-          userId: socket.user.id,
-        });
 
-        let targetSession = continuation.session;
+        // Pool still running + this seat is pool-eliminated: start a fresh table
+        // (same contest). Do NOT create reserved rematch against the unfinished source.
+        const openFreshMatchmaking = shouldOpenFreshMatchmakingOnTableBack(
+          sourceSession,
+          socket.user.id
+        );
 
+        let targetSession = null;
         let transitionType = 'same_table_continuation';
-        if (!targetSession && continuation.fallbackToMatchmaking) {
+        let continuationReused = false;
+        let fallbackToMatchmaking = false;
+        let eligibleUserIds = null;
+
+        if (openFreshMatchmaking) {
+          if (typeof gameplayService.markPendingRejoinOptOut === 'function') {
+            await gameplayService.markPendingRejoinOptOut({
+              sessionId: sourceSession.id,
+              userId: socket.user.id,
+              reason: 'table_back_fresh_after_pool_elimination',
+            });
+          }
+          // Hard-leave the unfinished pool seat so pending-rejoin / buyback UI
+          // does not fight the new matchmaking table.
+          if (typeof gameplayService.recordExplicitTableLeave === 'function') {
+            try {
+              await gameplayService.recordExplicitTableLeave({
+                sourceSessionId: sourceSession.id,
+                userId: socket.user.id,
+                reason: 'table_back_fresh_after_pool_elimination',
+                activeSessionExit: true,
+              });
+            } catch (leaveErr) {
+              // Seat may already be left/opted-out; still open the fresh table.
+              warnGame(
+                sourceSession.id,
+                `table:back pool-elim leave skipped uid=${socket.user.id}: ${leaveErr.message}`
+              );
+            }
+          }
+
           const config = resolveTransitionConfig(payload, sourceSession);
           targetSession = await gameplayService.createSession({
             gameId: config.gameId,
@@ -11900,20 +12394,52 @@ function registerSocketServer(httpServer) {
             hostUserId: socket.user.id,
             maxPlayers: config.maxPlayers,
             metadata: {
-              transition_action: 'table_back_fallback',
+              transition_action: 'table_back_fresh_after_pool_elimination',
               transition_source_session_id: sourceSession.id,
             },
           });
-          transitionType = 'same_table_fallback_matchmaking';
+          transitionType = 'matchmaking_only';
+          fallbackToMatchmaking = true;
+        } else {
+          const continuation = await gameplayService.createOrJoinContinuationSession({
+            sourceSessionId: sourceSession.id,
+            userId: socket.user.id,
+          });
+
+          targetSession = continuation.session;
+          continuationReused = continuation.reused === true;
+          fallbackToMatchmaking = continuation.fallbackToMatchmaking === true;
+          eligibleUserIds = continuation.eligibleUserIds || null;
+
+          if (!targetSession && continuation.fallbackToMatchmaking) {
+            const config = resolveTransitionConfig(payload, sourceSession);
+            targetSession = await gameplayService.createSession({
+              gameId: config.gameId,
+              contestId: config.contestId,
+              hostUserId: socket.user.id,
+              maxPlayers: config.maxPlayers,
+              metadata: {
+                transition_action: 'table_back_fallback',
+                transition_source_session_id: sourceSession.id,
+              },
+            });
+            transitionType = 'same_table_fallback_matchmaking';
+          }
         }
 
         const { liveSession } = await attachSocketToSession(io, socket, targetSession, {
-          presenceReason: 'table_back',
+          presenceReason: openFreshMatchmaking
+            ? 'table_back_fresh_after_pool_elimination'
+            : 'table_back',
           // Manual back-to-table must trigger pregame once all seats are filled.
           startPregameIfReady: true,
         });
         leaveOtherSessionRooms(socket, liveSession.id);
-        const phaseSync = syncSocketToSessionPhase(socket, liveSession, 'table_back');
+        const phaseSync = syncSocketToSessionPhase(
+          socket,
+          liveSession,
+          openFreshMatchmaking ? 'table_back_fresh' : 'table_back'
+        );
 
         callback({
           success: true,
@@ -11923,13 +12449,18 @@ function registerSocketServer(httpServer) {
             target_session: liveSession,
             phase: phaseSync.phase,
             sync_event: phaseSync.event,
-            continuation_reused: continuation.reused === true,
-            fallback_to_matchmaking: continuation.fallbackToMatchmaking === true,
-            eligible_user_ids: continuation.eligibleUserIds || null,
+            continuation_reused: continuationReused,
+            fallback_to_matchmaking: fallbackToMatchmaking,
+            eligible_user_ids: eligibleUserIds,
+            fresh_after_pool_elimination: openFreshMatchmaking === true,
           },
         });
         await emitSessionState(io, liveSession.id);
-        if (sourceSession.status === 'completed') {
+
+        // Completed rematch: fill bots / start countdown on the target table.
+        // Mid-pool eliminated fresh path: also fill — source is not completed, but
+        // the new open table still needs seats for 6P contests.
+        if (sourceSession.status === 'completed' || openFreshMatchmaking) {
           maybeStartRematchFastDeal(io, liveSession.id, {
             preferredFirstTurnUserId: Number.isNaN(preferredFirstTurnUserId) ? null : preferredFirstTurnUserId,
             enforceModeGate: false,
@@ -11952,32 +12483,52 @@ function registerSocketServer(httpServer) {
           && Number(sourceSession.max_players) === 2;
         const isSixPlayerSoftExit = Number(sourceSession.max_players) === 6
           && (isActiveSession || isReadySession);
-        const sourceEliminatedUserIds = getEliminatedUserIdSet(sourceSession.metadata || {});
-        const sourceTimeoutEliminatedUserIds = getTimeoutEliminatedUserIdSet(sourceSession.metadata || {});
         const sourcePlayer = (Array.isArray(sourceSession.players) ? sourceSession.players : [])
           .find((player) => Number(player.user_id) === Number(socket.user.id));
-        const alreadyDroppedOrEliminated = sourceEliminatedUserIds.has(Number(socket.user.id))
-          || sourceTimeoutEliminatedUserIds.has(Number(socket.user.id))
-          || sourcePlayer?.status === 'eliminated'
-          || sourcePlayer?.status === 'left'
-          || sourcePlayer?.metadata?.is_dropped === true
-          || sourcePlayer?.metadata?.table_left === true
-          || String(sourcePlayer?.metadata?.drop_status || '').toLowerCase() === 'dropped'
-          || String(sourcePlayer?.metadata?.elimination_reason || '').toLowerCase() === 'dropped'
-          || String(sourcePlayer?.metadata?.elimination_reason || '').toLowerCase() === 'timeout';
+        const leaveFlags = buildTableLeaveSeatFlags(
+          sourceSession,
+          sourcePlayer || {},
+          socket.user.id
+        );
         let updatedSourceSession = null;
         let result = null;
+        let softAway = false;
         if (isActiveTwoPlayerExit) {
           // Detach exiting player first so they do not receive game:result from
           // finalize — intentional leave should return to lobby, not the result UI.
           leaveOtherSessionRooms(socket, null);
-          const outcome = await finalizeActiveTwoPlayerExit(io, sourceSession.id, socket.user.id, 'player_left_table_exit');
-          updatedSourceSession = outcome.session;
-          result = outcome.result || null;
+          try {
+            const outcome = await finalizeActiveTwoPlayerExit(
+              io,
+              sourceSession.id,
+              socket.user.id,
+              'player_left_table_exit'
+            );
+            updatedSourceSession = outcome.session;
+            result = outcome.result || null;
+          } catch (finalizeErr) {
+            // Never trap a packed/stuck seat on leave — detach + hard-leave as fallback.
+            warnGame(
+              sourceSession.id,
+              `table:leave 2P finalize failed uid=${socket.user.id}: ${finalizeErr.message}`
+            );
+            if (typeof gameplayService.recordExplicitTableLeave === 'function') {
+              updatedSourceSession = await gameplayService.recordExplicitTableLeave({
+                sourceSessionId: sourceSession.id,
+                userId: socket.user.id,
+                reason: 'table_left_after_2p_finalize_fallback',
+                activeSessionExit: true,
+              });
+            } else {
+              updatedSourceSession = sourceSession;
+            }
+          }
         } else if (isSixPlayerSoftExit) {
           // 6P only: drop mid-hand if needed, then soft-away (disconnect-style pending rejoin).
+          // Invalid-declare pack / turn_eliminated skip drop but still soft-away —
+          // never hard-opt-out (that used to hide pending rejoin after pack+leave).
           // Never settles the table; never charges pool buyback.
-          if (isActiveSession && !alreadyDroppedOrEliminated) {
+          if (isActiveSession && !leaveFlags.skipRedundantDrop) {
             const outcome = await dropPlayerFromSession(io, sourceSession.id, socket.user.id);
             updatedSourceSession = outcome?.session || null;
             result = outcome?.result || null;
@@ -11985,18 +12536,35 @@ function registerSocketServer(httpServer) {
           updatedSourceSession = await gameplayService.recordSoftTableAway({
             sourceSessionId: sourceSession.id,
             userId: socket.user.id,
-            reason: alreadyDroppedOrEliminated ? 'soft_table_away_after_drop' : 'soft_table_away_leave',
+            reason: leaveFlags.skipRedundantDrop
+              ? (leaveFlags.isDealPacked
+                ? 'soft_table_away_after_invalid_declare'
+                : 'soft_table_away_after_drop')
+              : 'soft_table_away_leave',
           });
+          softAway = true;
         } else if (isActiveSession) {
-          if (alreadyDroppedOrEliminated) {
-            // Idempotent leave path: user already dropped/eliminated — record
-            // explicit exit so pending rejoin / pool buyback no longer surfaces.
+          if (leaveFlags.forceHardLeave) {
+            // Real drop / timeout / pool wipe / prior hard leave — hide pending.
             updatedSourceSession = await gameplayService.recordExplicitTableLeave({
               sourceSessionId: sourceSession.id,
               userId: socket.user.id,
-              reason: 'table_left_after_drop',
+              reason: leaveFlags.isPoolEliminated
+                ? 'table_left_after_pool_elimination'
+                : 'table_left_after_drop',
               activeSessionExit: true,
             });
+          } else if (leaveFlags.skipRedundantDrop) {
+            // Invalid-declare pack (or similar deal-out) on non-6: keep classic
+            // disconnect pending rejoin — do not hard-opt-out.
+            updatedSourceSession = await gameplayService.recordDisconnectAwayForPendingRejoin({
+              sourceSessionId: sourceSession.id,
+              userId: socket.user.id,
+              reason: leaveFlags.isDealPacked
+                ? 'disconnect_away_after_invalid_declare'
+                : 'disconnect_away_after_deal_out',
+            });
+            softAway = true;
           } else {
             const outcome = await dropPlayerFromSession(io, sourceSession.id, socket.user.id);
             updatedSourceSession = outcome?.session || null;
@@ -12019,14 +12587,14 @@ function registerSocketServer(httpServer) {
         await emitPendingRejoinGameForUser(
           io,
           socket.user.id,
-          isSixPlayerSoftExit ? 'soft_table_away' : 'table_left'
+          softAway ? 'soft_table_away' : 'table_left'
         );
 
         callback({
           success: true,
           data: {
             left: true,
-            soft_away: isSixPlayerSoftExit === true,
+            soft_away: softAway === true,
             source_session_id: sourceSession.id,
             source_session: updatedSourceSession,
             result,
@@ -12385,9 +12953,9 @@ function registerSocketServer(httpServer) {
           updatedFinishGroups
         );
         const preview = grouping;
-        if (preview?.summary?.valid_for_declare !== true) {
-          throw new Error('Cannot finish — arrange a valid hand before declaring');
-        }
+        // Validity is evaluated when the finisher submits in the declarer-only
+        // declare window (`player:declare:response`). Invalid hands must still
+        // be allowed to finish so wrong-show / pack rules can apply.
         logGame(
           sessionId,
           'Finish grouping classification',
@@ -12519,46 +13087,89 @@ function registerSocketServer(httpServer) {
           submittedGroups
         );
 
-        if (isAwaitingDeclarerOnly && isDeclarer && resolveSessionGameMode(session) === 'pool' && preview?.summary?.valid_for_declare !== true) {
-          const poolLimit = resolvePoolLimit(session);
-          const currentScores = normalizePoolScoresByUser(session.metadata || {});
+        // Always lock manual DECLARE layout first (all modes). Invalid-pack
+        // early-returns below used to skip responses.set → result showed best groups.
+        recordManualDeclareResponse(state, socket.user.id, submittedGroups);
+        playerDistribution.submitted_groups = submittedGroups;
+        if (Array.isArray(distribution?.players)) {
+          const pdIndex = distribution.players.findIndex(
+            (pd) => Number(pd?.user_id) === Number(socket.user.id)
+          );
+          if (pdIndex >= 0) {
+            distribution.players[pdIndex] = {
+              ...distribution.players[pdIndex],
+              submitted_groups: submittedGroups,
+            };
+          }
+        }
+
+        // Wrong-show / invalid DECLARE: pack declarer with 80 and continue when
+        // other seats remain (pool, points, deals, spin). Only end the hand when
+        // ≤1 active player is left — same product rule across all modes.
+        if (isAwaitingDeclarerOnly && isDeclarer && preview?.summary?.valid_for_declare !== true) {
+          const gameMode = resolveSessionGameMode(session);
+          const isPoolMode = gameMode === 'pool';
+
+          // Persist arrangement for later finalize / inactive prefills (6P continue).
+          const persistedSession = await persistPlayerSubmittedGroups(
+            sessionId,
+            socket.user.id,
+            submittedGroups
+          );
+          // Prefer DB-backed distribution (with submitted_groups) for any result build below.
+          const sessionWithGroups = persistedSession || session;
+          const distributionWithGroups = sessionWithGroups.metadata?.distribution || distribution;
+
+          const poolLimit = isPoolMode ? resolvePoolLimit(sessionWithGroups) : null;
+          const currentScores = isPoolMode
+            ? normalizePoolScoresByUser(sessionWithGroups.metadata || {})
+            : {};
           const declarerKey = String(socket.user.id);
-          const nextScore = (Number(currentScores[declarerKey]) || 0) + 80;
-          const nextScores = {
-            ...currentScores,
-            [declarerKey]: nextScore,
-          };
+          const nextScore = isPoolMode
+            ? ((Number(currentScores[declarerKey]) || 0) + 80)
+            : 80;
+          const nextScores = isPoolMode
+            ? { ...currentScores, [declarerKey]: nextScore }
+            : currentScores;
 
           const poolEliminatedSet = new Set(
-            (Array.isArray(session.metadata?.pool_eliminated_user_ids) ? session.metadata.pool_eliminated_user_ids : [])
+            (Array.isArray(sessionWithGroups.metadata?.pool_eliminated_user_ids)
+              ? sessionWithGroups.metadata.pool_eliminated_user_ids
+              : [])
               .map((id) => Number(id))
               .filter((id) => !Number.isNaN(id))
           );
           const wasPoolEliminated = poolEliminatedSet.has(Number(socket.user.id));
-          const crossedPoolLimitNow = Number.isFinite(poolLimit) && nextScore >= poolLimit;
+          const crossedPoolLimitNow = isPoolMode
+            && Number.isFinite(poolLimit)
+            && nextScore >= poolLimit;
           if (crossedPoolLimitNow) {
             poolEliminatedSet.add(Number(socket.user.id));
           }
 
           const turnEliminatedSet = new Set(
-            (Array.isArray(session.metadata?.turn_eliminated_user_ids) ? session.metadata.turn_eliminated_user_ids : [])
+            (Array.isArray(sessionWithGroups.metadata?.turn_eliminated_user_ids)
+              ? sessionWithGroups.metadata.turn_eliminated_user_ids
+              : [])
               .map((id) => Number(id))
               .filter((id) => !Number.isNaN(id))
           );
           turnEliminatedSet.add(Number(socket.user.id));
 
-          const activePlayersAfterPack = (session.players || []).filter((playerItem) => {
-            const uid = Number(playerItem.user_id);
-            if (Number.isNaN(uid)) return false;
-            if (poolEliminatedSet.has(uid)) return false;
-            if (turnEliminatedSet.has(uid)) return false;
-            return true;
+          const activePlayersAfterPack = getActivePlayers({
+            ...sessionWithGroups,
+            metadata: {
+              ...(sessionWithGroups.metadata || {}),
+              turn_eliminated_user_ids: Array.from(turnEliminatedSet),
+              pool_eliminated_user_ids: Array.from(poolEliminatedSet),
+            },
           });
 
           if (activePlayersAfterPack.length <= 1) {
             const winnerUserId = activePlayersAfterPack[0]?.user_id || null;
             if (winnerUserId != null) {
-              cleanupDeclareState(sessionId);
+              // Do NOT cleanup declare state before building result players —
+              // responses must still hold the manual invalid groups for display.
               if (crossedPoolLimitNow) {
                 const refreshedForStatus = await gameplayService.getSessionState(sessionId);
                 if (refreshedForStatus) {
@@ -12566,6 +13177,11 @@ function registerSocketServer(httpServer) {
                     (item) => Number(item.user_id) === Number(socket.user.id)
                   );
                   if (statusPlayer) {
+                    await persistInvalidDeclarationPackMetadata(sessionId, socket.user.id, {
+                      penaltyPoints: 80,
+                      cumulativePoints: nextScore,
+                      eliminated: true,
+                    });
                     emitPlayerStatusOverride(io, refreshedForStatus, statusPlayer, {
                       status: 'eliminated',
                       player_status: 'eliminated',
@@ -12579,20 +13195,25 @@ function registerSocketServer(httpServer) {
                   }
                 }
               } else {
-                emitPlayerStatusOverride(io, session, player, {
+                await persistInvalidDeclarationPackMetadata(sessionId, socket.user.id, {
+                  penaltyPoints: 80,
+                  cumulativePoints: isPoolMode ? nextScore : null,
+                  eliminated: false,
+                });
+                emitPlayerStatusOverride(io, sessionWithGroups, player, {
                   player_status: 'invalid_declaration',
                   metadata: {
                     invalid_declaration: true,
                     packed_in_current_deal: true,
                     invalid_declaration_penalty_points: 80,
-                    cumulative_points: nextScore,
+                    ...(isPoolMode ? { cumulative_points: nextScore } : {}),
                   },
                 }, 'invalid_declaration_packed');
               }
               // In 2-player pool, invalid declaration should pack declarer for the current deal
               // and transition to the next deal/round (unless pool limit elimination happened).
-              if (!crossedPoolLimitNow && Number(session?.max_players) === 2) {
-                const perRoundResults = (session.players || []).map((item) => {
+              if (isPoolMode && !crossedPoolLimitNow && Number(sessionWithGroups?.max_players) === 2) {
+                const perRoundResults = (sessionWithGroups.players || []).map((item) => {
                   const isDeclarerItem = Number(item.user_id) === Number(socket.user.id);
                   const isWinnerItem = Number(item.user_id) === Number(winnerUserId);
                   const points = isDeclarerItem ? 80 : 0;
@@ -12607,8 +13228,8 @@ function registerSocketServer(httpServer) {
                     valid_for_declare: isDeclarerItem ? false : null,
                     invalid_group_count: isDeclarerItem ? 1 : null,
                     all_cards_grouped: isDeclarerItem ? false : null,
-                    submission_mode: 'auto',
-                    submission_status: 'auto',
+                    submission_mode: isDeclarerItem ? 'manual' : 'auto',
+                    submission_status: isDeclarerItem ? 'manual' : 'auto',
                     player_status: baseStatus,
                     status_color: resolveStatusColor(baseStatus),
                     dropped: false,
@@ -12616,7 +13237,7 @@ function registerSocketServer(httpServer) {
                   };
                 });
 
-                const poolProgress = buildPoolRoundProgress(session, perRoundResults);
+                const poolProgress = buildPoolRoundProgress(sessionWithGroups, perRoundResults);
                 const roundResultsWithPool = perRoundResults.map((item) => {
                   const uid = Number(item.user_id);
                   const cumulativePoints = Number(poolProgress.scoresByUser[String(uid)]) || 0;
@@ -12633,16 +13254,16 @@ function registerSocketServer(httpServer) {
                 });
 
                 const rejoinContext = buildPoolRejoinContext({
-                  players: session.players || [],
+                  players: sessionWithGroups.players || [],
                   scoresByUser: poolProgress.scoresByUser,
                   eliminatedUserIds: poolProgress.eliminatedUserIds,
                   poolLimit: poolProgress.poolLimit,
                 });
-                const rejoinJoiningFee = roundCurrency(Number(session?.contest?.entry) || 0);
+                const rejoinJoiningFee = roundCurrency(Number(sessionWithGroups?.contest?.entry) || 0);
                 const prizePoolSummary = buildPoolPrizePoolSummary({
                   entryFee: rejoinJoiningFee,
-                  baseEntryCount: resolvePoolBaseEntryCount(session),
-                  rejoinEntryCount: resolvePoolRejoinEntryCount(session?.metadata || {}),
+                  baseEntryCount: resolvePoolBaseEntryCount(sessionWithGroups),
+                  rejoinEntryCount: resolvePoolRejoinEntryCount(sessionWithGroups?.metadata || {}),
                   projectedExtraEntries: rejoinContext.can_rejoin_table ? 1 : 0,
                 });
                 const rejoinInfo = buildPoolRejoinInfoPayload({
@@ -12650,7 +13271,10 @@ function registerSocketServer(httpServer) {
                   joiningFee: rejoinJoiningFee,
                   prizePoolSummary,
                 });
-                const poolEliminationContext = buildPoolEliminationContextFields(session, poolProgress);
+                const poolEliminationContext = buildPoolEliminationContextFields(
+                  sessionWithGroups,
+                  poolProgress
+                );
                 const intermediatePayload = {
                   session_id: sessionId,
                   server_time: new Date().toISOString(),
@@ -12686,14 +13310,14 @@ function registerSocketServer(httpServer) {
                   deal_scores: null,
                 };
                 const completeRoundResultsWithPool = appendAbsentEliminatedPoolPlayersToRoundResults(
-                  session,
+                  sessionWithGroups,
                   roundResultsWithPool,
                   poolProgress,
                 );
                 intermediatePayload.results = completeRoundResultsWithPool;
                 intermediatePayload.players = buildDeclarationTablePlayers({
-                  session,
-                  distribution,
+                  session: sessionWithGroups,
+                  distribution: distributionWithGroups,
                   state,
                   isFinal: true,
                   isGameFinal: false,
@@ -12704,7 +13328,8 @@ function registerSocketServer(httpServer) {
                   previousPoolEliminatedUserIds: poolEliminationContext.previousPoolEliminatedUserIds,
                 });
 
-                await transitionToNextPoolRound(io, session, intermediatePayload, poolProgress);
+                cleanupDeclareState(sessionId);
+                await transitionToNextPoolRound(io, sessionWithGroups, intermediatePayload, poolProgress);
                 callback({
                   success: true,
                   data: {
@@ -12719,20 +13344,70 @@ function registerSocketServer(httpServer) {
                 });
                 return;
               }
-              await finalizeGameByElimination(
-                io,
+              // Keep declare responses until after result players are built inside finalize.
+              // Refresh + merge pack flags so points settlement uses fixed 80, not hand score.
+              const packedPenalty = 80;
+              let sessionForFinalize = applyInvalidDeclarationPackToSessionPlayers(
                 {
-                  ...session,
+                  ...sessionWithGroups,
                   metadata: {
-                    ...(session.metadata || {}),
-                    pool_scores_by_user: nextScores,
-                    pool_eliminated_user_ids: Array.from(poolEliminatedSet),
+                    ...(sessionWithGroups.metadata || {}),
+                    distribution: distributionWithGroups,
+                    turn_eliminated_user_ids: Array.from(turnEliminatedSet),
+                    ...(isPoolMode
+                      ? {
+                        pool_scores_by_user: nextScores,
+                        pool_eliminated_user_ids: Array.from(poolEliminatedSet),
+                      }
+                      : {}),
                   },
                 },
+                socket.user.id,
+                {
+                  penaltyPoints: packedPenalty,
+                  cumulativePoints: isPoolMode ? nextScore : null,
+                  eliminated: crossedPoolLimitNow,
+                }
+              );
+              try {
+                const refreshedForFinalize = await gameplayService.getSessionState(sessionId);
+                if (refreshedForFinalize) {
+                  sessionForFinalize = applyInvalidDeclarationPackToSessionPlayers(
+                    {
+                      ...refreshedForFinalize,
+                      metadata: {
+                        ...(refreshedForFinalize.metadata || {}),
+                        distribution: distributionWithGroups
+                          || refreshedForFinalize.metadata?.distribution,
+                        turn_eliminated_user_ids: Array.from(turnEliminatedSet),
+                        ...(isPoolMode
+                          ? {
+                            pool_scores_by_user: nextScores,
+                            pool_eliminated_user_ids: Array.from(poolEliminatedSet),
+                          }
+                          : {}),
+                      },
+                    },
+                    socket.user.id,
+                    {
+                      penaltyPoints: packedPenalty,
+                      cumulativePoints: isPoolMode ? nextScore : null,
+                      eliminated: crossedPoolLimitNow,
+                    }
+                  );
+                }
+              } catch (_) {
+                // Keep in-memory packed sessionForFinalize.
+              }
+
+              await finalizeGameByElimination(
+                io,
+                sessionForFinalize,
                 winnerUserId,
-                Array.from(poolEliminatedSet),
+                isPoolMode ? Array.from(poolEliminatedSet) : Array.from(turnEliminatedSet),
                 'invalid_declaration_last_player_standing'
               );
+              cleanupDeclareState(sessionId);
               callback({
                 success: true,
                 data: {
@@ -12749,8 +13424,8 @@ function registerSocketServer(httpServer) {
             }
           }
 
-          const turnTimerSeconds = Number(session?.game?.turn_timer_seconds) || 30;
-          const attemptsUsedByUser = normalizeAttemptsUsedByUser(session.metadata || {});
+          const turnTimerSeconds = Number(sessionWithGroups?.game?.turn_timer_seconds) || 30;
+          const attemptsUsedByUser = normalizeAttemptsUsedByUser(sessionWithGroups.metadata || {});
           const nextTurnUser = nextTurnUserId(activePlayersAfterPack, socket.user.id, {
             currentSeatNo: player?.seat_no,
           });
@@ -12764,9 +13439,9 @@ function registerSocketServer(httpServer) {
           }
           const nextTurnWindow = buildTurnWindow(turnTimerSeconds);
           const nextTurn = buildTurnPayload({
-            session,
+            session: sessionWithGroups,
             userId: nextTurnUser,
-            turnId: Number(session?.metadata?.turn?.turn_id || 0) + 1,
+            turnId: Number(sessionWithGroups?.metadata?.turn?.turn_id || 0) + 1,
             type: 'normal',
             attemptNo: 0,
             attemptsUsedCount: Number(attemptsUsedByUser[String(nextTurnUser)]) || 0,
@@ -12777,21 +13452,26 @@ function registerSocketServer(httpServer) {
           });
 
           const nextMetadata = {
-            ...(session.metadata || {}),
+            ...(sessionWithGroups.metadata || {}),
+            distribution: distributionWithGroups,
             phase: 'active',
             phase_updated_at: new Date().toISOString(),
             turn: nextTurn,
             turn_bonus: {
-              max_attempts_per_player: getMaxBonusAttempts(session),
+              max_attempts_per_player: getMaxBonusAttempts(sessionWithGroups),
               attempts_used_by_user: attemptsUsedByUser,
             },
             turn_eliminated_user_ids: Array.from(turnEliminatedSet),
-            pool_scores_by_user: nextScores,
-            pool_eliminated_user_ids: Array.from(poolEliminatedSet),
+            ...(isPoolMode
+              ? {
+                pool_scores_by_user: nextScores,
+                pool_eliminated_user_ids: Array.from(poolEliminatedSet),
+              }
+              : {}),
           };
           delete nextMetadata.declaration;
 
-          await gameSessionModel.updateSessionStatus(sessionId, session.status, {
+          await gameSessionModel.updateSessionStatus(sessionId, sessionWithGroups.status, {
             currentTurnUserId: nextTurnUser,
             metadata: nextMetadata,
           });
@@ -12805,28 +13485,38 @@ function registerSocketServer(httpServer) {
               penalty_points: 80,
               total_score: nextScore,
               next_turn_user_id: nextTurnUser,
-              pool_limit: poolLimit,
+              game_mode: gameMode,
+              pool_limit: isPoolMode ? poolLimit : null,
               eliminated: crossedPoolLimitNow,
             },
           });
 
           cleanupDeclareState(sessionId);
 
-          emitPlayerStatusOverride(io, session, player, {
+          await persistInvalidDeclarationPackMetadata(sessionId, socket.user.id, {
+            penaltyPoints: 80,
+            cumulativePoints: isPoolMode ? nextScore : null,
+            eliminated: crossedPoolLimitNow,
+          });
+
+          const continueContent = crossedPoolLimitNow
+            ? 'Invalid declaration and threshold reached. You are eliminated from this pool game.'
+            : 'Invalid declaration. You are packed for this deck; play continues for others.';
+          const continueAction = crossedPoolLimitNow
+            ? 'Please wait for game completion or use rejoin option if available.'
+            : 'Please wait for this deck to end.';
+
+          emitPlayerStatusOverride(io, sessionWithGroups, player, {
             status: crossedPoolLimitNow ? 'eliminated' : player.status,
             player_status: crossedPoolLimitNow ? 'eliminated' : 'invalid_declaration',
             metadata: {
               invalid_declaration: true,
               packed_in_current_deal: true,
               invalid_declaration_penalty_points: 80,
-              cumulative_points: nextScore,
+              ...(isPoolMode ? { cumulative_points: nextScore } : {}),
             },
-            content_message: crossedPoolLimitNow
-              ? 'Invalid declaration and threshold reached. You are eliminated from this pool game.'
-              : 'Invalid declaration. You are packed for this deck; play continues for others.',
-            action_message: crossedPoolLimitNow
-              ? 'Please wait for game completion or use rejoin option if available.'
-              : 'Please wait for this deck to end.',
+            content_message: continueContent,
+            action_message: continueAction,
           }, crossedPoolLimitNow ? 'pool_limit_eliminated' : 'invalid_declaration_packed');
 
           if (crossedPoolLimitNow && !wasPoolEliminated) {
@@ -12836,7 +13526,7 @@ function registerSocketServer(httpServer) {
 
           emitTurn(io, sessionId, nextTurn, {
             action: 'invalid_declaration_continue',
-            previous_turn_id: session?.metadata?.turn?.turn_id || null,
+            previous_turn_id: sessionWithGroups?.metadata?.turn?.turn_id || null,
             invalid_declarer_user_id: socket.user.id,
           });
           scheduleTurnTimeout(io, sessionId, nextTurn);
