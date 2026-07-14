@@ -1467,8 +1467,22 @@ async function startPregame(io, sessionId, options = {}) {
     console.log(`[PREGAME][${sessionId}] startPregame aborted — status=${session.status} (expected: ready)`);
     return;
   }
-  if (!Array.isArray(session.players) || session.players.length !== session.max_players) {
-    console.log(`[PREGAME][${sessionId}] startPregame aborted — players=${session.players?.length}/${session.max_players} not filled`);
+  const mode = resolveSessionGameMode(session);
+  const isDealsInterDeal = mode === 'deals_2' && resolveCurrentDeal(session) > 1;
+  const poolRoundNo = Number(session?.metadata?.pool_round_no);
+  const isPoolInterRound = mode === 'pool'
+    && ((Number.isFinite(poolRoundNo) && poolRoundNo > 1) || session?.metadata?.phase === 'inter_deal');
+  const useInterDealFastStart = options.interDealFastStart === true && (isDealsInterDeal || isPoolInterRound);
+
+  // Fresh matchmaking requires a full table. Inter-deal / next pool round only needs
+  // enough active participants (left / eliminated seats must not block continuation).
+  if (!useInterDealFastStart) {
+    if (!Array.isArray(session.players) || session.players.length !== session.max_players) {
+      console.log(`[PREGAME][${sessionId}] startPregame aborted — players=${session.players?.length}/${session.max_players} not filled`);
+      return;
+    }
+  } else if (!Array.isArray(session.players) || session.players.length < 2) {
+    console.log(`[PREGAME][${sessionId}] startPregame aborted — inter-deal players=${session.players?.length} (<2)`);
     return;
   }
   const initialParticipants = resolvePregameParticipants(session);
@@ -1477,12 +1491,6 @@ async function startPregame(io, sessionId, options = {}) {
     return;
   }
 
-  const mode = resolveSessionGameMode(session);
-  const isDealsInterDeal = mode === 'deals_2' && resolveCurrentDeal(session) > 1;
-  const poolRoundNo = Number(session?.metadata?.pool_round_no);
-  const isPoolInterRound = mode === 'pool'
-    && ((Number.isFinite(poolRoundNo) && poolRoundNo > 1) || session?.metadata?.phase === 'inter_deal');
-  const useInterDealFastStart = options.interDealFastStart === true && (isDealsInterDeal || isPoolInterRound);
   const configuredCountdown = useInterDealFastStart
     ? Number(options.countdownSeconds) || INTER_DEAL_COUNTDOWN_SECONDS
     : COUNTDOWN_SECONDS;
@@ -1649,7 +1657,12 @@ async function startPregame(io, sessionId, options = {}) {
       if (state?.countdownInterval) { clearInterval(state.countdownInterval); state.countdownInterval = null; }
 
       const refreshed = await gameplayService.getSessionState(sessionId);
-      if (!refreshed || !Array.isArray(refreshed.players) || refreshed.players.length !== refreshed.max_players) {
+      if (!refreshed || !Array.isArray(refreshed.players) || refreshed.players.length < 2) {
+        console.warn(`[PREGAME][${sessionId}] Countdown end check failed — missing session/players. Aborting.`);
+        await cleanupPregameSequence(sessionId);
+        return;
+      }
+      if (!useInterDealFastStart && refreshed.players.length !== refreshed.max_players) {
         console.warn(`[PREGAME][${sessionId}] Countdown end check failed — players dropped. Aborting.`);
         await cleanupPregameSequence(sessionId);
         return;

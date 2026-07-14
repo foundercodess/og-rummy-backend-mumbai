@@ -1824,9 +1824,16 @@ function resolvePoolBotDropBlockScore(poolLimit) {
 function isBotPoolDropBlockedByScore(session, userId) {
   if (resolveSessionGameMode(session) !== 'pool') return false;
   const poolLimit = resolvePoolLimit(session);
-  const blockScore = resolvePoolBotDropBlockScore(poolLimit);
+  if (!Number.isFinite(Number(poolLimit))) return false;
   const scoresByUser = session?.metadata?.pool_scores_by_user || {};
   const currentScore = Number(scoresByUser[String(userId)]) || 0;
+  // Block when this drop would eliminate the bot (e.g. 79 + middle 40 in 101).
+  // Prefer projected drop penalty; fall back to legacy absolute block scores.
+  const dropPenalty = Number(resolveDropLossPoints(session, userId));
+  if (Number.isFinite(dropPenalty) && dropPenalty > 0) {
+    return (currentScore + dropPenalty) >= Number(poolLimit);
+  }
+  const blockScore = resolvePoolBotDropBlockScore(poolLimit);
   return currentScore >= blockScore;
 }
 
@@ -2307,13 +2314,13 @@ async function transitionToNextDeal(io, session, snapshot) {
   const nextDealParticipants = getActivePlayers(session);
   const rotatedFirstTurnUserId = resolveNextDealFirstTurnUserId(session, nextDealParticipants);
 
-  startPregame(io, sessionId, {
-    interDealFastStart: true,
-    preferredFirstTurnUserId: rotatedFirstTurnUserId || null,
-    countdownSeconds: 5,
-  }).catch((pregameErr) => {
-    errorGame(sessionId, `Failed to start next deal pregame: ${pregameErr.message}`);
-  });
+  await continuePoolDealFlow(
+    io,
+    sessionId,
+    rotatedFirstTurnUserId || null,
+    'deals_next_deal',
+    { countdownSeconds: 5 },
+  );
 
   return payload;
 }
@@ -5862,13 +5869,32 @@ async function continuePoolDealFlow(io, sessionId, preferredFirstTurnUserId = nu
     clearTimeout(splitState.timeoutHandle);
   }
   activePoolSplitBySession.delete(sessionId);
-  startPregame(io, sessionId, {
-    interDealFastStart: true,
-    preferredFirstTurnUserId: preferredFirstTurnUserId || null,
-    countdownSeconds,
-  }).catch((pregameErr) => {
-    errorGame(sessionId, `Failed to start next pool round pregame (${reason}): ${pregameErr.message}`);
-  });
+
+  const maxAttempts = Math.max(1, Number(options.pregameRetryAttempts) || 3);
+  const retryDelayMs = Math.max(250, Number(options.pregameRetryDelayMs) || 750);
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await startPregame(io, sessionId, {
+        interDealFastStart: true,
+        preferredFirstTurnUserId: preferredFirstTurnUserId || null,
+        countdownSeconds,
+      });
+      return;
+    } catch (pregameErr) {
+      lastErr = pregameErr;
+      errorGame(
+        sessionId,
+        `Failed to start next pool round pregame (${reason}) attempt=${attempt}/${maxAttempts}: ${pregameErr.message}`
+      );
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs * attempt));
+      }
+    }
+  }
+  if (lastErr) {
+    errorGame(sessionId, `Gave up starting next pool round pregame (${reason}): ${lastErr.message}`);
+  }
 }
 
 function emitPoolSplitState(io, sessionId, state, reason = 'state') {
