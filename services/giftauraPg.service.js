@@ -228,6 +228,7 @@ function extractCallbackFields(query = {}) {
   return { orderId, paymentRef, status };
 }
 
+
 module.exports = {
   isConfigured,
   getRedirectUrl,
