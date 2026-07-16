@@ -211,6 +211,18 @@ const BOT_LOW_MARGIN_THRESHOLD = Math.max(0, Number(process.env.BOT_LOW_MARGIN_T
 const GROUPING_TIE_NEAR_EQUAL_MARGIN = Math.max(1, Number(process.env.GROUPING_TIE_NEAR_EQUAL_MARGIN) || 10);
 const BOT_FINISH_DEBUG_LOG_ENABLED = String(process.env.BOT_FINISH_DEBUG_LOG_ENABLED || 'false').trim().toLowerCase() === 'true';
 const BOT_FINISH_EVAL_WARN_MS = Math.max(5, Number(process.env.BOT_FINISH_EVAL_WARN_MS) || 25);
+/** Soft CPU budget for bot finish-card search. Under load, stop after finding ≥1 valid candidate. */
+const BOT_FINISH_EVAL_BUDGET_MS = Math.max(
+  10,
+  Number(process.env.BOT_FINISH_EVAL_BUDGET_MS) || 45
+);
+/** High enough that an invalid-single leftover is near-optimal; stop early when found. */
+const BOT_FINISH_EARLY_EXIT_UTILITY = Math.max(
+  500,
+  Number(process.env.BOT_FINISH_EARLY_EXIT_UTILITY) || 1650
+);
+/** Internal bot/timer loads do not need recent event history on the response. */
+const BOT_INTERNAL_SESSION_OPTS = Object.freeze({ includeEvents: false });
 const SOCKET_SESSION_CHECK_TTL_MS = Math.max(1000, Number(process.env.SOCKET_SESSION_CHECK_TTL_MS) || 3000);
 const POOL_REJOIN_THRESHOLD_BY_LIMIT = {
   101: 79,
@@ -3218,6 +3230,9 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
     return null;
   }
   const startedAtMs = Date.now();
+  const evalBudgetMs = Number.isFinite(Number(options?.evalBudgetMs))
+    ? Math.max(5, Number(options.evalBudgetMs))
+    : BOT_FINISH_EVAL_BUDGET_MS;
 
   const groupingOptions = options?.groupingOptions || {};
   const tieBreakSeed = String(options?.tieBreakSeed || '');
@@ -3257,9 +3272,45 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
     });
   });
 
+  // Try likely finish cards first so a soft CPU budget still finds a valid declare path.
+  // Prefer the card already discovered by buildBestGrouping's finish-ready scan.
+  const preferredFinishUid = String(currentGrouping?.summary?.finish_card_uid || '').trim();
+  const canFinishKnown = currentGrouping?.summary?.can_finish_after_one_discard === true;
+  const cardsToTry = [...cards].sort((a, b) => {
+    const aUid = String(a?.card_uid || '').trim();
+    const bUid = String(b?.card_uid || '').trim();
+    if (preferredFinishUid) {
+      if (aUid === preferredFinishUid && bUid !== preferredFinishUid) return -1;
+      if (bUid === preferredFinishUid && aUid !== preferredFinishUid) return 1;
+    }
+    const aLayout = cardToLayoutMeta.get(aUid) || {};
+    const bLayout = cardToLayoutMeta.get(bUid) || {};
+    const aMeta = cardToGroupMeta.get(a?.card_uid) || {};
+    const bMeta = cardToGroupMeta.get(b?.card_uid) || {};
+    const aScore = (aLayout.isInvalidSingle ? 3000 : 0)
+      + (!aMeta.isValidMeld ? 2000 : 0)
+      + (Number(aMeta.size) > 3 ? (Number(aMeta.size) - 3) * 100 : 0)
+      + getCardValue(a, wildJoker);
+    const bScore = (bLayout.isInvalidSingle ? 3000 : 0)
+      + (!bMeta.isValidMeld ? 2000 : 0)
+      + (Number(bMeta.size) > 3 ? (Number(bMeta.size) - 3) * 100 : 0)
+      + getCardValue(b, wildJoker);
+    if (bScore !== aScore) return bScore - aScore;
+    return aUid.localeCompare(bUid);
+  });
+
   const safeCandidates = [];
-  for (const finishCard of cards) {
+  let stoppedEarly = false;
+  for (const finishCard of cardsToTry) {
     if (!finishCard?.card_uid) continue;
+
+    if (
+      safeCandidates.length > 0
+      && (Date.now() - startedAtMs) >= evalBudgetMs
+    ) {
+      stoppedEarly = true;
+      break;
+    }
 
     const finishIndex = cards.findIndex((card) => card?.card_uid === finishCard.card_uid);
     if (finishIndex < 0) continue;
@@ -3315,6 +3366,15 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
           ? deterministicRoll(tieBreakSeed, `finish:${finishCard.card_uid}`)
           : 0,
       });
+
+      // Near-optimal leftover, known finish-ready path, or CPU budget — stop scanning.
+      if (
+        utilityScore >= BOT_FINISH_EARLY_EXIT_UTILITY
+        || canFinishKnown
+      ) {
+        stoppedEarly = true;
+        break;
+      }
     }
   }
 
@@ -3354,14 +3414,15 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
     warnGame(
       options?.sessionId || 'finish_plan',
       `Finish evaluation slow — uid=${options?.userId || 'unknown'} turn=${options?.turnId || 'na'} ` +
-      `candidates=${safeCandidates.length} evalMs=${evalMs}`
+      `candidates=${safeCandidates.length} earlyStop=${stoppedEarly} evalMs=${evalMs}`
     );
   }
   if (BOT_FINISH_DEBUG_LOG_ENABLED) {
     logGame(
       options?.sessionId || 'finish_plan',
       `Finish selected uid=${options?.userId || 'unknown'} turn=${options?.turnId || 'na'} ` +
-      `card=${selected.finishCard?.card_uid || 'na'} candidates=${safeCandidates.length} evalMs=${evalMs}`
+      `card=${selected.finishCard?.card_uid || 'na'} candidates=${safeCandidates.length} ` +
+      `earlyStop=${stoppedEarly} evalMs=${evalMs}`
     );
   }
   return {
@@ -3375,6 +3436,7 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
       from_group_size: selected.fromMeldSize,
       card_value: selected.cardValue,
       isolated: selected.isolated,
+      early_stop: stoppedEarly,
     },
   };
 }
@@ -4197,8 +4259,10 @@ function prefillInactivePlayersInDeclareResponses(session, distribution, players
     const playerCards = playerDistribution?.cards || [];
     // Prefer last known layout (manual declare / finish arrangement) over inventing best.
     // True auto-declare (no stored groups) still falls through to buildBestGrouping.
+    // Coerce against the CURRENT hand so a layout captured before a finish/pick/discard
+    // (stale card_uid) can never carry a card the player no longer holds into finalize.
     const storedGroups = Array.isArray(playerDistribution?.submitted_groups)
-      ? playerDistribution.submitted_groups
+      ? coerceSubmittedGroupsForHand(playerDistribution.submitted_groups, playerCards)
       : [];
     if (storedGroups.length > 0) {
       responses.set(userId, {
@@ -7775,7 +7839,7 @@ async function tryExecuteBotDropBeforePick(
 
 async function executeBotPickAction(io, sessionId, expectedTurnId) {
   const decisionStartedAt = Date.now();
-  const session = await gameplayService.getSessionState(sessionId);
+  const session = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
   if (!session || session.status !== 'active') return;
   const softRiggingEnabled = isBotSoftRiggingEnabled(session);
   const aggressiveEnabled = isBotAggressionEnabled(session);
@@ -8038,7 +8102,7 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
 }
 
 async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
-  const refreshed = await gameplayService.getSessionState(sessionId);
+  const refreshed = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
   if (!refreshed || refreshed.status !== 'active') return;
   const softRiggingEnabled = isBotSoftRiggingEnabled(refreshed);
   const aggressiveEnabled = isBotAggressionEnabled(refreshed);
@@ -8493,7 +8557,7 @@ async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
     warnGame(sessionId, `Bot forced action before timeout failed uid=${turn.user_id}: ${err.message}`);
   }
 
-  const refreshed = await gameplayService.getSessionState(sessionId);
+  const refreshed = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
   if (!refreshed || refreshed.status !== 'active') return refreshed;
 
   const refreshedTurn = refreshed.metadata?.turn;
@@ -8508,7 +8572,7 @@ async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
     } catch (err) {
       warnGame(sessionId, `Bot forced discard before timeout failed uid=${turn.user_id}: ${err.message}`);
     }
-    const afterDiscard = await gameplayService.getSessionState(sessionId);
+    const afterDiscard = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
     if (afterDiscard?.metadata?.turn?.turn_id !== turn.turn_id) {
       logGame(sessionId, `Turn timeout skipped — bot discarded uid=${turn.user_id}`);
       return afterDiscard;
@@ -8525,11 +8589,19 @@ async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
 
 function executeBotTurnAction(io, sessionId, expectedTurnId, phase = 'pick') {
   cleanupBotActionState(sessionId);
-  if (phase === 'discard') {
-    return executeBotDiscardAction(io, sessionId, expectedTurnId);
-  }
+  const run = phase === 'discard'
+    ? () => executeBotDiscardAction(io, sessionId, expectedTurnId)
+    : () => executeBotPickAction(io, sessionId, expectedTurnId);
 
-  return executeBotPickAction(io, sessionId, expectedTurnId);
+  // Yield once so inbound socket handlers/ACKs can run before heavy bot CPU.
+  return new Promise((resolve, reject) => {
+    setImmediate(() => {
+      Promise.resolve()
+        .then(run)
+        .then(resolve)
+        .catch(reject);
+    });
+  });
 }
 
 function scheduleBotTurnAction(io, sessionId, turn, phase = 'pick', options = {}) {
@@ -8567,7 +8639,7 @@ function scheduleBotTurnAction(io, sessionId, turn, phase = 'pick', options = {}
 
 async function maybeScheduleBotTurnAction(io, sessionId, turn) {
   if (!turn || Number.isNaN(Number(turn.user_id))) return;
-  const session = await gameplayService.getSessionState(sessionId);
+  const session = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
   if (!session || session.status !== 'active') return;
   if (!isBotTurn(session, turn.user_id)) return;
   const softRiggingEnabled = isBotSoftRiggingEnabled(session);
@@ -9704,7 +9776,7 @@ function registerSocketServer(httpServer) {
     if (!payload.turn) return;
     scheduleTurnTimeout(io, sessionId, payload.turn);
 
-    gameplayService.getSessionState(sessionId)
+    gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS)
       .then((session) => {
         if (!session || session.status !== 'active' || !session.metadata?.turn) return;
         return maybeScheduleBotTurnAction(io, sessionId, session.metadata.turn);
@@ -9760,11 +9832,27 @@ function registerSocketServer(httpServer) {
       const declarerDistribution = getPlayerDistribution(distribution, declarerUserId);
       const declarerCards = declarerDistribution?.cards || [];
       const declarerSubmittedGroups = state.responses.get(declarerUserId)?.groups || [];
-      const declarerGrouping = groupingService.evaluateSubmittedGrouping(
-        declarerCards,
-        wildJoker,
-        declarerSubmittedGroups
-      );
+      // Never let a stale/mismatched submitted layout (card no longer in hand) throw
+      // and abort the whole finalize. If it cannot be resolved against the current
+      // hand, treat it as an invalid declaration (declarer cannot win on cards they
+      // do not hold) — same product outcome, but the deal still settles for everyone.
+      let declarerGrouping;
+      try {
+        declarerGrouping = groupingService.evaluateSubmittedGrouping(
+          declarerCards,
+          wildJoker,
+          declarerSubmittedGroups
+        );
+      } catch (declErr) {
+        warnGame(
+          sessionId,
+          `Declarer grouping unresolved uid=${declarerUserId} (${declErr.message}) — treating as invalid declaration`
+        );
+        const declarerBest = groupingService.buildBestGrouping(declarerCards, wildJoker);
+        declarerGrouping = declarerBest?.summary
+          ? { ...declarerBest, summary: { ...declarerBest.summary, valid_for_declare: false } }
+          : { summary: { valid_for_declare: false } };
+      }
       const declarerValid = declarerGrouping?.summary?.valid_for_declare === true;
 
       logGame(
@@ -9781,9 +9869,23 @@ function registerSocketServer(httpServer) {
         const playerDistribution = getPlayerDistribution(distribution, player.user_id);
         const playerCards = playerDistribution?.cards || [];
         const playerResponse = state.responses.get(player.user_id);
-        const scoring = playerResponse && playerResponse.auto !== true
-          ? scoreFromSubmittedGrouping(playerCards, wildJoker, playerResponse.groups || [])
-          : scoreFromBestGrouping(playerCards, wildJoker);
+        // A single seat's stale submitted layout must never crash the whole finalize
+        // (which was leaving tables frozen). Fall back to best grouping for just that
+        // seat; every other seat still settles normally.
+        let scoring;
+        if (playerResponse && playerResponse.auto !== true) {
+          try {
+            scoring = scoreFromSubmittedGrouping(playerCards, wildJoker, playerResponse.groups || []);
+          } catch (scoreErr) {
+            warnGame(
+              sessionId,
+              `Submitted grouping unresolved uid=${player.user_id} (${scoreErr.message}) — scoring best grouping`
+            );
+            scoring = scoreFromBestGrouping(playerCards, wildJoker);
+          }
+        } else {
+          scoring = scoreFromBestGrouping(playerCards, wildJoker);
+        }
         const userId = Number(player.user_id);
         const isDropped = isPlayerDropped(player, playerDistribution);
         const isTimeoutEliminated = timeoutEliminatedSet.has(userId);

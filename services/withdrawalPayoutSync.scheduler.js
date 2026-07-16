@@ -82,7 +82,9 @@ function startWithdrawalPayoutSyncCron() {
   const task = cron.schedule(
     schedule,
     () => {
-      runWithdrawalPayoutSyncCronTick().catch(() => {});
+      setImmediate(() => {
+        runWithdrawalPayoutSyncCronTick().catch(() => {});
+      });
     },
     opts
   );

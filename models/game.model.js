@@ -1,7 +1,36 @@
 const { query, pool } = require('../db');
 
+const gameContestCache = new Map();
+
+function gameContestCacheTtlMs() {
+  const parsed = Number(process.env.GAME_CONFIG_CACHE_TTL_MS);
+  if (Number.isFinite(parsed) && parsed >= 0) {
+    return Math.min(parsed, 5 * 60 * 1000);
+  }
+  return 30 * 1000;
+}
+
+function cacheKeyForGetAllWithContests(options = {}) {
+  return `includeInactive:${options.includeInactive === true}`;
+}
+
+function cloneRows(rows = []) {
+  return rows.map((row) => ({ ...row }));
+}
+
+function clearGameContestCache() {
+  gameContestCache.clear();
+}
+
 async function getAllWithContests(options = {}) {
   const { includeInactive = false } = options;
+  const ttlMs = gameContestCacheTtlMs();
+  const cacheKey = cacheKeyForGetAllWithContests({ includeInactive });
+  const cached = gameContestCache.get(cacheKey);
+  if (ttlMs > 0 && cached && cached.expiresAt > Date.now()) {
+    return cloneRows(cached.rows);
+  }
+
   const activeFilter = includeInactive
     ? ''
     : 'WHERE g.active = true AND (c.id IS NULL OR c.active = true)';
@@ -30,6 +59,12 @@ async function getAllWithContests(options = {}) {
     ${activeFilter}
     ORDER BY g.sort_order, g.id, c.player_count, c.sort_order, cpt.play_type
   `);
+  if (ttlMs > 0) {
+    gameContestCache.set(cacheKey, {
+      rows: cloneRows(result.rows),
+      expiresAt: Date.now() + ttlMs,
+    });
+  }
   return result.rows;
 }
 
@@ -38,6 +73,7 @@ async function updateGameActive(gameId, active) {
     'UPDATE games SET active = $1, updated_at = NOW() WHERE id = $2 RETURNING id, name, active',
     [active, gameId]
   );
+  clearGameContestCache();
   return result.rows[0] || null;
 }
 
@@ -46,6 +82,7 @@ async function updateContestActive(contestId, active) {
     'UPDATE contests SET active = $1, updated_at = NOW() WHERE id = $2 RETURNING id, game_id, player_count, entry, active',
     [active, contestId]
   );
+  clearGameContestCache();
   return result.rows[0] || null;
 }
 
@@ -199,6 +236,7 @@ async function createContests({
     }
 
     await client.query('COMMIT');
+    clearGameContestCache();
     return createdContests;
   } catch (err) {
     await client.query('ROLLBACK');

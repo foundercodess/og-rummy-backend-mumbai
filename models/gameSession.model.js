@@ -352,14 +352,44 @@ async function updateSessionStatus(sessionId, status, fields = {}) {
   return result.rows[0] || null;
 }
 
+function shouldAwaitSessionEventInsert() {
+  // Default: fire-and-forget so pick/discard/bot turns are not blocked on audit I/O.
+  // Set GAME_SESSION_EVENTS_AWAIT=true only for tests that assert on event rows immediately.
+  return String(process.env.GAME_SESSION_EVENTS_AWAIT || '').trim().toLowerCase() === 'true';
+}
+
+async function persistSessionEvent({ sessionId, userId = null, eventType, payload = {} }, options = {}) {
+  const returning = options.returning === true;
+  const sql = returning
+    ? `INSERT INTO game_session_events (game_session_id, user_id, event_type, payload)
+       VALUES ($1, $2, $3, $4::jsonb)
+       RETURNING *`
+    : `INSERT INTO game_session_events (game_session_id, user_id, event_type, payload)
+       VALUES ($1, $2, $3, $4::jsonb)`;
+  const result = await query(sql, [sessionId, userId, eventType, JSON.stringify(payload)]);
+  return returning ? (result.rows[0] || null) : null;
+}
+
+/**
+ * Audit-trail write for gameplay. By default does not block the caller: the insert is
+ * scheduled on the next event-loop turn so socket emit / ACK paths stay responsive.
+ * Game rules never depend on this row existing before the next action.
+ */
 async function insertEvent({ sessionId, userId = null, eventType, payload = {} }) {
-  const result = await query(
-    `INSERT INTO game_session_events (game_session_id, user_id, event_type, payload)
-     VALUES ($1, $2, $3, $4::jsonb)
-     RETURNING *`,
-    [sessionId, userId, eventType, JSON.stringify(payload)]
-  );
-  return result.rows[0] || null;
+  const args = { sessionId, userId, eventType, payload };
+  if (shouldAwaitSessionEventInsert()) {
+    return persistSessionEvent(args, { returning: true });
+  }
+
+  setImmediate(() => {
+    persistSessionEvent(args, { returning: false }).catch((err) => {
+      console.warn(
+        `[game_session_events] insert failed type=${eventType || 'unknown'} ` +
+        `session=${sessionId}: ${err.message}`
+      );
+    });
+  });
+  return null;
 }
 
 async function listRecentEvents(sessionId, limit = 25) {

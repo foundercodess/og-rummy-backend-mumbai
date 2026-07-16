@@ -1,0 +1,25 @@
+services:
+  tcpdump:
+    image: nicolaka/netshoot
+    profiles:
+      - tcpdump
+    depends_on:
+      - api
+    network_mode: "service:api"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      TCPDUMP_INTERFACE: ${TCPDUMP_INTERFACE:-any}
+      TCPDUMP_ROTATE_SECONDS: ${TCPDUMP_ROTATE_SECONDS:-300}
+      TCPDUMP_FILE_COUNT: ${TCPDUMP_FILE_COUNT:-12}
+      TCPDUMP_FILTER: ${TCPDUMP_FILTER:-}
+    volumes:
+      - ./captures:/captures
+    command:
+      - sh
+      - -c
+      - >
+        tcpdump -i "$$TCPDUMP_INTERFACE" -nn -s 0 -U
+        -G "$$TCPDUMP_ROTATE_SECONDS" -W "$$TCPDUMP_FILE_COUNT"
+        -w "/captures/api-%Y%m%d-%H%M%S.pcap" $$TCPDUMP_FILTER

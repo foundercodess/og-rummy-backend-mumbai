@@ -44,7 +44,6 @@ if (process.env.DATABASE_URL) {
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: useSsl ? { 
-      rejectUnauthorized: false,
       // Add these SSL options for better performance
       requestCert: true,
       rejectUnauthorized: false
@@ -67,19 +66,14 @@ if (process.env.DATABASE_URL) {
     
     // Statement timeout to prevent long-running queries
     statement_timeout: parseInt(process.env.DB_STATEMENT_TIMEOUT) || 30000,
+    idle_in_transaction_session_timeout: parseInt(process.env.DB_IDLE_IN_TX_TIMEOUT, 10) || 60000,
     
     // Application name for easier debugging in RDS logs
     application_name: 'app-runner-service',
   });
   
-  // Fires once per new physical TCP connection to Postgres.
-  // Set session defaults in a SINGLE query to avoid the pg@9 deprecation warning
-  // ("Calling client.query() when already executing a query").
   pool.on('connect', (client) => {
     console.log('[DB] New connection established to Postgres');
-    client.query(
-      'SET statement_timeout = 30000; SET idle_in_transaction_session_timeout = 60000;',
-    );
   });
 
   // 'acquire' fires on every pool.connect() / pool.query() checkout — far too noisy for logs.
@@ -98,25 +92,60 @@ if (process.env.DATABASE_URL) {
   });
 }
 
+function snapshotPoolMetrics() {
+  if (!pool) return null;
+  return {
+    totalCount: pool.totalCount,
+    idleCount: pool.idleCount,
+    waitingCount: pool.waitingCount,
+    max: pool.options.max
+  };
+}
+
+function compactSqlForLog(text) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .substring(0, 240);
+}
+
 // Optimized query function with performance monitoring
 async function query(text, params) {
   if (!pool) throw new Error('DATABASE_URL not configured');
-  
-  const start = Date.now();
+
+  const slowQueryMs = parseInt(process.env.DB_SLOW_QUERY_MS, 10) || 100;
+  const slowAcquireMs = parseInt(process.env.DB_SLOW_ACQUIRE_MS, 10) || 50;
+  const queuedAt = Date.now();
+  let client;
   try {
-    const result = await pool.query(text, params);
-    const duration = Date.now() - start;
-    
-    // Log slow queries (>100ms)
-    if (duration > 100) {
-      console.warn(`Slow query (${duration}ms):`, text.substring(0, 200));
+    client = await pool.connect();
+    const acquiredAt = Date.now();
+    const acquireMs = acquiredAt - queuedAt;
+
+    const result = await client.query(text, params);
+    const execMs = Date.now() - acquiredAt;
+    const totalMs = Date.now() - queuedAt;
+
+    if (totalMs > slowQueryMs || acquireMs > slowAcquireMs) {
+      const metrics = snapshotPoolMetrics();
+      console.warn(
+        `Slow query total=${totalMs}ms acquire=${acquireMs}ms exec=${execMs}ms ` +
+          `pool=${JSON.stringify(metrics)} sql=${compactSqlForLog(text)}`
+      );
     }
-    
+
     return result;
   } catch (err) {
-    const duration = Date.now() - start;
-    console.error(`Query failed after ${duration}ms:`, err.message);
+    const totalMs = Date.now() - queuedAt;
+    console.error(
+      `Query failed total=${totalMs}ms pool=${JSON.stringify(snapshotPoolMetrics())} ` +
+        `sql=${compactSqlForLog(text)} error=${err.message}`
+    );
     throw err;
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 }
 
@@ -135,13 +164,7 @@ async function getPreparedStatement(name, text) {
 
 // Add connection pool metrics endpoint (useful for monitoring)
 async function getPoolMetrics() {
-  if (!pool) return null;
-  return {
-    totalCount: pool.totalCount,
-    idleCount: pool.idleCount,
-    waitingCount: pool.waitingCount,
-    max: pool.options.max
-  };
+  return snapshotPoolMetrics();
 }
 
 async function testConnection() {

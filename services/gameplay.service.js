@@ -855,15 +855,20 @@ async function markPlayerReady({ sessionId, userId, ready }) {
   return getSessionState(session.id, updatedPlayers);
 }
 
-async function getSessionState(sessionIdOrCode, existingPlayers = null) {
+async function getSessionState(sessionIdOrCode, existingPlayers = null, options = {}) {
   const session = Number.isInteger(sessionIdOrCode)
     ? await gameSessionModel.findSessionById(sessionIdOrCode)
     : await gameSessionModel.findSessionByCode(String(sessionIdOrCode));
 
   if (!session) return null;
 
+  const includeEvents = options?.includeEvents !== false;
   const players = existingPlayers || await gameSessionModel.listSessionPlayers(session.id);
-  const events = await gameSessionModel.listRecentEvents(session.id);
+  // Internal bot/timer paths can skip events to avoid an extra ordered scan per action.
+  // Client-facing paths (join, refresh, session:state) keep the default includeEvents=true.
+  const events = includeEvents
+    ? await gameSessionModel.listRecentEvents(session.id)
+    : [];
   const { game, contest } = await getGameAndContestData(session.game_id, session.contest_id);
   const scoreContext = resolveSessionScoreContext({ session, game, players });
   const prizePoolFields = buildSessionPrizePoolFields({

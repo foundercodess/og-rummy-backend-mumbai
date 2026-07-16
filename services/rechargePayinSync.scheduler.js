@@ -73,7 +73,10 @@ function startRechargePayinSyncCron() {
   const task = cron.schedule(
     schedule,
     () => {
-      runRechargePayinSyncCronTick().catch(() => {});
+      // Defer off the cron tick so socket handlers are not starved at the exact fire time.
+      setImmediate(() => {
+        runRechargePayinSyncCronTick().catch(() => {});
+      });
     },
     opts
   );

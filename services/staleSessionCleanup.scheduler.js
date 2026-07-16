@@ -87,7 +87,9 @@ function startStaleSessionCleanupCron() {
   const task = cron.schedule(
     schedule,
     () => {
-      runStaleSessionCleanupCronTick().catch(() => {});
+      setImmediate(() => {
+        runStaleSessionCleanupCronTick().catch(() => {});
+      });
     },
     opts
   );
