@@ -168,10 +168,32 @@ function evaluateHandStrength(cards = [], wildJoker = null, options = {}) {
 
 function canFinishAfterOneDiscard(cards = [], wildJoker = null, options = {}) {
   if (!Array.isArray(cards) || cards.length < 2) return false;
+  const groupingOptions = options?.groupingOptions || {};
+
+  // 14-card hands: buildBestGrouping already runs finish-ready detection.
+  if (cards.length === 14) {
+    if (options?.precomputedGrouping?.summary) {
+      return options.precomputedGrouping.summary.can_finish_after_one_discard === true;
+    }
+    const grouping = groupingService.buildBestGrouping(cards, wildJoker, groupingOptions);
+    return grouping?.summary?.can_finish_after_one_discard === true;
+  }
+
+  // 13-card (pre-pick) "finish after one discard" is rarely meaningful for declare;
+  // skip the O(n) scan unless explicitly requested.
+  if (options?.allowExpensiveFinishScan !== true) {
+    return false;
+  }
+
+  const budgetMs = Number.isFinite(Number(options?.evalBudgetMs))
+    ? Math.max(5, Number(options.evalBudgetMs))
+    : Math.max(5, Number(process.env.BOT_FINISH_EVAL_BUDGET_MS) || 40);
+  const startedAtMs = Date.now();
   for (const card of cards) {
+    if ((Date.now() - startedAtMs) >= budgetMs) break;
     if (!card?.card_uid) continue;
     const remainingCards = cards.filter((entry) => entry?.card_uid !== card.card_uid);
-    const grouping = groupingService.buildBestGrouping(remainingCards, wildJoker, options?.groupingOptions || {});
+    const grouping = groupingService.buildBestGrouping(remainingCards, wildJoker, groupingOptions);
     if (grouping?.summary?.valid_for_declare === true) {
       return true;
     }
@@ -193,15 +215,24 @@ function chooseBotPickSource(distribution, playerCards = [], wildJoker = null, o
   const discardTop = Array.isArray(distribution?.discard_pile) ? distribution.discard_pile[0] : null;
   if (!discardTop) return 'closed';
 
-  const before = evaluateHandStrength(playerCards, wildJoker, options);
-  const after = evaluateHandStrength([...playerCards, discardTop], wildJoker, options);
+  const before = options.precomputedBefore || evaluateHandStrength(playerCards, wildJoker, options);
+  const after = options.precomputedAfter
+    || evaluateHandStrength([...playerCards, discardTop], wildJoker, options);
   const pickImportance = getCardImportance(discardTop, [...playerCards, discardTop], before.wildRank);
   const improvement = after.score - before.score;
 
   const beforeSummary = before.summary || {};
   const afterSummary = after.summary || {};
-  const canFinishBefore = canFinishAfterOneDiscard(playerCards, wildJoker, options);
-  const canFinishAfterPick = canFinishAfterOneDiscard([...playerCards, discardTop], wildJoker, options);
+  // Prefer finish flags already computed inside evaluateHandStrength / buildBestGrouping.
+  const canFinishBefore = playerCards.length === 14
+    ? beforeSummary.can_finish_after_one_discard === true
+    : false;
+  const canFinishAfterPick = ([...playerCards, discardTop].length === 14)
+    ? afterSummary.can_finish_after_one_discard === true
+    : canFinishAfterOneDiscard([...playerCards, discardTop], wildJoker, {
+      ...options,
+      precomputedGrouping: after.grouping,
+    });
   const needsPure = before.pureCount === 0;
   const proactive = playToWin || urgency >= 0.7;
 
@@ -256,8 +287,18 @@ function buildDiscardCandidateRanking(cards = [], wildJoker = null, options = {}
   const urgency = Math.max(0, Math.min(1, Number(options?.playUrgency) || 0.55));
   const nearEqualMargin = Math.max(0.5, Number(options?.nearEqualMargin) || 8);
   const proactive = playToWin || urgency >= 0.7;
+  const fullEvalTop = Math.max(
+    2,
+    Math.min(
+      8,
+      Number.isFinite(Number(options?.fullEvalTop))
+        ? Number(options.fullEvalTop)
+        : (Number(process.env.BOT_DISCARD_FULL_EVAL_TOP) || 4)
+    )
+  );
 
-  const currentGrouping = groupingService.buildBestGrouping(cards, wildJoker, options?.groupingOptions || {});
+  const currentGrouping = options?.precomputedGrouping
+    || groupingService.buildBestGrouping(cards, wildJoker, options?.groupingOptions || {});
   const groupedIds = new Set(
     (Array.isArray(currentGrouping?.groups) ? currentGrouping.groups : [])
       .filter((group) => group?.is_valid_meld)
@@ -279,29 +320,53 @@ function buildDiscardCandidateRanking(cards = [], wildJoker = null, options = {}
     candidates = nonWildCandidates.length > 0 ? nonWildCandidates : cards;
   }
 
-  const ranked = candidates.map((candidate) => {
-    const remainingCards = cards.filter((card) => card?.card_uid !== candidate.card_uid);
-    const remainingState = evaluateHandStrength(remainingCards, wildJoker, options);
+  // Cheap pre-rank (no per-card buildBestGrouping) — was the main event-loop blocker.
+  const cheapRanked = candidates.map((candidate) => {
     const importance = getCardImportance(candidate, cards, wildRank);
     const value = getCardValue(candidate, wildRank);
     const isolatedBonus = isCardIsolated(candidate, cards, wildRank) ? (proactive ? 18 : 14) : 0;
     const groupedPenalty = groupedIds.has(candidate.card_uid) ? (proactive ? 42 : 35) : 0;
     const highValueIsolatedPenalty = proactive && isolatedBonus > 0 && value >= 10 ? (value * 0.35) : 0;
-
-    const discardScore = remainingState.score
-      + (value * 2)
+    const cheapScore = (value * 2)
       + isolatedBonus
       + highValueIsolatedPenalty
       - (importance * 2)
       - groupedPenalty;
-
     return {
       candidate,
-      discardScore,
       importance,
       value,
       groupedPenalty,
+      isolatedBonus,
+      cheapScore,
       seededNoise: seededFloat(tieBreakSeed, `discard:${candidate.card_uid || 'unknown'}`),
+    };
+  });
+
+  cheapRanked.sort((a, b) => {
+    if (b.cheapScore !== a.cheapScore) return b.cheapScore - a.cheapScore;
+    if (conservativeMode && a.value !== b.value) return a.value - b.value;
+    return b.seededNoise - a.seededNoise;
+  });
+
+  const shortlist = cheapRanked.slice(0, Math.min(fullEvalTop, cheapRanked.length));
+  const ranked = shortlist.map((row) => {
+    const remainingCards = cards.filter((card) => card?.card_uid !== row.candidate.card_uid);
+    const remainingState = evaluateHandStrength(remainingCards, wildJoker, options);
+    const discardScore = remainingState.score
+      + (row.value * 2)
+      + row.isolatedBonus
+      + (proactive && row.isolatedBonus > 0 && row.value >= 10 ? (row.value * 0.35) : 0)
+      - (row.importance * 2)
+      - row.groupedPenalty;
+
+    return {
+      candidate: row.candidate,
+      discardScore,
+      importance: row.importance,
+      value: row.value,
+      groupedPenalty: row.groupedPenalty,
+      seededNoise: row.seededNoise,
     };
   });
 
@@ -341,10 +406,13 @@ function compactGroupingSummary(summary = {}) {
 function explainPickSourceDecision(distribution, playerCards = [], wildJoker = null, options = {}) {
   const softRiggingEnabled = options?.softRiggingEnabled === true;
   const discardTop = Array.isArray(distribution?.discard_pile) ? distribution.discard_pile[0] : null;
-  const before = evaluateHandStrength(playerCards, wildJoker);
-  const chosen = chooseBotPickSource(distribution, playerCards, wildJoker, options);
+  const before = options.precomputedBefore || evaluateHandStrength(playerCards, wildJoker, options);
 
   if (!discardTop) {
+    const chosen = chooseBotPickSource(distribution, playerCards, wildJoker, {
+      ...options,
+      precomputedBefore: before,
+    });
     return {
       chosen,
       soft_rigging_enabled: softRiggingEnabled,
@@ -355,11 +423,17 @@ function explainPickSourceDecision(distribution, playerCards = [], wildJoker = n
         : 0,
       before_hand: compactGroupingSummary(before.summary),
       score_delta_vs_open: null,
-      can_finish_before: canFinishAfterOneDiscard(playerCards, wildJoker, options),
+      can_finish_before: before.summary?.can_finish_after_one_discard === true,
     };
   }
 
-  const after = evaluateHandStrength([...playerCards, discardTop], wildJoker);
+  const after = options.precomputedAfter
+    || evaluateHandStrength([...playerCards, discardTop], wildJoker, options);
+  const chosen = chooseBotPickSource(distribution, playerCards, wildJoker, {
+    ...options,
+    precomputedBefore: before,
+    precomputedAfter: after,
+  });
   const pickImportance = getCardImportance(discardTop, [...playerCards, discardTop], before.wildRank);
 
   return {
@@ -378,8 +452,8 @@ function explainPickSourceDecision(distribution, playerCards = [], wildJoker = n
     hypothetical_with_open: compactGroupingSummary(after.summary),
     strength_score_delta: after.score - before.score,
     pick_importance: pickImportance,
-    can_finish_before: canFinishAfterOneDiscard(playerCards, wildJoker, options),
-    can_finish_after_open_pick: canFinishAfterOneDiscard([...playerCards, discardTop], wildJoker, options),
+    can_finish_before: before.summary?.can_finish_after_one_discard === true,
+    can_finish_after_open_pick: after.summary?.can_finish_after_one_discard === true,
   };
 }
 
@@ -400,6 +474,7 @@ function getTopDiscardCandidatesForLog(cards = [], wildJoker = null, limit = 5, 
 module.exports = {
   chooseBotPickSource,
   chooseBotDiscardCard,
+  buildDiscardCandidateRanking,
   getCardValue,
   isCardIsolated,
   evaluateHandStrength,

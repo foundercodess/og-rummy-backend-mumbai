@@ -29,6 +29,16 @@ const MAX_TOTAL_GROUPS = 6;
 const MAX_OPTIMAL_SEARCH_CARDS = 14;
 const FINISH_HAND_CARD_COUNT = 14;
 const DECLARE_HAND_CARD_COUNT = 13;
+/** Hard CPU budget for the O(n) discard finish scan (ms). Partition search is tried first. */
+const GROUPING_FINISH_SCAN_BUDGET_MS = Math.max(
+  5,
+  Number(process.env.GROUPING_FINISH_SCAN_BUDGET_MS) || 35 
+);
+/** Stop refining discard scan once a finish card of this point value (or higher) is found. */
+const GROUPING_FINISH_SCAN_GOOD_ENOUGH_POINTS = Math.max(
+  0,
+  Number(process.env.GROUPING_FINISH_SCAN_GOOD_ENOUGH_POINTS) || 10
+);
 
 const GROUP_TYPE_PRIORITY = {
   pure_sequence: 0, impure_sequence: 1, set: 2,
@@ -1271,17 +1281,40 @@ function _assembleFinishTraceFromNextHand(hand, wildJoker, finishCard, nextTrace
   };
 }
 
-function _buildFinishReadyFromDiscardScan(hand, wildJoker) {
+function _buildFinishReadyFromDiscardScan(hand, wildJoker, options = {}) {
   const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const startedAtMs = Date.now();
+  const budgetMs = Number.isFinite(Number(options?.budgetMs))
+    ? Math.max(5, Number(options.budgetMs))
+    : GROUPING_FINISH_SCAN_BUDGET_MS;
+  const goodEnoughPoints = Number.isFinite(Number(options?.goodEnoughPoints))
+    ? Math.max(0, Number(options.goodEnoughPoints))
+    : GROUPING_FINISH_SCAN_GOOD_ENOUGH_POINTS;
+
+  // Prefer high-point / likely leftover cards first so a tight budget still finds a finish.
+  const order = hand
+    .map((card, index) => ({ card, index, points: cardPoints(card, wildRank) }))
+    .sort((a, b) => {
+      if (b.points !== a.points) return b.points - a.points;
+      return a.index - b.index;
+    });
+
   let best = null;
-  for (let i = 0; i < hand.length; i++) {
-    const finishCard = hand[i];
-    const nextHand = hand.filter((_, idx) => idx !== i);
+  for (const entry of order) {
+    if (best && (Date.now() - startedAtMs) >= budgetMs) break;
+
+    const finishCard = entry.card;
+    const nextHand = hand.filter((_, idx) => idx !== entry.index);
     const nextTrace = _resolveOptimalTrace(nextHand, wildRank);
     const assembled = _assembleFinishTraceFromNextHand(hand, wildJoker, finishCard, nextTrace);
     if (!assembled) continue;
     if (!_isFinishReadyAfterDiscard(hand, wildJoker, assembled.groups, finishCard)) continue;
     best = _pickBetterFinishTrace(hand, wildJoker, best, assembled);
+
+    const bestPoints = best?.ungrouped?.[0] != null
+      ? cardPoints(best.ungrouped[0], wildRank)
+      : 0;
+    if (best && bestPoints >= goodEnoughPoints) break;
   }
   return best;
 }
@@ -1291,8 +1324,10 @@ function _tryBuildFinishReadyTrace(hand, wildJoker) {
   const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
   const melds = _enumerateMelds(hand, wildRank);
   const fromPartition = _searchFinishReadyPartition(hand, wildJoker, melds);
-  const fromScan = _buildFinishReadyFromDiscardScan(hand, wildJoker);
-  return _pickBetterFinishTrace(hand, wildJoker, fromPartition, fromScan);
+  // Partition already found a declare-ready finish — skip the O(n) discard scan.
+  // This was the main event-loop blocker (14 × optimal trace) on every 14-card grouping.
+  if (fromPartition) return fromPartition;
+  return _buildFinishReadyFromDiscardScan(hand, wildJoker);
 }
 
 // ─── buildBestGrouping ────────────────────────────────────────────────────────

@@ -17,12 +17,12 @@ const redisLockService = require('../services/redisLock.service');
 const botLeaseService = require('../services/botLease.service');
 const {
   chooseBotDiscardCard,
+  buildDiscardCandidateRanking,
   getCardValue,
   isCardIsolated,
   canFinishAfterOneDiscard,
   evaluateHandStrength,
   explainPickSourceDecision,
-  getTopDiscardCandidatesForLog,
   compactGroupingSummary,
 } = require('../services/botEngine/rummyBotStrategy');
 const { pool } = require('../db');
@@ -39,6 +39,12 @@ const {
   resolveNextDealFirstTurnUserId,
 } = require('./turnRotation');
 const { setTurnTimerStarter } = require('./turnSchedulerBridge');
+const {
+  toClientCardFaceId,
+  resolveClosedDeckTopPreview,
+  emitClosedDeckPreviewToTurnPlayer,
+  scheduleClosedDeckPreviewFromSession,
+} = require('./closedDeckPreview');
 const {
   instrumentSocket,
   traceSessionBroadcast,
@@ -213,11 +219,19 @@ const BOT_LOW_CONFIDENCE_THRESHOLD = Math.max(0, Math.min(1, Number(process.env.
 const BOT_LOW_MARGIN_THRESHOLD = Math.max(0, Number(process.env.BOT_LOW_MARGIN_THRESHOLD) || 12);
 const GROUPING_TIE_NEAR_EQUAL_MARGIN = Math.max(1, Number(process.env.GROUPING_TIE_NEAR_EQUAL_MARGIN) || 10);
 const BOT_FINISH_DEBUG_LOG_ENABLED = String(process.env.BOT_FINISH_DEBUG_LOG_ENABLED || 'false').trim().toLowerCase() === 'true';
-const BOT_FINISH_EVAL_WARN_MS = Math.max(5, Number(process.env.BOT_FINISH_EVAL_WARN_MS) || 25);
-/** Soft CPU budget for bot finish-card search. Under load, stop after finding ≥1 valid candidate. */
+const BOT_FINISH_EVAL_WARN_MS = Math.max(5, Number(process.env.BOT_FINISH_EVAL_WARN_MS) || 60);
+/**
+ * Hard CPU budget for bot finish-card search (ms). Always enforced — even when no
+ * candidate has been found yet — so a miss cannot block the gameplay event loop.
+ */
 const BOT_FINISH_EVAL_BUDGET_MS = Math.max(
   10,
-  Number(process.env.BOT_FINISH_EVAL_BUDGET_MS) || 45
+  Number(process.env.BOT_FINISH_EVAL_BUDGET_MS) || 40
+);
+/** Cap how many finish-card candidates we fully re-group under the hard budget. */
+const BOT_FINISH_EVAL_MAX_CARDS = Math.max(
+  1,
+  Math.min(14, Number(process.env.BOT_FINISH_EVAL_MAX_CARDS) || 5)
 );
 /** High enough that an invalid-single leftover is near-optimal; stop early when found. */
 const BOT_FINISH_EARLY_EXIT_UTILITY = Math.max(
@@ -226,6 +240,18 @@ const BOT_FINISH_EARLY_EXIT_UTILITY = Math.max(
 );
 /** Internal bot/timer loads do not need recent event history on the response. */
 const BOT_INTERNAL_SESSION_OPTS = Object.freeze({ includeEvents: false });
+/**
+ * Human pick/discard/finish hot path: skip audit-event PG scan and game/contest
+ * join. Turn timer / bonus come from metadata.turn (+ defaults).
+ */
+const TURN_ACTION_SESSION_OPTS = Object.freeze({
+  includeEvents: false,
+  includeGameContest: false,
+});
+/** Yield so inbound socket:ping / player ACKs can run between bot CPU chunks. */
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
 const SOCKET_SESSION_CHECK_TTL_MS = Math.max(1000, Number(process.env.SOCKET_SESSION_CHECK_TTL_MS) || 3000);
 const POOL_REJOIN_THRESHOLD_BY_LIMIT = {
   101: 79,
@@ -2411,11 +2437,23 @@ function normalizeAttemptsUsedByUser(metadata = {}) {
 }
 
 function getMaxBonusAttempts(session) {
+  const fromMeta = Number(session?.metadata?.turn_bonus?.max_attempts_per_player);
+  if (!Number.isNaN(fromMeta) && fromMeta > 0) {
+    return Math.floor(fromMeta);
+  }
   const fromGame = Number(session?.game?.bonus_attempts_per_player);
   if (!Number.isNaN(fromGame) && fromGame > 0) {
     return Math.floor(fromGame);
   }
   return MAX_BONUS_ATTEMPTS_PER_PLAYER;
+}
+
+function resolveTurnTimerSeconds(session, fallback = 30) {
+  const fromTurn = Number(session?.metadata?.turn?.turn_timer_seconds);
+  if (Number.isFinite(fromTurn) && fromTurn > 0) return Math.floor(fromTurn);
+  const fromGame = Number(session?.game?.turn_timer_seconds);
+  if (Number.isFinite(fromGame) && fromGame > 0) return Math.floor(fromGame);
+  return fallback;
 }
 
 function isFirstDropEligible(playerDistribution) {
@@ -2506,6 +2544,14 @@ function buildTurnPayload({
 }
 
 function emitTurn(io, sessionId, turn, extras = {}) {
+  // Never leak closed-deck identity on the room broadcast.
+  const {
+    session,
+    distribution,
+    closed_deck_top: _ignoredClosedTop,
+    ...publicExtras
+  } = extras || {};
+
   const turnPayload = traceSessionBroadcast({
     sessionId,
     eventName: 'game:turn',
@@ -2513,12 +2559,19 @@ function emitTurn(io, sessionId, turn, extras = {}) {
       session_id: sessionId,
       server_time: new Date().toISOString(),
       event: 'game:turn',
-      ...extras,
+      ...publicExtras,
       turn,
     },
     targetUserId: turn?.user_id ?? null,
   });
   io.to(sessionRoom(sessionId)).emit('game:turn', turnPayload);
+
+  const dist = distribution || session?.metadata?.distribution || null;
+  if (dist) {
+    emitClosedDeckPreviewToTurnPlayer(io, sessionId, turn, dist);
+  } else {
+    scheduleClosedDeckPreviewFromSession(io, sessionId, turn);
+  }
 
   maybeScheduleBotTurnAction(io, sessionId, turn).catch((err) => {
     errorGame(sessionId, `Bot turn scheduling failed: ${err.message}`);
@@ -2576,6 +2629,22 @@ function emitDeckReshuffled(io, sessionId, extras = {}) {
   );
 
   io.to(sessionRoom(sessionId)).emit('game:deck_reshuffled', payload);
+
+  // Current turn player needs a fresh closed-top preview after reshuffle.
+  Promise.resolve()
+    .then(() => gameSessionModel.findSessionById(sessionId))
+    .then((row) => {
+      const turn = row?.metadata?.turn;
+      if (!turn || turn.has_picked === true) return;
+      emitClosedDeckPreviewToTurnPlayer(
+        io,
+        sessionId,
+        turn,
+        row?.metadata?.distribution
+      );
+    })
+    .catch(() => {});
+
   return payload;
 }
 
@@ -3000,11 +3069,19 @@ function tryFindBotCardInClosedDeck(closedDeck, botCards, wildJoker, options = {
   }
 
   const helpfulCards = [];
-  for (let i = 0; i < closedDeck.length; i++) {
+  // Only scan the top of the closed deck — full-deck × buildBestGrouping was blocking
+  // the event loop for hundreds of ms (and spiking client socket:ping to ~1s).
+  const maxScan = Math.min(
+    closedDeck.length,
+    Math.max(BOT_SOFT_RIGGING_DECK_LOOKAHEAD, Number(process.env.BOT_SOFT_RIGGING_MAX_SCAN) || 6)
+  );
+  const scanBudgetMs = Math.max(5, Number(process.env.BOT_SOFT_RIGGING_SCAN_BUDGET_MS) || 20);
+  const scanStartedAt = Date.now();
+  for (let i = 0; i < maxScan; i++) {
+    if ((Date.now() - scanStartedAt) >= scanBudgetMs) break;
     const card = closedDeck[i];
     const testHand = [...botCards, card];
     const testGrouping = groupingService.buildBestGrouping(testHand, wildJoker, groupingOptions);
-    const currentSummary = botGrouping?.summary || {};
     const nextSummary = testGrouping?.summary || {};
     const groupedDelta = (Number(nextSummary.grouped_cards_count) || 0) - (Number(currentSummary.grouped_cards_count) || 0);
     const pureDelta = (Number(nextSummary.pure_sequence_count) || 0) - (Number(currentSummary.pure_sequence_count) || 0);
@@ -3100,12 +3177,34 @@ function tryBuildFinishPlanFromSubmittedGroups(cards = [], wildJoker = null, opt
 
   const candidates = [];
   const finishPool = ungroupedCards.length > 0 ? ungroupedCards : cards;
+  const maxCandidates = Number.isFinite(Number(options?.maxCandidates))
+    ? Math.max(1, Number(options.maxCandidates))
+    : (options?.earlyExit === true ? 4 : finishPool.length);
+  const earlyExitUtility = Number.isFinite(Number(options?.earlyExitUtility))
+    ? Number(options.earlyExitUtility)
+    : 1500;
 
-  finishPool.forEach((finishCard) => {
-    if (!finishCard?.card_uid) return;
+  // Prefer likely leftovers first so earlyExit still finds a good finish card.
+  const orderedPool = [...finishPool].sort((a, b) => {
+    const aUid = String(a?.card_uid || '').trim();
+    const bUid = String(b?.card_uid || '').trim();
+    const aMeta = cardToLayoutMeta.get(aUid) || {};
+    const bMeta = cardToLayoutMeta.get(bUid) || {};
+    const aScore = (aMeta.isInvalidSingle ? 2000 : 0)
+      + (ungroupedCards.some((c) => String(c?.card_uid || '').trim() === aUid) ? 1000 : 0)
+      + getCardValue(a, wildJoker);
+    const bScore = (bMeta.isInvalidSingle ? 2000 : 0)
+      + (ungroupedCards.some((c) => String(c?.card_uid || '').trim() === bUid) ? 1000 : 0)
+      + getCardValue(b, wildJoker);
+    if (bScore !== aScore) return bScore - aScore;
+    return aUid.localeCompare(bUid);
+  }).slice(0, maxCandidates);
+
+  for (const finishCard of orderedPool) {
+    if (!finishCard?.card_uid) continue;
     const finishUid = String(finishCard.card_uid).trim();
     const nextHandCards = cards.filter((card) => String(card?.card_uid || '').trim() !== finishUid);
-    if (nextHandCards.length !== DECLARE_HAND_CARD_COUNT) return;
+    if (nextHandCards.length !== DECLARE_HAND_CARD_COUNT) continue;
 
     let nextSubmittedGroups;
     try {
@@ -3114,7 +3213,7 @@ function tryBuildFinishPlanFromSubmittedGroups(cards = [], wildJoker = null, opt
         nextHandCards
       );
     } catch (_) {
-      return;
+      continue;
     }
 
     let nextGrouping;
@@ -3125,10 +3224,10 @@ function tryBuildFinishPlanFromSubmittedGroups(cards = [], wildJoker = null, opt
         nextSubmittedGroups
       );
     } catch (_) {
-      return;
+      continue;
     }
 
-    if (nextGrouping?.summary?.valid_for_declare !== true) return;
+    if (nextGrouping?.summary?.valid_for_declare !== true) continue;
 
     const cardValue = getCardValue(finishCard, wildJoker);
     const isUngrouped = ungroupedCards.some(
@@ -3155,7 +3254,11 @@ function tryBuildFinishPlanFromSubmittedGroups(cards = [], wildJoker = null, opt
         ? deterministicRoll(tieBreakSeed, `finish:${finishUid}`)
         : 0,
     });
-  });
+
+    if (options?.earlyExit === true && utilityScore >= earlyExitUtility) {
+      break;
+    }
+  }
 
   if (candidates.length === 0) return null;
 
@@ -3236,32 +3339,16 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
   const evalBudgetMs = Number.isFinite(Number(options?.evalBudgetMs))
     ? Math.max(5, Number(options.evalBudgetMs))
     : BOT_FINISH_EVAL_BUDGET_MS;
+  const maxCardsToTry = Number.isFinite(Number(options?.maxCardsToTry))
+    ? Math.max(1, Math.min(14, Number(options.maxCardsToTry)))
+    : BOT_FINISH_EVAL_MAX_CARDS;
 
   const groupingOptions = options?.groupingOptions || {};
   const tieBreakSeed = String(options?.tieBreakSeed || '');
   const currentGrouping = groupingService.buildBestGrouping(cards, wildJoker, groupingOptions);
-  const currentSubmitted = toSubmittedGroupsFromGrouping(currentGrouping);
-  let layoutGrouping = null;
-  try {
-    layoutGrouping = groupingService.evaluateSubmittedGrouping(cards, wildJoker, currentSubmitted);
-  } catch (_) {
-    layoutGrouping = null;
-  }
-  const cardToLayoutMeta = new Map();
-  (layoutGrouping?.groups || []).forEach((group) => {
-    const type = String(group?.type || '');
-    const cardsInGroup = Array.isArray(group?.cards) ? group.cards : [];
-    const isInvalidSingle = type === 'invalid_single'
-      || (group?.is_valid_meld !== true && cardsInGroup.length === 1);
-    cardsInGroup.forEach((card) => {
-      if (!card?.card_uid) return;
-      cardToLayoutMeta.set(String(card.card_uid).trim(), {
-        type,
-        isInvalidSingle,
-        groupPoints: Number(group?.group_points) || 0,
-      });
-    });
-  });
+  const preferredFinishUid = String(currentGrouping?.summary?.finish_card_uid || '').trim();
+  const canFinishKnown = currentGrouping?.summary?.can_finish_after_one_discard === true;
+
   const cardToGroupMeta = new Map();
   (Array.isArray(currentGrouping?.groups) ? currentGrouping.groups : []).forEach((group) => {
     const groupCards = Array.isArray(group?.cards) ? group.cards : [];
@@ -3275,10 +3362,151 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
     });
   });
 
-  // Try likely finish cards first so a soft CPU budget still finds a valid declare path.
-  // Prefer the card already discovered by buildBestGrouping's finish-ready scan.
-  const preferredFinishUid = String(currentGrouping?.summary?.finish_card_uid || '').trim();
-  const canFinishKnown = currentGrouping?.summary?.can_finish_after_one_discard === true;
+  // Layout re-eval is only needed to rank leftovers; skip when grouping already named a finish card.
+  const cardToLayoutMeta = new Map();
+  if (!preferredFinishUid) {
+    const currentSubmitted = toSubmittedGroupsFromGrouping(currentGrouping);
+    let layoutGrouping = null;
+    try {
+      layoutGrouping = groupingService.evaluateSubmittedGrouping(cards, wildJoker, currentSubmitted);
+    } catch (_) {
+      layoutGrouping = null;
+    }
+    (layoutGrouping?.groups || []).forEach((group) => {
+      const type = String(group?.type || '');
+      const cardsInGroup = Array.isArray(group?.cards) ? group.cards : [];
+      const isInvalidSingle = type === 'invalid_single'
+        || (group?.is_valid_meld !== true && cardsInGroup.length === 1);
+      cardsInGroup.forEach((card) => {
+        if (!card?.card_uid) return;
+        cardToLayoutMeta.set(String(card.card_uid).trim(), {
+          type,
+          isInvalidSingle,
+          groupPoints: Number(group?.group_points) || 0,
+        });
+      });
+    });
+  }
+
+  const scoreFinishCandidate = (finishCard, nextHandCards, nextGrouping) => {
+    const meta = cardToGroupMeta.get(finishCard.card_uid) || {
+      type: '',
+      size: 1,
+      isValidMeld: false,
+    };
+    const fromMeldSize = Number(meta.size) || 1;
+    const fromValidMeld = meta.isValidMeld === true;
+    const fromType = String(meta.type || '');
+    const cardValue = getCardValue(finishCard, wildJoker);
+    const isolated = isCardIsolated(finishCard, cards, wildJoker);
+    const layoutMeta = cardToLayoutMeta.get(String(finishCard.card_uid || '').trim()) || {};
+
+    // "Most useless card" heuristic:
+    // - Prefer true leftovers / invalid singles from best-group layout.
+    // - Prefer removing extra cards from oversized melds (4/5 cards) first.
+    // - Avoid breaking minimal 3-card melds unless no other safe option.
+    let utilityScore = 0;
+    if (layoutMeta.isInvalidSingle) utilityScore += 1650;
+    else if (!fromValidMeld) utilityScore += 1500;
+    else if (layoutMeta.groupPoints > 0) utilityScore += 850;
+    if (fromValidMeld && fromMeldSize > 3) utilityScore += (fromMeldSize - 3) * 80;
+    if (fromValidMeld && fromMeldSize === 3) utilityScore -= 35;
+    if (fromType === 'set' && fromMeldSize === 3) utilityScore -= 20;
+    if (fromType === 'pure_sequence' && fromMeldSize === 3) utilityScore -= 12;
+    utilityScore += cardValue * 6;
+    if (isolated) utilityScore += 18;
+    utilityScore += (Number(nextGrouping?.summary?.decision_margin) || 0) * 0.01;
+    if (preferredFinishUid && String(finishCard.card_uid).trim() === preferredFinishUid) {
+      utilityScore += 2000;
+    }
+
+    return {
+      finishCard,
+      nextHandCards,
+      nextGrouping,
+      utilityScore,
+      cardValue,
+      isolated,
+      fromType,
+      fromMeldSize,
+      seededTieRoll: tieBreakSeed
+        ? deterministicRoll(tieBreakSeed, `finish:${finishCard.card_uid}`)
+        : 0,
+    };
+  };
+
+  const tryFinishCard = (finishCard) => {
+    if (!finishCard?.card_uid) return null;
+    const finishIndex = cards.findIndex((card) => card?.card_uid === finishCard.card_uid);
+    if (finishIndex < 0) return null;
+    const nextHandCards = [...cards];
+    nextHandCards.splice(finishIndex, 1);
+    if (nextHandCards.length !== DECLARE_HAND_CARD_COUNT) return null;
+    const nextGrouping = groupingService.buildBestGrouping(
+      nextHandCards,
+      wildJoker,
+      groupingOptions
+    );
+    if (nextGrouping?.summary?.valid_for_declare !== true) return null;
+    return scoreFinishCandidate(finishCard, nextHandCards, nextGrouping);
+  };
+
+  // Fast path: grouping already proved a finish card — validate only that card.
+  if (canFinishKnown && preferredFinishUid) {
+    const preferredCard = cards.find(
+      (card) => String(card?.card_uid || '').trim() === preferredFinishUid
+    );
+    const preferredCandidate = tryFinishCard(preferredCard);
+    if (preferredCandidate) {
+      const evalMs = Date.now() - startedAtMs;
+      if (evalMs >= BOT_FINISH_EVAL_WARN_MS) {
+        warnGame(
+          options?.sessionId || 'finish_plan',
+          `Finish evaluation slow — uid=${options?.userId || 'unknown'} turn=${options?.turnId || 'na'} ` +
+          `candidates=1 earlyStop=true evalMs=${evalMs}`
+        );
+      }
+      if (BOT_FINISH_DEBUG_LOG_ENABLED) {
+        logGame(
+          options?.sessionId || 'finish_plan',
+          `Finish selected uid=${options?.userId || 'unknown'} turn=${options?.turnId || 'na'} ` +
+          `card=${preferredCandidate.finishCard?.card_uid || 'na'} candidates=1 ` +
+          `earlyStop=true evalMs=${evalMs}`
+        );
+      }
+      return {
+        finishCard: preferredCandidate.finishCard,
+        nextHandCards: preferredCandidate.nextHandCards,
+        submittedGroups: toSubmittedGroupsFromGrouping(preferredCandidate.nextGrouping),
+        preview: preferredCandidate.nextGrouping,
+        explain: {
+          utility_score: preferredCandidate.utilityScore,
+          from_group_type: preferredCandidate.fromType,
+          from_group_size: preferredCandidate.fromMeldSize,
+          card_value: preferredCandidate.cardValue,
+          isolated: preferredCandidate.isolated,
+          early_stop: true,
+          source: 'grouping_finish_uid',
+        },
+      };
+    }
+  }
+
+  // Grouping already ran finish-ready detection and found nothing. A full 14-card
+  // re-scan here used to burn 200–500ms for a guaranteed miss — bail immediately.
+  if (!canFinishKnown) {
+    const evalMs = Date.now() - startedAtMs;
+    if (evalMs >= BOT_FINISH_EVAL_WARN_MS) {
+      warnGame(
+        options?.sessionId || 'finish_plan',
+        `Finish evaluation slow (no candidate) — uid=${options?.userId || 'unknown'} ` +
+        `turn=${options?.turnId || 'na'} evalMs=${evalMs}`
+      );
+    }
+    return null;
+  }
+
+  // Try likely finish cards first so a hard CPU budget still finds a valid declare path.
   const cardsToTry = [...cards].sort((a, b) => {
     const aUid = String(a?.card_uid || '').trim();
     const bUid = String(b?.card_uid || '').trim();
@@ -3300,84 +3528,29 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
       + getCardValue(b, wildJoker);
     if (bScore !== aScore) return bScore - aScore;
     return aUid.localeCompare(bUid);
-  });
+  }).slice(0, maxCardsToTry);
 
   const safeCandidates = [];
   let stoppedEarly = false;
+  let cardsTried = 0;
   for (const finishCard of cardsToTry) {
-    if (!finishCard?.card_uid) continue;
-
-    if (
-      safeCandidates.length > 0
-      && (Date.now() - startedAtMs) >= evalBudgetMs
-    ) {
+    // Hard budget: always stop, even with zero candidates (bot discards normally).
+    if ((Date.now() - startedAtMs) >= evalBudgetMs) {
       stoppedEarly = true;
       break;
     }
+    cardsTried += 1;
+    const candidate = tryFinishCard(finishCard);
+    if (!candidate) continue;
+    safeCandidates.push(candidate);
 
-    const finishIndex = cards.findIndex((card) => card?.card_uid === finishCard.card_uid);
-    if (finishIndex < 0) continue;
-
-    const nextHandCards = [...cards];
-    nextHandCards.splice(finishIndex, 1);
-
-    const nextGrouping = groupingService.buildBestGrouping(
-      nextHandCards,
-      wildJoker,
-      groupingOptions
-    );
-    if (nextGrouping?.summary?.valid_for_declare === true) {
-      if (nextHandCards.length !== DECLARE_HAND_CARD_COUNT) continue;
-      const meta = cardToGroupMeta.get(finishCard.card_uid) || {
-        type: '',
-        size: 1,
-        isValidMeld: false,
-      };
-      const fromMeldSize = Number(meta.size) || 1;
-      const fromValidMeld = meta.isValidMeld === true;
-      const fromType = String(meta.type || '');
-      const cardValue = getCardValue(finishCard, wildJoker);
-      const isolated = isCardIsolated(finishCard, cards, wildJoker);
-      const layoutMeta = cardToLayoutMeta.get(String(finishCard.card_uid || '').trim()) || {};
-
-      // "Most useless card" heuristic:
-      // - Prefer true leftovers / invalid singles from best-group layout.
-      // - Prefer removing extra cards from oversized melds (4/5 cards) first.
-      // - Avoid breaking minimal 3-card melds unless no other safe option.
-      let utilityScore = 0;
-      if (layoutMeta.isInvalidSingle) utilityScore += 1650;
-      else if (!fromValidMeld) utilityScore += 1500;
-      else if (layoutMeta.groupPoints > 0) utilityScore += 850;
-      if (fromValidMeld && fromMeldSize > 3) utilityScore += (fromMeldSize - 3) * 80;
-      if (fromValidMeld && fromMeldSize === 3) utilityScore -= 35;
-      if (fromType === 'set' && fromMeldSize === 3) utilityScore -= 20;
-      if (fromType === 'pure_sequence' && fromMeldSize === 3) utilityScore -= 12;
-      utilityScore += cardValue * 6;
-      if (isolated) utilityScore += 18;
-      utilityScore += (Number(nextGrouping?.summary?.decision_margin) || 0) * 0.01;
-
-      safeCandidates.push({
-        finishCard,
-        nextHandCards,
-        nextGrouping,
-        utilityScore,
-        cardValue,
-        isolated,
-        fromType,
-        fromMeldSize,
-        seededTieRoll: tieBreakSeed
-          ? deterministicRoll(tieBreakSeed, `finish:${finishCard.card_uid}`)
-          : 0,
-      });
-
-      // Near-optimal leftover, known finish-ready path, or CPU budget — stop scanning.
-      if (
-        utilityScore >= BOT_FINISH_EARLY_EXIT_UTILITY
-        || canFinishKnown
-      ) {
-        stoppedEarly = true;
-        break;
-      }
+    if (
+      candidate.utilityScore >= BOT_FINISH_EARLY_EXIT_UTILITY
+      || canFinishKnown
+      || (Date.now() - startedAtMs) >= evalBudgetMs
+    ) {
+      stoppedEarly = true;
+      break;
     }
   }
 
@@ -3387,17 +3560,16 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
       warnGame(
         options?.sessionId || 'finish_plan',
         `Finish plan missing despite valid grouping — uid=${options?.userId || 'unknown'} ` +
-        `turn=${options?.turnId || 'na'} cards=${cards.length} evalMs=${evalMs}`
+        `turn=${options?.turnId || 'na'} cards=${cards.length} tried=${cardsTried} evalMs=${evalMs}`
       );
     }
     if (evalMs >= BOT_FINISH_EVAL_WARN_MS) {
       warnGame(
         options?.sessionId || 'finish_plan',
         `Finish evaluation slow (no candidate) — uid=${options?.userId || 'unknown'} ` +
-        `turn=${options?.turnId || 'na'} evalMs=${evalMs}`
+        `turn=${options?.turnId || 'na'} tried=${cardsTried} earlyStop=${stoppedEarly} evalMs=${evalMs}`
       );
     }
-    // No safe finish card found.
     return null;
   }
 
@@ -3417,7 +3589,7 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
     warnGame(
       options?.sessionId || 'finish_plan',
       `Finish evaluation slow — uid=${options?.userId || 'unknown'} turn=${options?.turnId || 'na'} ` +
-      `candidates=${safeCandidates.length} earlyStop=${stoppedEarly} evalMs=${evalMs}`
+      `candidates=${safeCandidates.length} tried=${cardsTried} earlyStop=${stoppedEarly} evalMs=${evalMs}`
     );
   }
   if (BOT_FINISH_DEBUG_LOG_ENABLED) {
@@ -3425,7 +3597,7 @@ function tryBuildBotFinishPlan(cards = [], wildJoker = null, options = {}) {
       options?.sessionId || 'finish_plan',
       `Finish selected uid=${options?.userId || 'unknown'} turn=${options?.turnId || 'na'} ` +
       `card=${selected.finishCard?.card_uid || 'na'} candidates=${safeCandidates.length} ` +
-      `earlyStop=${stoppedEarly} evalMs=${evalMs}`
+      `tried=${cardsTried} earlyStop=${stoppedEarly} evalMs=${evalMs}`
     );
   }
   return {
@@ -3618,13 +3790,22 @@ function shouldBotStrategicallyDrop(session, userId, cards = [], wildJoker = nul
   const turnId = Number(options?.turn?.turn_id) || 0;
   const isDeadHand = !hasAnyValidMeld(cards, wildJoker);
   if (turnId > 0 && turnId < BOT_STRATEGIC_DROP_EARLY_TURN_GATE && !isDeadHand) return false;
-  if (canFinishAfterOneDiscard(cards, wildJoker, { groupingOptions: buildGroupingTieBreakOptions(options?.decisionSeed) })) {
+
+  const groupingOptions = buildGroupingTieBreakOptions(options?.decisionSeed);
+  const grouping = groupingService.buildBestGrouping(cards, wildJoker, groupingOptions);
+  const summary = grouping?.summary || {};
+  // Prefer summary finish flag on 14-card hands; avoid a second O(n) finish scan.
+  if (
+    summary.can_finish_after_one_discard === true
+    || summary.valid_for_declare === true
+    || (
+      Array.isArray(cards)
+      && cards.length !== 14
+      && canFinishAfterOneDiscard(cards, wildJoker, { groupingOptions })
+    )
+  ) {
     return false;
   }
-
-  const grouping = groupingService.buildBestGrouping(cards, wildJoker, buildGroupingTieBreakOptions(options?.decisionSeed));
-  const summary = grouping?.summary || {};
-  if (summary.valid_for_declare === true) return false;
   if (BOT_CONSERVATIVE_PLAY_ON_LOW_CONFIDENCE && isLowConfidenceGrouping(summary)) return false;
 
   const hopeless = isHopelessHandForDrop(summary, turnId);
@@ -4083,14 +4264,61 @@ function buildAutoBestGroupingResult(handCards, wildJoker, options = {}) {
     wildJoker,
     submittedGroups
   );
-  const finishPlan = tryBuildFinishPlan(handCards, wildJoker, {
-    submittedGroups,
-    groupingOptions,
-    tieBreakSeed: options.tieBreakSeed || '',
-    sessionId: options.sessionId,
-    userId: options.userId,
-    turnId: options.turnId,
-  });
+
+  // Fast path for pick ACK: trust finish_card_uid from buildBestGrouping instead of
+  // re-scanning every leftover (that scan was a major pick-latency source).
+  let finishPlan = null;
+  const preferredUid = String(best?.summary?.finish_card_uid || '').trim();
+  if (options.fastFinishPlan === true && preferredUid) {
+    const finishCard = (Array.isArray(handCards) ? handCards : [])
+      .find((card) => String(card?.card_uid || '').trim() === preferredUid);
+    if (finishCard) {
+      const nextHandCards = handCards.filter(
+        (card) => String(card?.card_uid || '').trim() !== preferredUid
+      );
+      if (nextHandCards.length === DECLARE_HAND_CARD_COUNT) {
+        let nextSubmitted;
+        try {
+          nextSubmitted = sanitizeSubmittedGroups(
+            removeCardFromGroups(submittedGroups, preferredUid),
+            nextHandCards
+          );
+        } catch (_) {
+          nextSubmitted = null;
+        }
+        if (nextSubmitted) {
+          try {
+            const preview = groupingService.evaluateSubmittedGrouping(
+              nextHandCards,
+              wildJoker,
+              nextSubmitted
+            );
+            if (preview?.summary?.valid_for_declare === true) {
+              finishPlan = {
+                finishCard,
+                nextHandCards,
+                submittedGroups: nextSubmitted,
+                preview,
+                explain: { source: 'auto_best_finish_uid', early_stop: true },
+              };
+            }
+          } catch (_) {
+            finishPlan = null;
+          }
+        }
+      }
+    }
+  } else if (options.skipFinishPlan !== true) {
+    finishPlan = tryBuildFinishPlan(handCards, wildJoker, {
+      submittedGroups,
+      groupingOptions,
+      tieBreakSeed: options.tieBreakSeed || '',
+      sessionId: options.sessionId,
+      userId: options.userId,
+      turnId: options.turnId,
+    });
+  }
+
   return { grouping, submittedGroups, finishPlan };
 }
 
@@ -7138,6 +7366,23 @@ function syncSocketToSessionPhase(socket, session, reason = 'session_sync') {
           `Emitting game:turn after game:deal sync uid=${socket.user?.id} payload=${JSON.stringify(turnPayload)}`
         );
         socket.emit('game:turn', turnPayload);
+        const turn = session.metadata?.turn;
+        if (
+          turn
+          && Number(turn.user_id) === Number(socket.user?.id)
+          && turn.has_picked !== true
+        ) {
+          const preview = resolveClosedDeckTopPreview(session.metadata?.distribution);
+          if (preview) {
+            socket.emit('player:closed_deck_preview', {
+              session_id: session.id,
+              server_time: new Date().toISOString(),
+              event: 'player:closed_deck_preview',
+              turn_id: turn.turn_id,
+              closed_deck_top: preview,
+            });
+          }
+        }
       }
       return { phase: 'active', event: 'game:deal', reason };
     }
@@ -7878,10 +8123,11 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
   const decisionSeed = buildDecisionSeed(sessionId, turn.turn_id, turn.user_id);
   const playContext = buildBotPlayContext(session, turn.user_id);
   const tieBreakOptions = buildGroupingTieBreakOptions(decisionSeed);
+  const handBeforePick = evaluateHandStrength(playerDistribution.cards, wildJoker, {
+    groupingOptions: tieBreakOptions,
+  });
   const conservativeMode = BOT_CONSERVATIVE_PLAY_ON_LOW_CONFIDENCE
-    && isLowConfidenceGrouping(
-      groupingService.buildBestGrouping(playerDistribution.cards, wildJoker, tieBreakOptions)?.summary || {}
-    );
+    && isLowConfidenceGrouping(handBeforePick.summary || {});
   if (await tryExecuteBotDropBeforePick(
     io,
     sessionId,
@@ -7894,6 +8140,9 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
   )) {
     return;
   }
+
+  await yieldToEventLoop();
+
   let discardPile = [...(distribution.discard_pile || [])];
   let closedDeck = [...(distribution.closed_deck || [])];
 
@@ -7914,6 +8163,7 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
       playUrgency: playContext.urgency,
       playToWin: playContext.playToWin,
       mode,
+      precomputedBefore: handBeforePick,
     }
   );
   source = pickExplain.chosen;
@@ -7930,6 +8180,8 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
       }
     }
   }
+
+  await yieldToEventLoop();
 
   if (source === 'closed' && closedDeck.length === 0) {
     logGame(
@@ -8029,7 +8281,7 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
     metadata: pickedMetadata,
   });
 
-  await gameSessionModel.insertEvent({
+  gameSessionModel.insertEvent({
     sessionId,
     userId: turn.user_id,
     eventType: 'bot_pick',
@@ -8038,33 +8290,41 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
       card_uid: pickedCard.card_uid,
       card_id: pickedCard.card_id,
     },
-  });
+  }).catch(() => {});
 
-  const afterPickStrength = evaluateHandStrength(playerDistribution.cards, wildJoker, {
-    groupingOptions: tieBreakOptions,
-  });
-  logBotDecisionExplainability(sessionId, {
-    phase: 'pick',
-    user_id: turn.user_id,
-    turn_id: Number(turn.turn_id) || 0,
-    mode,
-    wild_joker: wildJoker && { rank: wildJoker.rank, card_id: wildJoker.card_id },
-    pick_eval: pickExplain,
-    effective_pick_source: source,
-    chosen_card: {
-      card_uid: pickedCard.card_uid,
-      rank: pickedCard.rank,
-      suit: pickedCard.suit,
-    },
-    after_pick_hand: compactGroupingSummary(afterPickStrength.summary),
-    grouping_confidence: Number(afterPickStrength.summary?.grouping_confidence),
-    decision_margin: Number(afterPickStrength.summary?.decision_margin),
-    alternative_count: Number(afterPickStrength.summary?.alternative_count),
-    conservative_mode: conservativeMode,
-    soft_rigging_applied: usedSoftRiggingPick,
-    reshuffle_applied: Boolean(reshufflePayload),
-    closed_deck_count_after: closedDeck.length,
-    elapsed_ms: Date.now() - decisionStartedAt,
+  // Defer explainability CPU so human socket:ping / pick ACK aren't blocked.
+  const elapsedPickMs = Date.now() - decisionStartedAt;
+  setImmediate(() => {
+    try {
+      const afterPickStrength = evaluateHandStrength(playerDistribution.cards, wildJoker, {
+        groupingOptions: tieBreakOptions,
+      });
+      logBotDecisionExplainability(sessionId, {
+        phase: 'pick',
+        user_id: turn.user_id,
+        turn_id: Number(turn.turn_id) || 0,
+        mode,
+        wild_joker: wildJoker && { rank: wildJoker.rank, card_id: wildJoker.card_id },
+        pick_eval: pickExplain,
+        effective_pick_source: source,
+        chosen_card: {
+          card_uid: pickedCard.card_uid,
+          rank: pickedCard.rank,
+          suit: pickedCard.suit,
+        },
+        after_pick_hand: compactGroupingSummary(afterPickStrength.summary),
+        grouping_confidence: Number(afterPickStrength.summary?.grouping_confidence),
+        decision_margin: Number(afterPickStrength.summary?.decision_margin),
+        alternative_count: Number(afterPickStrength.summary?.alternative_count),
+        conservative_mode: conservativeMode,
+        soft_rigging_applied: usedSoftRiggingPick,
+        reshuffle_applied: Boolean(reshufflePayload),
+        closed_deck_count_after: closedDeck.length,
+        elapsed_ms: elapsedPickMs,
+      });
+    } catch (_) {
+      // explainability must never affect gameplay
+    }
   });
 
   if (reshufflePayload) {
@@ -8156,6 +8416,8 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
   const conservativeMode = BOT_CONSERVATIVE_PLAY_ON_LOW_CONFIDENCE
     && isLowConfidenceGrouping(handStrengthBeforeDecision.summary || {});
 
+  await yieldToEventLoop();
+
   let finishPlan = tryBuildBotFinishPlan(
     refreshedPlayer.cards,
     refreshedDistribution.wild_joker || null,
@@ -8206,9 +8468,6 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
 
     const mode = resolveSessionGameMode(refreshed);
     const wildForFinish = refreshedDistribution.wild_joker || null;
-    const finishHandEval = evaluateHandStrength(refreshedPlayer.cards, wildForFinish, {
-      groupingOptions: tieBreakOptions,
-    });
     const invalidPoolDeclare = mode === 'pool' && finishPlan?.preview?.summary?.valid_for_declare !== true;
     logBotDecisionExplainability(sessionId, {
       phase: 'finish',
@@ -8216,10 +8475,10 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
       turn_id: Number(refreshedTurn.turn_id) || 0,
       mode,
       wild_joker: wildForFinish && { rank: wildForFinish.rank, card_id: wildForFinish.card_id },
-      hand_before_finish: compactGroupingSummary(finishHandEval.summary),
-      grouping_confidence: Number(finishHandEval.summary?.grouping_confidence),
-      decision_margin: Number(finishHandEval.summary?.decision_margin),
-      alternative_count: Number(finishHandEval.summary?.alternative_count),
+      hand_before_finish: compactGroupingSummary(handStrengthBeforeDecision.summary),
+      grouping_confidence: Number(handStrengthBeforeDecision.summary?.grouping_confidence),
+      decision_margin: Number(handStrengthBeforeDecision.summary?.decision_margin),
+      alternative_count: Number(handStrengthBeforeDecision.summary?.alternative_count),
       conservative_mode: conservativeMode,
       finish_card_uid: finishPlan.finishCard.card_uid,
       preview_valid_for_declare: finishPlan.preview?.summary?.valid_for_declare === true,
@@ -8385,6 +8644,8 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
     return;
   }
 
+  await yieldToEventLoop();
+
   const discardWild = refreshedDistribution.wild_joker || null;
   const playContext = buildBotPlayContext(refreshed, refreshedTurn.user_id);
   const discardOptions = {
@@ -8394,9 +8655,23 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
     playUrgency: playContext.urgency,
     playToWin: playContext.playToWin,
     mode: playContext.mode,
+    precomputedGrouping: handStrengthBeforeDecision.grouping,
   };
-  const discardCandidates = getTopDiscardCandidatesForLog(refreshedPlayer.cards, discardWild, 5, discardOptions);
-  let discardCard = chooseBotDiscardCard(refreshedPlayer.cards, discardWild, discardOptions);
+  let rankedDiscards = buildDiscardCandidateRanking(
+    refreshedPlayer.cards,
+    discardWild,
+    discardOptions
+  );
+  let discardCard = rankedDiscards[0]?.candidate || null;
+  const discardCandidates = rankedDiscards.slice(0, 5).map((row) => ({
+    card_uid: row.candidate?.card_uid,
+    rank: row.candidate?.rank,
+    suit: row.candidate?.suit,
+    discardScore: row.discardScore,
+    importance: row.importance,
+    value: row.value,
+    groupedPenalty: row.groupedPenalty,
+  }));
   const pickedUid = String(refreshedTurn.picked_card_uid || '').trim();
   if (pickedUid && discardCard?.card_uid === pickedUid) {
     const pickedCardObj = refreshedPlayer.cards.find((card) => card?.card_uid === pickedUid);
@@ -8405,10 +8680,11 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
       pickedCardObj
       && !canMeaningfullyImproveWithPickedCard(handBeforePick, pickedCardObj, discardWild)
     ) {
-      discardCard = chooseBotDiscardCard(refreshedPlayer.cards, discardWild, {
+      rankedDiscards = buildDiscardCandidateRanking(refreshedPlayer.cards, discardWild, {
         ...discardOptions,
         excludeCardUids: [pickedUid],
       });
+      discardCard = rankedDiscards[0]?.candidate || null;
     }
   }
   if (!discardCard && refreshedPlayer.cards.length > 0) {
@@ -8459,7 +8735,7 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
     return;
   }
 
-  const turnTimerSeconds = Number(refreshed?.game?.turn_timer_seconds) || 30;
+  const turnTimerSeconds = resolveTurnTimerSeconds(refreshed, 30);
   const attemptsUsedByUser = normalizeAttemptsUsedByUser(refreshed.metadata || {});
   const nextTurnWindow = buildTurnWindow(turnTimerSeconds);
   const nextTurn = buildTurnPayload({
@@ -8535,6 +8811,7 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
     discarded_card: discardedCard,
     discard_top: nextDiscardPile[0] || null,
     player_deal_flags: buildPlayerDealFlags(playersAfterDepartingTurn),
+    distribution: nextMetadata.distribution,
   });
 
   emitDiscardHistoryUpdate(io, {
@@ -9364,6 +9641,7 @@ async function onTurnTimeout(io, sessionId, expectedTurnId) {
     discarded_card: discardedCard,
     discard_top: discardPile[0] || null,
     player_deal_flags: buildPlayerDealFlags(playersAfterDepartingTurn),
+    distribution: nextMetadata.distribution,
   });
 
   scheduleTurnTimeout(io, sessionId, nextTurn);
@@ -11691,7 +11969,7 @@ function registerSocketServer(httpServer) {
         const requestedPosition = normalizeCardPosition(requestedPositionRaw);
 
         const source = resolvePickSource(payload.source);
-        const session = await gameplayService.getSessionState(sessionId);
+        const session = await gameplayService.getSessionState(sessionId, null, TURN_ACTION_SESSION_OPTS);
         if (!session) {
           throw new Error('Session not found');
         }
@@ -11741,7 +12019,9 @@ function registerSocketServer(httpServer) {
           callback(lockedPickAck);
           return;
         }
-        if ((await gameplayService.getSessionState(sessionId))?.metadata?.turn?.has_picked === true) {
+        // Lightweight race check — Redis live row only (no players/events/game join).
+        const liveAfterLock = await gameSessionModel.findSessionById(sessionId);
+        if (liveAfterLock?.metadata?.turn?.has_picked === true) {
           const raced = await turnActionIdempotency.getStoredAck(pickResultKey);
           if (raced) {
             callback(raced);
@@ -11836,6 +12116,7 @@ function registerSocketServer(httpServer) {
             sessionId,
             userId: socket.user.id,
             turnId: turnIdForSeed,
+            fastFinishPlan: true,
           });
           updatedPickGroups = autoResult.submittedGroups;
           grouping = autoResult.grouping;
@@ -11855,13 +12136,16 @@ function registerSocketServer(httpServer) {
             wildJoker,
             updatedPickGroups
           ));
-          finishPlan = tryBuildFinishPlan(playerDistribution.cards, wildJoker, {
+          // Human pick: only finish-from-submitted layout (never bot full scan on ACK path).
+          finishPlan = tryBuildFinishPlanFromSubmittedGroups(playerDistribution.cards, wildJoker, {
             submittedGroups: updatedPickGroups,
             groupingOptions,
             tieBreakSeed: decisionSeed,
             sessionId,
             userId: socket.user.id,
             turnId: turnIdForSeed,
+            earlyExit: true,
+            maxCandidates: 4,
           });
         }
 
@@ -11902,7 +12186,8 @@ function registerSocketServer(httpServer) {
           metadata: nextMetadata,
         });
 
-        await gameSessionModel.insertEvent({
+        // Non-blocking audit trail — must not delay pick ACK.
+        gameSessionModel.insertEvent({
           sessionId,
           userId: socket.user.id,
           eventType: 'player_pick',
@@ -11911,7 +12196,24 @@ function registerSocketServer(httpServer) {
             card_uid: pickedCard.card_uid,
             card_id: pickedCard.card_id,
           },
-        });
+        }).catch(() => {});
+
+        const pickAck = {
+          success: true,
+          data: {
+            source,
+            picked_card: pickedCard,
+            cards_count: playerDistribution.cards.length,
+            closed_deck_count: closedDeck.length,
+            discard_top: discardPile[0] || null,
+            deck_reshuffled: Boolean(reshufflePayload),
+            ...buildFinishPlanCallbackExtras(finishPlan),
+            ...buildGroupingResponseData(grouping),
+          },
+        };
+        await turnActionIdempotency.storeAck(pickResultKey, { ...pickAck, idempotent_replay: true });
+        // ACK the picker first — room fan-out must not add latency to their hand UI.
+        callback(pickAck);
 
         if (reshufflePayload) {
           emitDeckReshuffled(io, sessionId, reshufflePayload);
@@ -11939,22 +12241,6 @@ function registerSocketServer(httpServer) {
             latest: playerDiscardPickUpdate.latestEntry,
           });
         }
-
-        const pickAck = {
-          success: true,
-          data: {
-            source,
-            picked_card: pickedCard,
-            cards_count: playerDistribution.cards.length,
-            closed_deck_count: closedDeck.length,
-            discard_top: discardPile[0] || null,
-            deck_reshuffled: Boolean(reshufflePayload),
-            ...buildFinishPlanCallbackExtras(finishPlan),
-            ...buildGroupingResponseData(grouping),
-          },
-        };
-        await turnActionIdempotency.storeAck(pickResultKey, { ...pickAck, idempotent_replay: true });
-        callback(pickAck);
         } finally {
           await redisLockService.releaseLock(pickLockKey, pickLockOwner);
         }
@@ -11975,7 +12261,7 @@ function registerSocketServer(httpServer) {
           throw new Error('card_uid is required');
         }
 
-        const session = await gameplayService.getSessionState(sessionId);
+        const session = await gameplayService.getSessionState(sessionId, null, TURN_ACTION_SESSION_OPTS);
         if (!session) {
           throw new Error('Session not found');
         }
@@ -12065,7 +12351,7 @@ function registerSocketServer(httpServer) {
         );
 
         const nextTurnUser = nextTurnUserId(getActivePlayers(session), socket.user.id);
-        const turnTimerSeconds = Number(session?.game?.turn_timer_seconds) || 30;
+        const turnTimerSeconds = resolveTurnTimerSeconds(session, 30);
         const nextTurnWindow = buildTurnWindow(turnTimerSeconds);
         const previousTurnId = Number(session.metadata?.turn?.turn_id) || Date.now();
         const maxBonusAttempts = getMaxBonusAttempts(session);
@@ -12116,7 +12402,7 @@ function registerSocketServer(httpServer) {
           metadata: nextMetadata,
         });
 
-        await gameSessionModel.insertEvent({
+        gameSessionModel.insertEvent({
           sessionId,
           userId: socket.user.id,
           eventType: 'player_discard',
@@ -12125,28 +12411,7 @@ function registerSocketServer(httpServer) {
             card_id: discardedCard.card_id,
             next_turn_user_id: nextTurnUser,
           },
-        });
-
-        logGame(sessionId, `Discard — uid=${socket.user.id} card=${discardedCard.card_uid} → next=uid:${nextTurnUser} timer=${turnTimerSeconds}s`);
-
-        emitTurn(io, sessionId, nextTurn, {
-          action: 'discard',
-          previous_turn_user_id: socket.user.id,
-          previous_turn_id: previousTurnId,
-          discarded_card: discardedCard,
-          discard_top: discardPile[0],
-          player_deal_flags: buildPlayerDealFlags(playersAfterDepartingTurn),
-        });
-
-        emitDiscardHistoryUpdate(io, {
-          ...session,
-          metadata: nextMetadata,
-        }, {
-          reason: 'player_discard',
-          latest: playerDiscardHistoryAppend.latestEntry,
-        });
-
-        scheduleTurnTimeout(io, sessionId, nextTurn);
+        }).catch(() => {});
 
         const discardAck = {
           success: true,
@@ -12160,6 +12425,28 @@ function registerSocketServer(httpServer) {
         };
         await turnActionIdempotency.storeAck(discardResultKey, { ...discardAck, idempotent_replay: true });
         callback(discardAck);
+
+        logGame(sessionId, `Discard — uid=${socket.user.id} card=${discardedCard.card_uid} → next=uid:${nextTurnUser} timer=${turnTimerSeconds}s`);
+
+        emitTurn(io, sessionId, nextTurn, {
+          action: 'discard',
+          previous_turn_user_id: socket.user.id,
+          previous_turn_id: previousTurnId,
+          discarded_card: discardedCard,
+          discard_top: discardPile[0],
+          player_deal_flags: buildPlayerDealFlags(playersAfterDepartingTurn),
+          distribution: nextMetadata.distribution,
+        });
+
+        emitDiscardHistoryUpdate(io, {
+          ...session,
+          metadata: nextMetadata,
+        }, {
+          reason: 'player_discard',
+          latest: playerDiscardHistoryAppend.latestEntry,
+        });
+
+        scheduleTurnTimeout(io, sessionId, nextTurn);
         } finally {
           await redisLockService.releaseLock(discardLockKey, discardLockOwner);
         }

@@ -865,13 +865,16 @@ async function getSessionState(sessionIdOrCode, existingPlayers = null, options 
   if (!session) return null;
 
   const includeEvents = options?.includeEvents !== false;
+  const includeGameContest = options?.includeGameContest !== false;
   const players = existingPlayers || await gameSessionModel.listSessionPlayers(session.id);
-  // Internal bot/timer paths can skip events to avoid an extra ordered scan per action.
+  // Internal bot/timer + pick/discard paths skip events to avoid an extra ordered PG scan.
   // Client-facing paths (join, refresh, session:state) keep the default includeEvents=true.
   const events = includeEvents
     ? await gameSessionModel.listRecentEvents(session.id)
     : [];
-  const { game, contest } = await getGameAndContestData(session.game_id, session.contest_id);
+  const { game, contest } = includeGameContest
+    ? await getGameAndContestData(session.game_id, session.contest_id)
+    : { game: null, contest: null };
   const scoreContext = resolveSessionScoreContext({ session, game, players });
   const prizePoolFields = buildSessionPrizePoolFields({
     mode: scoreContext.game_mode,

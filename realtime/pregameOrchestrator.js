@@ -19,6 +19,9 @@ const {
   filterTurnEligibleAtDealStart,
   resolveLastTurnUserId,
 } = require('./turnRotation');
+const {
+  emitClosedDeckPreviewToTurnPlayer,
+} = require('./closedDeckPreview');
 
 const COUNTDOWN_SECONDS = Math.max(3, Number(process.env.MATCH_COUNTDOWN_SECONDS) || 10);
 /** Free leave while seconds_left is above this; entry lock + back disabled at this value. */
@@ -1421,24 +1424,45 @@ async function emitDealFromPregame({
     players: dealPlayers,
   });
 
+  // Private closed-top for first turn player — deal_start used to skip emitTurn().
+  emitClosedDeckPreviewToTurnPlayer(
+    io,
+    sessionId,
+    {
+      turn_id: turnId,
+      user_id: firstTurnPlayer.user_id,
+      has_picked: false,
+    },
+    dealPayload.distribution
+  );
+
   setTimeout(() => {
+    const dealStartTurn = {
+      turn_id: turnId,
+      user_id: firstTurnPlayer.user_id,
+      started_at: turnStartedAt,
+      ends_at: turnEndsAt,
+      turn_timer_seconds: turnTimerSeconds,
+      type: 'normal',
+      attempt_no: 0,
+      max_bonus_attempts: BONUS_ATTEMPTS_PER_PLAYER,
+      attempts_left: BONUS_ATTEMPTS_PER_PLAYER,
+      has_picked: false,
+    };
     io.to(sessionRoom(sessionId)).emit('game:turn', {
       session_id: dealPayload.session_id,
       server_time: getNowIso(),
       event: 'game:turn',
       action: 'deal_start',
-      turn: {
-        turn_id: turnId,
-        user_id: firstTurnPlayer.user_id,
-        started_at: turnStartedAt,
-        ends_at: turnEndsAt,
-        turn_timer_seconds: turnTimerSeconds,
-        type: 'normal',
-        attempt_no: 0,
-        max_bonus_attempts: BONUS_ATTEMPTS_PER_PLAYER,
-        attempts_left: BONUS_ATTEMPTS_PER_PLAYER,
-      },
+      turn: dealStartTurn,
     });
+    // Re-send after deal animation window so late joiners / missed emits still get it.
+    emitClosedDeckPreviewToTurnPlayer(
+      io,
+      sessionId,
+      dealStartTurn,
+      dealPayload.distribution
+    );
 
     startTurnTimerFromDeal({
       session_id: sessionId,
