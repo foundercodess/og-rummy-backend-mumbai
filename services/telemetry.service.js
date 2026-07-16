@@ -5,6 +5,8 @@ const TELEMETRY_SKIPPED_EVENTS = new Set([
   'client:telemetry:ack',
   'notice:get',
   'connection:ready',
+  // RTT probe for on-table indicator — every few seconds per client; never persist.
+  'socket:ping',
 ]);
 
 
@@ -623,10 +625,9 @@ async function resolveBroadcastDeliveryMs(traceId, payload = {}) {
     return computeDurationMs(serverEmitAt, clientAckAt);
   }
 
-  const emitRow = await telemetryModel.findLatestEmitByTraceId(traceId);
-  if (!emitRow) return null;
-  const emitAt = emitRow.server_received_at || emitRow.server_completed_at || emitRow.created_at;
-  return computeDurationMs(emitAt, clientAckAt);
+  // Do NOT fall back to a DB lookup here — that SELECT races with async inserts
+  // and blocks the client ACK path. Prefer payload timestamps only.
+  return null;
 }
 
 module.exports = {

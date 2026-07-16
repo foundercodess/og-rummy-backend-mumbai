@@ -1,7 +1,9 @@
 const { query } = require('../db');
 
 async function insertEvent(row = {}) {
-  const result = await query(
+  // Fire-and-forget audit path: no RETURNING — avoids an extra round-trip and
+  // keeps background telemetry from competing with gameplay for as long.
+  await query(
     `INSERT INTO game_telemetry_events (
        game_session_id,
        user_id,
@@ -28,8 +30,7 @@ async function insertEvent(row = {}) {
      VALUES (
        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $21::jsonb
-     )
-     RETURNING id, created_at`,
+     )`,
     [
       row.game_session_id ?? null,
       row.user_id ?? null,
@@ -54,7 +55,7 @@ async function insertEvent(row = {}) {
       JSON.stringify(row.ack_summary || {}),
     ]
   );
-  return result.rows[0] || null;
+  return null;
 }
 
 async function listEvents({

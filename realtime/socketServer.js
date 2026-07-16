@@ -11047,6 +11047,15 @@ function registerSocketServer(httpServer) {
       }
     });
 
+    // Lightweight RTT probe for client socket-health indicator (no DB, no session read).
+    socket.on('socket:ping', (payload = {}, callback = () => { }) => {
+      callback({
+        success: true,
+        server_time: new Date().toISOString(),
+        socket_id: socket.id,
+      });
+    });
+
     socket.on('notice:get', async (payload = {}, callback = () => { }) => {
       try {
         const response = await emitActiveNotices(socket);
