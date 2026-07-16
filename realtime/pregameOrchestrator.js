@@ -11,6 +11,7 @@ const gameSessionModel = require('../models/gameSession.model');
 const groupingService = require('../services/grouping.service');
 const redisLockService = require('../services/redisLock.service');
 const sessionCache = require('../services/sessionCache.service');
+const liveSessionState = require('../services/liveSessionState.service');
 const socketRegistry = require('./socketRegistry');
 const { pool } = require('../db');
 const { startTurnTimerFromDeal } = require('./turnSchedulerBridge');
@@ -1181,6 +1182,7 @@ async function debitEntriesOnMatchFilled({ sessionId, sequence }) {
 
     await client.query('COMMIT');
     if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
+    if (liveSessionState.isEnabled()) await liveSessionState.drop(sessionId);
     return { debited_user_ids: debitedUserIds, skipped: false, entry_fee: entryFee };
   } catch (err) {
     await client.query('ROLLBACK');

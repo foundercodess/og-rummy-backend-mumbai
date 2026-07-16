@@ -5,6 +5,7 @@ const walletModel = require('../models/wallet.model');
 const { computeWalletDebitSplit } = require('./walletDebitSplit');
 const { buildPoolSessionPrizePoolFields } = require('./poolPrizePool.service');
 const sessionCache = require('./sessionCache.service');
+const liveSessionState = require('./liveSessionState.service');
 const { pool, query } = require('../db');
 
 function createSessionCode() {
@@ -1112,6 +1113,7 @@ async function leaveTableContinuation({ sourceSessionId, userId }) {
         );
         await query('COMMIT');
         if (sessionCache.isEnabled()) await sessionCache.invalidate(sourceSession.id);
+        if (liveSessionState.isEnabled()) await liveSessionState.drop(sourceSession.id);
         return null;
       }
 
@@ -1138,6 +1140,7 @@ async function leaveTableContinuation({ sourceSessionId, userId }) {
       );
       await query('COMMIT');
       if (sessionCache.isEnabled()) await sessionCache.invalidate(sourceSession.id);
+      if (liveSessionState.isEnabled()) await liveSessionState.drop(sourceSession.id);
       return getSessionState(sourceSession.id);
     } catch (err) {
       await query('ROLLBACK');

@@ -28,6 +28,8 @@ const {
 const { pool } = require('../db');
 const { getSocketAdapterRedisClients } = require('../services/redis.service');
 const sessionCache = require('../services/sessionCache.service');
+const liveSessionState = require('../services/liveSessionState.service');
+const turnActionIdempotency = require('../services/turnActionIdempotency.service');
 const { socketAuth } = require('./socketAuth');
 const socketRegistry = require('./socketRegistry');
 const { emitActiveNotices, setSocketIO } = require('./socketBus');
@@ -5889,6 +5891,7 @@ async function processPoolRejoinRequest({ sessionId, userId }) {
 
     await client.query('COMMIT');
     if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
+    if (liveSessionState.isEnabled()) await liveSessionState.drop(sessionId);
     const baseEntryCount = players.filter((player) => ['joined', 'disconnected', 'eliminated', 'left'].includes(player?.status)).length;
     const prizePoolSummary = buildPoolPrizePoolSummary({
       entryFee,
@@ -11705,8 +11708,45 @@ function registerSocketServer(httpServer) {
         }
         assertTurnStarted(session.metadata?.turn);
 
-        // Guard: cannot pick twice in the same turn
+        const pickTurnId = turnActionIdempotency.resolveTurnId(session);
+        const pickResultKey = turnActionIdempotency.pickResultKey(sessionId, pickTurnId, socket.user.id);
+        const priorPickAck = await turnActionIdempotency.getStoredAck(pickResultKey);
+        if (priorPickAck) {
+          callback(priorPickAck);
+          return;
+        }
+
+        // Guard: cannot pick twice in the same turn (idempotent replay handled above)
         if (session.metadata?.turn?.has_picked === true) {
+          throw new Error('You have already picked a card this turn — discard first');
+        }
+
+        const pickLockOwner = `${socket.id}:pick:${Date.now()}`;
+        const pickLockKey = turnActionIdempotency.pickLockKey(sessionId, pickTurnId, socket.user.id);
+        const pickLockGot = await redisLockService.acquireLock(pickLockKey, pickLockOwner, 20);
+        if (!pickLockGot) {
+          for (let i = 0; i < 40; i += 1) {
+            await new Promise((r) => setTimeout(r, 50));
+            const waited = await turnActionIdempotency.getStoredAck(pickResultKey);
+            if (waited) {
+              callback(waited);
+              return;
+            }
+          }
+          throw new Error('Pick already in progress — retry shortly');
+        }
+        try {
+        const lockedPickAck = await turnActionIdempotency.getStoredAck(pickResultKey);
+        if (lockedPickAck) {
+          callback(lockedPickAck);
+          return;
+        }
+        if ((await gameplayService.getSessionState(sessionId))?.metadata?.turn?.has_picked === true) {
+          const raced = await turnActionIdempotency.getStoredAck(pickResultKey);
+          if (raced) {
+            callback(raced);
+            return;
+          }
           throw new Error('You have already picked a card this turn — discard first');
         }
 
@@ -11900,7 +11940,7 @@ function registerSocketServer(httpServer) {
           });
         }
 
-        callback({
+        const pickAck = {
           success: true,
           data: {
             source,
@@ -11912,7 +11952,12 @@ function registerSocketServer(httpServer) {
             ...buildFinishPlanCallbackExtras(finishPlan),
             ...buildGroupingResponseData(grouping),
           },
-        });
+        };
+        await turnActionIdempotency.storeAck(pickResultKey, { ...pickAck, idempotent_replay: true });
+        callback(pickAck);
+        } finally {
+          await redisLockService.releaseLock(pickLockKey, pickLockOwner);
+        }
       } catch (err) {
         callback({ success: false, message: err.message });
       }
@@ -11947,9 +11992,38 @@ function registerSocketServer(httpServer) {
         }
         assertTurnStarted(session.metadata?.turn);
 
+        const discardTurnId = turnActionIdempotency.resolveTurnId(session);
+        const discardResultKey = turnActionIdempotency.discardResultKey(sessionId, discardTurnId, socket.user.id);
+        const priorDiscardAck = await turnActionIdempotency.getStoredAck(discardResultKey);
+        if (priorDiscardAck) {
+          callback(priorDiscardAck);
+          return;
+        }
+
         // Guard: must pick before discarding
         if (session.metadata?.turn?.has_picked !== true) {
           throw new Error('You must pick a card before discarding');
+        }
+
+        const discardLockOwner = `${socket.id}:discard:${Date.now()}`;
+        const discardLockKey = turnActionIdempotency.discardLockKey(sessionId, discardTurnId, socket.user.id);
+        const discardLockGot = await redisLockService.acquireLock(discardLockKey, discardLockOwner, 20);
+        if (!discardLockGot) {
+          for (let i = 0; i < 40; i += 1) {
+            await new Promise((r) => setTimeout(r, 50));
+            const waited = await turnActionIdempotency.getStoredAck(discardResultKey);
+            if (waited) {
+              callback(waited);
+              return;
+            }
+          }
+          throw new Error('Discard already in progress — retry shortly');
+        }
+        try {
+        const lockedDiscardAck = await turnActionIdempotency.getStoredAck(discardResultKey);
+        if (lockedDiscardAck) {
+          callback(lockedDiscardAck);
+          return;
         }
 
         const distribution = session.metadata?.distribution;
@@ -12074,7 +12148,7 @@ function registerSocketServer(httpServer) {
 
         scheduleTurnTimeout(io, sessionId, nextTurn);
 
-        callback({
+        const discardAck = {
           success: true,
           data: {
             discarded_card: discardedCard,
@@ -12083,7 +12157,12 @@ function registerSocketServer(httpServer) {
             turn: nextTurn,
             ...buildGroupingResponseData(grouping),
           },
-        });
+        };
+        await turnActionIdempotency.storeAck(discardResultKey, { ...discardAck, idempotent_replay: true });
+        callback(discardAck);
+        } finally {
+          await redisLockService.releaseLock(discardLockKey, discardLockOwner);
+        }
       } catch (err) {
         callback({ success: false, message: err.message });
       }
@@ -13171,6 +13250,28 @@ function registerSocketServer(httpServer) {
 
         const state = activeDeclareBySession.get(sessionId);
         if (!state) {
+          // Late / desynced submit: window already finalized (timeout or all players done).
+          // Do not fail hard — return settled state so client can show result seamlessly.
+          const settled = await gameplayService.getSessionState(sessionId);
+          const settledResult = settled?.metadata?.result || null;
+          const declarationMeta = settled?.metadata?.declaration || null;
+          if (settledResult || declarationMeta?.finalized_at || settled?.status === 'completed' || settled?.status === 'ready') {
+            warnGame(
+              sessionId,
+              `Declare response after window closed uid=${socket.user.id} — returning already_finalized`
+            );
+            callback({
+              success: true,
+              data: {
+                already_finalized: true,
+                pending_count: 0,
+                result: settledResult,
+                declaration: declarationMeta,
+                session_status: settled?.status || null,
+              },
+            });
+            return;
+          }
           throw new Error('No active declaration window');
         }
 
@@ -13438,7 +13539,7 @@ function registerSocketServer(httpServer) {
                   rejoin_candidate_user_ids: rejoinContext.rejoin_candidate_user_ids,
                   rejoin_start_points_by_user: rejoinContext.rejoin_start_points_by_user,
                   rejoin_at_points_by_user: rejoinContext.rejoin_start_points_by_user,
-                  joining_fee: rejoinInfo.joining_fee,
+                  joining_fee: rejoinInfo.joining_fee, 
                   current_prize_pool: rejoinInfo.current_prize_pool,
                   updated_prize_pool_if_rejoin: rejoinInfo.updated_prize_pool_if_rejoin,
                   rejoin_info: rejoinInfo,

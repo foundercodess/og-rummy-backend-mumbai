@@ -1,5 +1,6 @@
 const { query } = require('../db');
 const sessionCache = require('../services/sessionCache.service');
+const liveSessionState = require('../services/liveSessionState.service');
 
 async function createSession({ sessionCode, gameId, contestId, hostUserId, maxPlayers, metadata = {} }) {
   const result = await query(
@@ -21,21 +22,46 @@ async function createSession({ sessionCode, gameId, contestId, hostUserId, maxPl
 }
 
 async function findSessionById(sessionId) {
+  // Phase 3: live Redis snapshot is authoritative for active tables when enabled.
+  if (liveSessionState.isEnabled()) {
+    const live = await liveSessionState.get(sessionId);
+    if (live) return live;
+  }
+
   if (sessionCache.isEnabled()) {
     const cached = await sessionCache.getSessionRow(sessionId);
-    if (cached) return cached;
+    if (cached) {
+      // Promote into live store so subsequent pick/discard skip PG JSONB.
+      if (liveSessionState.isEnabled()) {
+        await liveSessionState.hydrateFromRow(sessionId, cached);
+      }
+      return cached;
+    }
   }
+
   const result = await query('SELECT * FROM game_sessions WHERE id = $1', [sessionId]);
   const row = result.rows[0] || null;
-  if (row && sessionCache.isEnabled()) {
-    await sessionCache.setSessionRow(sessionId, row);
+  if (row) {
+    if (liveSessionState.isEnabled()) {
+      await liveSessionState.hydrateFromRow(sessionId, row);
+    }
+    if (sessionCache.isEnabled()) {
+      await sessionCache.setSessionRow(sessionId, row);
+    }
   }
   return row;
 }
 
 async function findSessionByCode(sessionCode) {
   const result = await query('SELECT * FROM game_sessions WHERE session_code = $1', [sessionCode]);
-  return result.rows[0] || null;
+  const row = result.rows[0] || null;
+  if (!row) return null;
+  if (liveSessionState.isEnabled()) {
+    const live = await liveSessionState.get(row.id);
+    if (live) return live;
+    await liveSessionState.hydrateFromRow(row.id, row);
+  }
+  return row;
 }
 
 async function findOpenWaitingSession({ gameId, contestId, maxPlayers }) {
@@ -339,7 +365,7 @@ async function countJoinedPlayers(sessionId) {
   return result.rows[0] ? result.rows[0].total : 0;
 }
 
-async function updateSessionStatus(sessionId, status, fields = {}) {
+async function persistSessionStatusToPostgres(sessionId, status, fields = {}) {
   const updates = ['status = $2', 'updated_at = NOW()'];
   const values = [sessionId, status];
   let index = values.length + 1;
@@ -368,8 +394,74 @@ async function updateSessionStatus(sessionId, status, fields = {}) {
      RETURNING *`,
     values
   );
-  if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
   return result.rows[0] || null;
+}
+
+async function updateSessionStatus(sessionId, status, fields = {}) {
+  // ── Phase 3 live path (flag OFF → fall through to classic PG-only) ─────────
+  if (liveSessionState.isEnabled()) {
+    let base = await liveSessionState.get(sessionId);
+    if (!base) {
+      const result = await query('SELECT * FROM game_sessions WHERE id = $1', [sessionId]);
+      base = result.rows[0] || null;
+    }
+    if (!base) return null;
+
+    const nextLive = liveSessionState.applyStatusUpdate(base, status, fields);
+    await liveSessionState.set(sessionId, nextLive);
+    if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
+
+    const terminal = status === 'completed' || status === 'cancelled';
+    const awaitPg = liveSessionState.mustAwaitPostgres(status, fields);
+
+    if (awaitPg) {
+      liveSessionState.noteSyncPersist();
+      const row = await persistSessionStatusToPostgres(sessionId, status, fields);
+      if (terminal) {
+        await liveSessionState.drop(sessionId);
+      } else if (row) {
+        // Keep live in sync with any DB defaults (updated_at etc.)
+        await liveSessionState.hydrateFromRow(sessionId, {
+          ...row,
+          live_version: nextLive.live_version,
+        });
+      }
+      return row || nextLive;
+    }
+
+    // Async Postgres snapshot — Redis already has the move; ACK path stays fast.
+    liveSessionState.noteAsyncPersist();
+    const capturedFields = { ...fields };
+    const capturedStatus = status;
+    const capturedVersion = nextLive.live_version;
+    setImmediate(() => {
+      persistSessionStatusToPostgres(sessionId, capturedStatus, capturedFields)
+        .then((row) => {
+          if (!row) return;
+          // Only refresh live from PG if no newer live write raced ahead.
+          return liveSessionState.get(sessionId).then((current) => {
+            if (!current) return;
+            if (Number(current.live_version) > capturedVersion) return;
+            return liveSessionState.hydrateFromRow(sessionId, {
+              ...row,
+              live_version: capturedVersion,
+            });
+          });
+        })
+        .catch((err) => {
+          console.warn(
+            `[live-session] async PG persist failed session=${sessionId} ` +
+            `v=${capturedVersion}: ${err.message}`
+          );
+        });
+    });
+    return nextLive;
+  }
+
+  // ── Classic path (LIVE disabled) ───────────────────────────────────────────
+  const row = await persistSessionStatusToPostgres(sessionId, status, fields);
+  if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
+  return row;
 }
 
 function shouldAwaitSessionEventInsert() {
