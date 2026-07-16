@@ -116,9 +116,55 @@ async function getSocketAdapterRedisClients() {
 
 
 
+/**
+ * Fail-safe JSON cache helpers. These never throw: on any Redis error or when
+ * Redis is not configured they degrade to a cache-miss / no-op so callers can
+ * always fall back to their source of truth (Postgres). Safe to call on hot paths.
+ */
+async function cacheGetJson(key) {
+  try {
+    const client = await ensureRedisConnection();
+    if (!client) return null;
+    const raw = await client.get(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function cacheSetJson(key, value, ttlMs = 3000) {
+  try {
+    const client = await ensureRedisConnection();
+    if (!client) return;
+    const payload = JSON.stringify(value);
+    if (Number(ttlMs) > 0) {
+      await client.set(key, payload, 'PX', Math.floor(Number(ttlMs)));
+    } else {
+      await client.set(key, payload);
+    }
+  } catch (_) {
+    // best-effort cache write; ignore failures
+  }
+}
+
+async function cacheDel(...keys) {
+  try {
+    const flatKeys = keys.filter(Boolean);
+    if (flatKeys.length === 0) return;
+    const client = await ensureRedisConnection();
+    if (!client) return;
+    await client.del(...flatKeys);
+  } catch (_) {
+    // best-effort invalidation; ignore failures
+  }
+}
+
 module.exports = {
   getRedisClient,
   ensureRedisConnection,
   pingRedis,
   getSocketAdapterRedisClients,
+  cacheGetJson,
+  cacheSetJson,
+  cacheDel,
 };

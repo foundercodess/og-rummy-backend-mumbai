@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const sessionCache = require('./sessionCache.service');
 
 // Lobbies with no row activity past this window are cancelled (waiting/ready only). Tune via STALE_SESSION_CANCEL_AFTER_HOURS (e.g. 3).
 const DEFAULT_STALE_AFTER_HOURS = 2;
@@ -111,6 +112,9 @@ async function runStaleSessionCleanup(options = {}) {
     }
 
     await client.query('COMMIT');
+    if (sessionCache.isEnabled() && cancelledSessionIds.length > 0) {
+      await sessionCache.invalidateMany(cancelledSessionIds);
+    }
 
     return {
       cancelled_count: cancelledSessionIds.length,

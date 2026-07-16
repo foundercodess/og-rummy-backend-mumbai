@@ -1,4 +1,5 @@
 const { query } = require('../db');
+const sessionCache = require('../services/sessionCache.service');
 
 async function createSession({ sessionCode, gameId, contestId, hostUserId, maxPlayers, metadata = {} }) {
   const result = await query(
@@ -20,8 +21,16 @@ async function createSession({ sessionCode, gameId, contestId, hostUserId, maxPl
 }
 
 async function findSessionById(sessionId) {
+  if (sessionCache.isEnabled()) {
+    const cached = await sessionCache.getSessionRow(sessionId);
+    if (cached) return cached;
+  }
   const result = await query('SELECT * FROM game_sessions WHERE id = $1', [sessionId]);
-  return result.rows[0] || null;
+  const row = result.rows[0] || null;
+  if (row && sessionCache.isEnabled()) {
+    await sessionCache.setSessionRow(sessionId, row);
+  }
+  return row;
 }
 
 async function findSessionByCode(sessionCode) {
@@ -233,6 +242,10 @@ async function listStaleWaitingSessions({ olderThanSeconds = 30, limit = 25 } = 
 }
 
 async function listSessionPlayers(sessionId) {
+  if (sessionCache.isEnabled()) {
+    const cached = await sessionCache.getPlayers(sessionId);
+    if (cached) return cached;
+  }
   const result = await query(
     `SELECT gsp.*, u.name, u.phone, u.avatar, u.view_id
      FROM game_session_players gsp
@@ -241,6 +254,9 @@ async function listSessionPlayers(sessionId) {
      ORDER BY gsp.seat_no ASC`,
     [sessionId]
   );
+  if (sessionCache.isEnabled()) {
+    await sessionCache.setPlayers(sessionId, result.rows);
+  }
   return result.rows;
 }
 
@@ -256,6 +272,7 @@ async function addPlayer({ sessionId, userId, seatNo, metadata = {} }) {
     RETURNING *`,
     [sessionId, userId, seatNo, JSON.stringify(metadata)]
   );
+  if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
   return result.rows[0] || null;
 }
 
@@ -275,6 +292,7 @@ async function updatePlayerMetadata(sessionId, userId, metadata = {}) {
      RETURNING *`,
     [sessionId, userId, JSON.stringify(metadata)]
   );
+  if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
   return result.rows[0] || null;
 }
 
@@ -307,6 +325,7 @@ async function updatePlayerState(sessionId, userId, fields = {}) {
      RETURNING *`,
     values
   );
+  if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
   return result.rows[0] || null;
 }
 
@@ -349,6 +368,7 @@ async function updateSessionStatus(sessionId, status, fields = {}) {
      RETURNING *`,
     values
   );
+  if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
   return result.rows[0] || null;
 }
 

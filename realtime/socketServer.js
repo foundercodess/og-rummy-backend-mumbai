@@ -27,6 +27,7 @@ const {
 } = require('../services/botEngine/rummyBotStrategy');
 const { pool } = require('../db');
 const { getSocketAdapterRedisClients } = require('../services/redis.service');
+const sessionCache = require('../services/sessionCache.service');
 const { socketAuth } = require('./socketAuth');
 const socketRegistry = require('./socketRegistry');
 const { emitActiveNotices, setSocketIO } = require('./socketBus');
@@ -5887,6 +5888,7 @@ async function processPoolRejoinRequest({ sessionId, userId }) {
     );
 
     await client.query('COMMIT');
+    if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
     const baseEntryCount = players.filter((player) => ['joined', 'disconnected', 'eliminated', 'left'].includes(player?.status)).length;
     const prizePoolSummary = buildPoolPrizePoolSummary({
       entryFee,
