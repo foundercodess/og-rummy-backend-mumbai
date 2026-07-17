@@ -50,7 +50,7 @@ if (process.env.DATABASE_URL) {
     } : false,
     
     // CRITICAL: Increase connection pool for better throughput
-    max: parseInt(process.env.DB_POOL_MAX) || 20,  // Increased from 10 to 20
+    max: parseInt(process.env.DB_POOL_MAX, 10) || 30,
     
     // Keep connections alive to avoid reconnection overhead
     idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT) || 30000,

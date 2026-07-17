@@ -13,6 +13,7 @@ const loginAttemptModel = require('../models/loginAttempt.model');
 const userModel = require('../models/user.model');
 const avatarModel = require('../models/avatar.model');
 const groupingService = require('../services/grouping.service');
+const { isJokerCard: isJokerCardWithWild } = require('../services/wildJokerRules');
 const redisLockService = require('../services/redisLock.service');
 const botLeaseService = require('../services/botLease.service');
 const {
@@ -2448,9 +2449,8 @@ function getMaxBonusAttempts(session) {
   return MAX_BONUS_ATTEMPTS_PER_PLAYER;
 }
 
-function resolveTurnTimerSeconds(session, fallback = 30) {
-  const fromTurn = Number(session?.metadata?.turn?.turn_timer_seconds);
-  if (Number.isFinite(fromTurn) && fromTurn > 0) return Math.floor(fromTurn);
+/** Normal turn duration for the next player — game config only, never current bonus turn metadata. */
+function resolveNormalTurnTimerSeconds(session, fallback = 30) {
   const fromGame = Number(session?.game?.turn_timer_seconds);
   if (Number.isFinite(fromGame) && fromGame > 0) return Math.floor(fromGame);
   return fallback;
@@ -2570,6 +2570,9 @@ function emitTurn(io, sessionId, turn, extras = {}) {
   if (dist) {
     emitClosedDeckPreviewToTurnPlayer(io, sessionId, turn, dist);
   } else {
+    console.warn(
+      `[closed_deck_preview] emitTurn missing distribution session=${sessionId} turn=${turn?.turn_id}`,
+    );
     scheduleClosedDeckPreviewFromSession(io, sessionId, turn);
   }
 
@@ -2875,9 +2878,7 @@ function emitDiscardHistoryUpdate(io, session = {}, extras = {}) {
 }
 
 function isJokerCard(card = null, wildJoker = null) {
-  if (!card) return false;
-  if (card.is_joker === true) return true; // printed joker
-  return wildJoker && card.rank != null && card.rank === wildJoker.rank;
+  return isJokerCardWithWild(card, wildJoker);
 }
 
 function canPickDiscardJokerInCurrentTurn(session = {}) {
@@ -8625,6 +8626,7 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
         action: 'invalid_declaration_continue',
         previous_turn_id: refreshed?.metadata?.turn?.turn_id || null,
         invalid_declarer_user_id: refreshedTurn.user_id,
+        distribution: nextMetadata.distribution,
       });
       scheduleTurnTimeout(io, sessionId, nextTurn);
       await emitSessionState(io, sessionId);
@@ -8735,7 +8737,7 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
     return;
   }
 
-  const turnTimerSeconds = resolveTurnTimerSeconds(refreshed, 30);
+  const turnTimerSeconds = resolveNormalTurnTimerSeconds(refreshed, 30);
   const attemptsUsedByUser = normalizeAttemptsUsedByUser(refreshed.metadata || {});
   const nextTurnWindow = buildTurnWindow(turnTimerSeconds);
   const nextTurn = buildTurnPayload({
@@ -9423,6 +9425,7 @@ async function onTurnTimeout(io, sessionId, expectedTurnId) {
       previous_turn_id: turn.turn_id,
       previous_turn_type: turn.type || 'normal',
       user_id: currentUserId,
+      distribution: nextMetadata.distribution || distribution,
     });
 
     scheduleTurnTimeout(io, sessionId, nextTurn);
@@ -9928,6 +9931,7 @@ async function dropPlayerFromSession(io, sessionId, userId) {
       eliminated_user_ids: Array.from(nextEliminatedSet),
       discarded_card: discardedCard,
       discard_top: discardPile[0] || null,
+      distribution: nextMetadata.distribution,
     });
     scheduleTurnTimeout(io, sessionId, nextTurn);
     return { session: updatedSession, turn: nextTurn };
@@ -10033,6 +10037,12 @@ function registerSocketServer(httpServer) {
       origin: process.env.CORS_ORIGIN || '*',
       credentials: true,
     },
+    // Tighter heartbeats + no deflate — lower CPU and faster disconnect detection.
+    pingTimeout: Math.max(5000, Number(process.env.SOCKET_PING_TIMEOUT_MS) || 10000),
+    pingInterval: Math.max(8000, Number(process.env.SOCKET_PING_INTERVAL_MS) || 15000),
+    maxHttpBufferSize: Math.max(65536, Number(process.env.SOCKET_MAX_BUFFER_BYTES) || 1048576),
+    perMessageDeflate: false,
+    transports: ['websocket', 'polling'],
   });
 
   setSocketIO(io);
@@ -12351,7 +12361,7 @@ function registerSocketServer(httpServer) {
         );
 
         const nextTurnUser = nextTurnUserId(getActivePlayers(session), socket.user.id);
-        const turnTimerSeconds = resolveTurnTimerSeconds(session, 30);
+        const turnTimerSeconds = resolveNormalTurnTimerSeconds(session, 30);
         const nextTurnWindow = buildTurnWindow(turnTimerSeconds);
         const previousTurnId = Number(session.metadata?.turn?.turn_id) || Date.now();
         const maxBonusAttempts = getMaxBonusAttempts(session);
@@ -14055,6 +14065,7 @@ function registerSocketServer(httpServer) {
             action: 'invalid_declaration_continue',
             previous_turn_id: sessionWithGroups?.metadata?.turn?.turn_id || null,
             invalid_declarer_user_id: socket.user.id,
+            distribution: nextMetadata.distribution,
           });
           scheduleTurnTimeout(io, sessionId, nextTurn);
           await emitSessionState(io, sessionId);

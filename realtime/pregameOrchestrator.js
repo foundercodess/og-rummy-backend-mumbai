@@ -9,6 +9,7 @@ const {
 } = require('../services/poolPrizePool.service');
 const gameSessionModel = require('../models/gameSession.model');
 const groupingService = require('../services/grouping.service');
+const { resolveWildRank } = require('../services/wildJokerRules');
 const redisLockService = require('../services/redisLock.service');
 const sessionCache = require('../services/sessionCache.service');
 const liveSessionState = require('../services/liveSessionState.service');
@@ -801,7 +802,7 @@ function buildDealPayload({ session, players, tossWinnerUserId, seed }) {
     cursor += 1;
     const closedDeck = deck.slice(cursor);
     const normalizedWildJoker = normalizeCard(wildJoker);
-    const resolvedWildRank = normalizedWildJoker?.rank ?? null;
+    const resolvedWildRank = resolveWildRank(normalizedWildJoker);
 
     // Repetition score (unchanged)
     const repetitionScores = seats.map((player) => {
@@ -937,6 +938,7 @@ function buildDealPayload({ session, players, tossWinnerUserId, seed }) {
         };
       }),
       wild_joker: normalizedWildJoker,
+      wild_rank: resolveWildRank(normalizedWildJoker),
       discard_pile: discardTop ? [normalizeCard(discardTop)] : [],
       closed_deck_count: closedDeck.length,
       closed_deck: closedDeck.map(normalizeCard),
@@ -1243,7 +1245,7 @@ async function emitDealFromPregame({
 
   const wildJoker = dealPayload.distribution?.wild_joker;
   const jokerDisplay = wildJoker?.is_joker
-    ? 'Printed JKR'
+    ? `Printed JKR (wild rank=A)`
     : `${wildJoker?.rank || '?'}(${wildJoker?.suit || '?'})`;
   console.log(`[PREGAME][${sessionId}] Deal built — cardsPerPlayer=${CARDS_PER_PLAYER} wildJoker=${jokerDisplay} closedDeck=${dealPayload.distribution?.closed_deck?.length}`);
   console.log(`[DEAL_QUALITY][${sessionId}] ${JSON.stringify(dealPayload.distribution_quality || {})}`);

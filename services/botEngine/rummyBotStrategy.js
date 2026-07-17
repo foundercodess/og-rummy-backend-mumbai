@@ -1,4 +1,5 @@
 const groupingService = require('../grouping.service');
+const { resolveWildRank } = require('../wildJokerRules');
 
 const RANK_TO_ORDER = {
   A: 1,
@@ -124,7 +125,7 @@ function getCardImportance(card, cards = [], wildRank = null) {
 }
 
 function evaluateHandStrength(cards = [], wildJoker = null, options = {}) {
-  const wildRank = wildJoker?.rank || null;
+  const wildRank = resolveWildRank(wildJoker);
   const grouping = groupingService.buildBestGrouping(cards, wildJoker, options?.groupingOptions || {});
   const summary = grouping?.summary || {};
   const groupedCount = Array.isArray(cards)
@@ -307,7 +308,7 @@ function buildDiscardCandidateRanking(cards = [], wildJoker = null, options = {}
       .filter(Boolean)
   );
 
-  const wildRank = wildJoker?.rank || null;
+  const wildRank = resolveWildRank(wildJoker);
   const excludeUids = new Set(
     (Array.isArray(options?.excludeCardUids) ? options.excludeCardUids : [])
       .map((uid) => String(uid || '').trim())

@@ -87,9 +87,18 @@ function scheduleClosedDeckPreviewFromSession(io, sessionId, turn) {
     .then(() => gameSessionModel.findSessionById(sessionId))
     .then((row) => {
       const dist = row?.metadata?.distribution;
+      if (!dist) {
+        console.warn(
+          `[closed_deck_preview] fallback fetch missing distribution session=${sessionId} turn=${turn?.turn_id}`,
+        );
+      }
       emitClosedDeckPreviewToTurnPlayer(io, sessionId, turn, dist);
     })
-    .catch(() => {});
+    .catch((err) => {
+      console.warn(
+        `[closed_deck_preview] fallback fetch failed session=${sessionId}: ${err?.message || err}`,
+      );
+    });
 }
 
 module.exports = {

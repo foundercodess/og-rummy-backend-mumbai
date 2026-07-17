@@ -10,6 +10,7 @@ const { startBotEngine } = require('./services/botEngine');
 const { startStaleSessionCleanupCron } = require('./services/staleSessionCleanup.scheduler');
 const { startWithdrawalPayoutSyncCron } = require('./services/withdrawalPayoutSync.scheduler');
 const { startRechargePayinSyncCron } = require('./services/rechargePayinSync.scheduler');
+const { startRuntimeObservability } = require('./realtime/runtimeObservability');
 
 const app = express();
 const server = http.createServer(app);
@@ -75,6 +76,7 @@ app.get('/', (req, res) => {
 });
 
 const io = registerSocketServer(server);
+startRuntimeObservability();
 startBotEngine(io);
 startStaleSessionCleanupCron();
 startWithdrawalPayoutSyncCron();

@@ -74,6 +74,12 @@ services:
       - LIVE_SESSION_STATE_ENABLED=${LIVE_SESSION_STATE_ENABLED:-true}
       - LIVE_SESSION_STATE_ASYNC_PG=${LIVE_SESSION_STATE_ASYNC_PG:-true}
       - LIVE_SESSION_STATE_TTL_MS=${LIVE_SESSION_STATE_TTL_MS:-21600000}
+      - DB_POOL_MAX=${DB_POOL_MAX:-30}
+      - SOCKET_PING_TIMEOUT_MS=${SOCKET_PING_TIMEOUT_MS:-10000}
+      - SOCKET_PING_INTERVAL_MS=${SOCKET_PING_INTERVAL_MS:-15000}
+      - SOCKET_MAX_BUFFER_BYTES=${SOCKET_MAX_BUFFER_BYTES:-1048576}
+      - EVENT_LOOP_WARN_MS=${EVENT_LOOP_WARN_MS:-50}
+      - RUNTIME_METRICS_LOG_INTERVAL_MS=${RUNTIME_METRICS_LOG_INTERVAL_MS:-60000}
       - BOT_FINISH_EVAL_BUDGET_MS=${BOT_FINISH_EVAL_BUDGET_MS:-40}
       - BOT_FINISH_EVAL_MAX_CARDS=${BOT_FINISH_EVAL_MAX_CARDS:-5}
       - GROUPING_FINISH_SCAN_BUDGET_MS=${GROUPING_FINISH_SCAN_BUDGET_MS:-35}
@@ -85,6 +91,13 @@ services:
     depends_on:
       - postgres
       - redis
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 512M
 
   postgres:
     image: postgres:16-alpine
@@ -102,6 +115,11 @@ services:
     ports:
       - "6379:6379"
     command: redis-server --appendonly yes
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
 
 volumes:
   postgres_data:

@@ -1,5 +1,7 @@
 'use strict';
 
+const { resolveWildRank } = require('./wildJokerRules');
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  groupingService.js
 //  Exported API (unchanged):
@@ -1139,7 +1141,7 @@ function _resolveOptimalTrace(hand, wildRank) {
 }
 
 function _isFinishReadyAfterDiscard(hand, wildJoker, groups, finishCard) {
-  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const wildRank = resolveWildRank(wildJoker);
   if (!finishCard?.card_uid) return false;
   const finishUid = String(finishCard.card_uid).trim();
   for (const group of groups) {
@@ -1163,7 +1165,7 @@ function _isFinishReadyAfterDiscard(hand, wildJoker, groups, finishCard) {
 }
 
 function _pickBetterFinishTrace(hand, wildJoker, left, right) {
-  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const wildRank = resolveWildRank(wildJoker);
   if (!left) return right;
   if (!right) return left;
   const leftValue = cardPoints(left.ungrouped[0], wildRank);
@@ -1175,7 +1177,7 @@ function _pickBetterFinishTrace(hand, wildJoker, left, right) {
 }
 
 function _searchFinishReadyPartition(hand, wildJoker, melds) {
-  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const wildRank = resolveWildRank(wildJoker);
   const n = hand.length;
   const meldsByBit = _indexMeldsByBit(melds, n);
   const fullMask = (1 << n) - 1;
@@ -1229,7 +1231,7 @@ function _searchFinishReadyPartition(hand, wildJoker, melds) {
 }
 
 function _assembleFinishTraceFromNextHand(hand, wildJoker, finishCard, nextTrace) {
-  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const wildRank = resolveWildRank(wildJoker);
   const groups = nextTrace.groups.map((g) => ({ type: g.type, cards: g.cards.slice() }));
   const leftovers = (nextTrace.ungrouped || []).slice();
 
@@ -1282,7 +1284,7 @@ function _assembleFinishTraceFromNextHand(hand, wildJoker, finishCard, nextTrace
 }
 
 function _buildFinishReadyFromDiscardScan(hand, wildJoker, options = {}) {
-  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const wildRank = resolveWildRank(wildJoker);
   const startedAtMs = Date.now();
   const budgetMs = Number.isFinite(Number(options?.budgetMs))
     ? Math.max(5, Number(options.budgetMs))
@@ -1321,7 +1323,7 @@ function _buildFinishReadyFromDiscardScan(hand, wildJoker, options = {}) {
 
 function _tryBuildFinishReadyTrace(hand, wildJoker) {
   if (hand.length !== FINISH_HAND_CARD_COUNT) return null;
-  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const wildRank = resolveWildRank(wildJoker);
   const melds = _enumerateMelds(hand, wildRank);
   const fromPartition = _searchFinishReadyPartition(hand, wildJoker, melds);
   // Partition already found a declare-ready finish — skip the O(n) discard scan.
@@ -1334,7 +1336,7 @@ function _tryBuildFinishReadyTrace(hand, wildJoker) {
 
 function buildBestGrouping(cards, wildJoker, options) {
   const hand = Array.isArray(cards) ? cards.slice() : [];
-  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const wildRank = resolveWildRank(wildJoker);
   const n = hand.length;
 
   if (n === 0) return _emptyResult();
@@ -1458,7 +1460,7 @@ function _emptyResult() {
 
 function evaluateSubmittedGrouping(cards, wildJoker, submittedGroups) {
   const handCards = Array.isArray(cards) ? cards : [];
-  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const wildRank = resolveWildRank(wildJoker);
   const cardMap = new Map(handCards.map(c => [c.card_uid, c]));
   const used = new Set();
 
@@ -1553,7 +1555,7 @@ function evaluateSubmittedGrouping(cards, wildJoker, submittedGroups) {
 
 function buildSuitGroups(cards, wildJoker) {
   const handCards = Array.isArray(cards) ? cards : [];
-  const wildRank = wildJoker != null ? (wildJoker.rank || null) : null;
+  const wildRank = resolveWildRank(wildJoker);
 
   const suitBuckets = { spades: [], hearts: [], diamonds: [], clubs: [] };
   const jokers = [];
@@ -1652,4 +1654,5 @@ module.exports = {
   computeDisplayPoint,
   applyGroupDisplayPoints,
   toSubmittedGroupsFromGrouping,
+  resolveWildRank,
 };
