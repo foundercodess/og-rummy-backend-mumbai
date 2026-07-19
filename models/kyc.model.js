@@ -1,5 +1,7 @@
 const { query } = require('../db');
 
+const DOC_MODES = new Set(['pan', 'aadhaar', 'both']);
+
 async function findByUserId(userId) {
   const result = await query(
     'SELECT * FROM kyc WHERE user_id = $1',
@@ -25,6 +27,7 @@ async function listForAdmin({
   active = null,
   dateFrom = null,
   dateTo = null,
+  docMode = null,
 } = {}) {
   const offset = (page - 1) * limit;
   const conditions = [];
@@ -56,6 +59,11 @@ async function listForAdmin({
     params.push(dateTo);
   }
 
+  if (docMode && DOC_MODES.has(String(docMode).toLowerCase())) {
+    conditions.push(`k.doc_mode = $${idx++}`);
+    params.push(String(docMode).toLowerCase());
+  }
+
   if (search) {
     conditions.push(`(
       COALESCE(u.name, '') ILIKE $${idx}
@@ -63,6 +71,8 @@ async function listForAdmin({
       OR COALESCE(u.phone, '') ILIKE $${idx}
       OR COALESCE(u.view_id, '') ILIKE $${idx}
       OR COALESCE(k.card_no, '') ILIKE $${idx}
+      OR COALESCE(k.pan_card_no, '') ILIKE $${idx}
+      OR COALESCE(k.aadhaar_card_no, '') ILIKE $${idx}
     )`);
     params.push(`%${search}%`);
     idx += 1;
@@ -88,8 +98,14 @@ async function listForAdmin({
         u.avatar,
         u.view_id,
         u.active AS user_active,
+        k.doc_mode,
         k.image_url,
         k.card_no,
+        k.pan_image_url,
+        k.pan_card_no,
+        k.aadhaar_front_image_url,
+        k.aadhaar_back_image_url,
+        k.aadhaar_card_no,
         k.dob,
         k.state,
         k.name AS kyc_name,
@@ -109,58 +125,110 @@ async function listForAdmin({
   return { items: result.rows, total };
 }
 
+function normalizeUpsertPayload(data = {}) {
+  const docModeRaw = String(data.doc_mode || data.docMode || 'pan').toLowerCase();
+  const docMode = DOC_MODES.has(docModeRaw) ? docModeRaw : 'pan';
+
+  const panImageUrl = data.pan_image_url ?? data.panImageUrl
+    ?? ((docMode === 'pan' || docMode === 'both') ? (data.image_url ?? null) : null);
+  const panCardNo = data.pan_card_no ?? data.panCardNo
+    ?? ((docMode === 'pan' || docMode === 'both') ? (data.card_no ?? null) : null);
+
+  const aadhaarFront = data.aadhaar_front_image_url ?? data.aadhaarFrontImageUrl ?? null;
+  const aadhaarBack = data.aadhaar_back_image_url ?? data.aadhaarBackImageUrl ?? null;
+  const aadhaarNo = data.aadhaar_card_no ?? data.aadhaarCardNo ?? null;
+
+  // Legacy single fields: prefer PAN when mode includes pan; else keep aadhaar front as image_url.
+  let legacyImage = data.image_url ?? null;
+  let legacyCard = data.card_no ?? null;
+  if (docMode === 'pan' || docMode === 'both') {
+    legacyImage = panImageUrl ?? legacyImage;
+    legacyCard = panCardNo ?? legacyCard;
+  } else if (docMode === 'aadhaar') {
+    legacyImage = aadhaarFront ?? legacyImage;
+    legacyCard = aadhaarNo ?? legacyCard;
+  }
+
+  return {
+    doc_mode: docMode,
+    pan_image_url: panImageUrl ?? null,
+    pan_card_no: panCardNo != null ? String(panCardNo).trim().toUpperCase() : null,
+    aadhaar_front_image_url: aadhaarFront ?? null,
+    aadhaar_back_image_url: aadhaarBack ?? null,
+    aadhaar_card_no: aadhaarNo != null ? String(aadhaarNo).replace(/\s+/g, '') : null,
+    image_url: legacyImage ?? null,
+    card_no: legacyCard != null ? String(legacyCard).trim() : null,
+    dob: data.dob ?? null,
+    state: data.state ?? null,
+    name: data.name ?? null,
+  };
+}
+
 /**
  * Upsert KYC for user (user-facing).
  * - status is always set to 'submitted' from this API.
  * - active is always true from this API.
- * Admin APIs can later change status/active.
  */
 async function upsert(userId, data) {
-  const { image_url, card_no, dob, state, name } = data;
+  const payload = normalizeUpsertPayload(data);
   const statusVal = 'submitted';
   const activeVal = true;
 
-  // Check if KYC already exists for this user
   const existing = await findByUserId(userId);
   if (!existing) {
-    // First-time insert: it's okay if some fields are null
     const result = await query(
-      `INSERT INTO kyc (user_id, image_url, card_no, dob, state, name, status, active, rejection_note, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW())
+      `INSERT INTO kyc (
+         user_id, doc_mode,
+         image_url, card_no,
+         pan_image_url, pan_card_no,
+         aadhaar_front_image_url, aadhaar_back_image_url, aadhaar_card_no,
+         dob, state, name, status, active, rejection_note, updated_at
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULL,NOW())
        RETURNING *`,
-      [userId, image_url ?? null, card_no ?? null, dob ?? null, state ?? null, name ?? null, statusVal, activeVal]
+      [
+        userId,
+        payload.doc_mode,
+        payload.image_url,
+        payload.card_no,
+        payload.pan_image_url,
+        payload.pan_card_no,
+        payload.aadhaar_front_image_url,
+        payload.aadhaar_back_image_url,
+        payload.aadhaar_card_no,
+        payload.dob,
+        payload.state,
+        payload.name,
+        statusVal,
+        activeVal,
+      ]
     );
     return result.rows[0];
   }
 
-  // Partial update: only overwrite fields that are provided (not undefined)
   const sets = ['status = $1', 'active = $2', 'rejection_note = NULL', 'updated_at = NOW()'];
   const params = [statusVal, activeVal];
   let idx = params.length + 1;
 
-  // For existing KYC, user is not allowed to null-out data; only non-null values update.
-  if (image_url !== undefined && image_url !== null) {
-    sets.push(`image_url = $${idx++}`);
-    params.push(image_url);
-  }
-  if (card_no !== undefined && card_no !== null) {
-    sets.push(`card_no = $${idx++}`);
-    params.push(card_no);
-  }
-  if (dob !== undefined && dob !== null) {
-    sets.push(`dob = $${idx++}`);
-    params.push(dob);
-  }
-  if (state !== undefined && state !== null) {
-    sets.push(`state = $${idx++}`);
-    params.push(state);
-  }
-  if (name !== undefined && name !== null) {
-    sets.push(`name = $${idx++}`);
-    params.push(name);
-  }
+  const maybeSet = (column, value) => {
+    if (value !== undefined && value !== null && value !== '') {
+      sets.push(`${column} = $${idx++}`);
+      params.push(value);
+    }
+  };
 
-  // If nothing except status/active changed, still touch updated_at and submitted
+  maybeSet('doc_mode', payload.doc_mode);
+  maybeSet('image_url', payload.image_url);
+  maybeSet('card_no', payload.card_no);
+  maybeSet('pan_image_url', payload.pan_image_url);
+  maybeSet('pan_card_no', payload.pan_card_no);
+  maybeSet('aadhaar_front_image_url', payload.aadhaar_front_image_url);
+  maybeSet('aadhaar_back_image_url', payload.aadhaar_back_image_url);
+  maybeSet('aadhaar_card_no', payload.aadhaar_card_no);
+  maybeSet('dob', payload.dob);
+  maybeSet('state', payload.state);
+  maybeSet('name', payload.name);
+
   params.push(userId);
   const result = await query(
     `UPDATE kyc SET ${sets.join(', ')} WHERE user_id = $${idx} RETURNING *`,
@@ -169,13 +237,21 @@ async function upsert(userId, data) {
   return result.rows[0];
 }
 
-/** Format KYC row for API (snake_case and include kyc_id). */
 function formatForResponse(row) {
   if (!row) return null;
+  const docMode = row.doc_mode || 'pan';
+  const panImage = row.pan_image_url || (docMode !== 'aadhaar' ? row.image_url : null);
+  const panNo = row.pan_card_no || (docMode !== 'aadhaar' ? row.card_no : null);
   return {
     kyc_id: row.id,
-    image_url: row.image_url,
-    card_no: row.card_no,
+    doc_mode: docMode,
+    image_url: row.image_url || panImage || row.aadhaar_front_image_url || null,
+    card_no: row.card_no || panNo || row.aadhaar_card_no || null,
+    pan_image_url: panImage || null,
+    pan_card_no: panNo || null,
+    aadhaar_front_image_url: row.aadhaar_front_image_url || null,
+    aadhaar_back_image_url: row.aadhaar_back_image_url || null,
+    aadhaar_card_no: row.aadhaar_card_no || null,
     dob: row.dob,
     state: row.state,
     name: row.name,
@@ -203,7 +279,27 @@ async function adminUpdateStatusByUserId({ userId, status, rejectionNote = null 
 
 function formatAdminListItem(row) {
   if (!row) return null;
+  const formatted = formatForResponse({
+    id: row.kyc_id,
+    doc_mode: row.doc_mode,
+    image_url: row.image_url,
+    card_no: row.card_no,
+    pan_image_url: row.pan_image_url,
+    pan_card_no: row.pan_card_no,
+    aadhaar_front_image_url: row.aadhaar_front_image_url,
+    aadhaar_back_image_url: row.aadhaar_back_image_url,
+    aadhaar_card_no: row.aadhaar_card_no,
+    dob: row.dob,
+    state: row.state,
+    name: row.kyc_name,
+    status: row.status,
+    active: row.active,
+    rejection_note: row.rejection_note,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  });
   return {
+    ...formatted,
     kyc_id: row.kyc_id,
     user_id: row.user_id,
     user_name: row.user_name,
@@ -211,21 +307,13 @@ function formatAdminListItem(row) {
     avatar: row.avatar,
     view_id: row.view_id,
     user_active: row.user_active,
-    image_url: row.image_url,
-    card_no: row.card_no,
-    dob: row.dob,
-    state: row.state,
     kyc_name: row.kyc_name,
-    status: row.status,
     status_display: row.status === 'submitted' ? 'pending' : row.status,
-    active: row.active,
-    rejection_note: row.rejection_note,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
   };
 }
 
 module.exports = {
+  DOC_MODES,
   findByUserId,
   findByIdAndUserId,
   listForAdmin,
@@ -233,4 +321,5 @@ module.exports = {
   adminUpdateStatusByUserId,
   formatForResponse,
   formatAdminListItem,
+  normalizeUpsertPayload,
 };
