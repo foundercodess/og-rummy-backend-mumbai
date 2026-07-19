@@ -34,6 +34,10 @@ const turnActionIdempotency = require('../services/turnActionIdempotency.service
 const { socketAuth } = require('./socketAuth');
 const socketRegistry = require('./socketRegistry');
 const { emitActiveNotices, setSocketIO } = require('./socketBus');
+const {
+  emitLiveGameCounts,
+  startLiveCountBroadcaster,
+} = require('./gameLiveCount');
 const { startPregame, cancelPregame } = require('./pregameOrchestrator');
 const {
   anticlockwiseNextTurnUserId,
@@ -10069,6 +10073,7 @@ function registerSocketServer(httpServer) {
   });
 
   setSocketIO(io);
+  startLiveCountBroadcaster(io);
 
   getSocketAdapterRedisClients()
     .then((clients) => {
@@ -11323,6 +11328,10 @@ function registerSocketServer(httpServer) {
 
     emitActiveNotices(socket).catch((err) => {
       console.error('[SOCKET] Failed to emit notices on connect:', err.message);
+    });
+
+    emitLiveGameCounts(socket).catch((err) => {
+      console.error('[SOCKET] Failed to emit live game counts on connect:', err.message);
     });
 
     emitPendingRejoinGame(io, socket, 'connect').catch((err) => {
