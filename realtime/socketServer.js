@@ -2882,8 +2882,31 @@ function isJokerCard(card = null, wildJoker = null) {
 }
 
 function canPickDiscardJokerInCurrentTurn(session = {}) {
-  const currentTurnId = Number(session?.metadata?.turn?.turn_id);
-  const initialTurnId = Number(session?.metadata?.game_state?.initial_turn_id);
+  const turn = session?.metadata?.turn || {};
+  const gameState = session?.metadata?.game_state || {};
+  const currentUserId = Number(turn.user_id);
+  const firstTurnUserId = Number(
+    gameState.first_turn_user_id
+      ?? session?.metadata?.first_turn_user_id
+      ?? 0,
+  );
+
+  // Opening discard is still on the pile only while nobody has discarded yet.
+  const timeline = Array.isArray(session?.metadata?.discard_history?.timeline)
+    ? session.metadata.discard_history.timeline
+    : [];
+  if (timeline.length > 0) return false;
+
+  // First seat of the deal may take an opening joker on their normal or bonus
+  // turn (bonus bumps turn_id; initial_turn_id alone would wrongly block it).
+  if (Number.isFinite(firstTurnUserId) && firstTurnUserId > 0
+      && Number.isFinite(currentUserId) && currentUserId > 0) {
+    return currentUserId === firstTurnUserId;
+  }
+
+  // Legacy fallback when first_turn_user_id is missing.
+  const currentTurnId = Number(turn.turn_id);
+  const initialTurnId = Number(gameState.initial_turn_id);
   if (Number.isNaN(currentTurnId) || Number.isNaN(initialTurnId)) return false;
   return currentTurnId === initialTurnId;
 }
