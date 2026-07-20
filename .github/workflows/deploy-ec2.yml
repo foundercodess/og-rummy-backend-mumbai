@@ -51,7 +51,7 @@ jobs:
           PORT: ${{ secrets.PORT }}
           NODE_ENV: production
           POOL_SPLIT_ENABLED: "true"
-          BOT_ENGINE_ENABLED: "true"
+          BOT_ENGINE_ENABLED: "false"
           ENABLE_BOT_SOFT_RIGGING: "true"
           BOT_INJECT_AFTER_SECONDS: "7"
           BOT_SCAN_EVERY_MS: "5000"
