@@ -1061,25 +1061,9 @@ async function leaveTableContinuation({ sourceSessionId, userId }) {
   }
 
   const phase = String(sourceSession.metadata?.phase || '').toLowerCase();
-  const countdownLockAt = Math.max(
-    1,
-    Number(process.env.MATCH_COUNTDOWN_LOCK_AT_SECONDS) || 3
-  );
-  const countdown = sourceSession.metadata?.countdown || {};
-  const endsAtMs = countdown?.ends_at ? Date.parse(countdown.ends_at) : NaN;
-  const secondsLeft = Number.isFinite(endsAtMs)
-    ? Math.max(0, Math.ceil((endsAtMs - Date.now()) / 1000))
-    : null;
-  const entryLocked = sourceSession.metadata?.entry_locked === true
-    || (secondsLeft != null && secondsLeft <= countdownLockAt);
-  const isCountdownFreeLeave = phase === 'countdown' && !entryLocked;
-  const isPrelockLeave = (
-    ['waiting', 'ready'].includes(sourceSession.status)
-    && (
-      !['countdown', 'toss', 'dealing', 'active', 'declaration_window'].includes(phase)
-      || isCountdownFreeLeave
-    )
-  );
+  // Free leave only for lobby / match-start countdown before entry lock.
+  // Do NOT treat pool inter_deal / toss / dealing as free leave (would wipe seats).
+  const isPrelockLeave = isPregameFreeLeaveEligible(sourceSession);
   if (isPrelockLeave) {
     await query('BEGIN');
     try {
@@ -1107,6 +1091,9 @@ async function leaveTableContinuation({ sourceSessionId, userId }) {
       delete nextMetadata.countdown;
       delete nextMetadata.toss;
       delete nextMetadata.declaration;
+      delete nextMetadata.entry_locked;
+      delete nextMetadata.entry_locked_at;
+      delete nextMetadata.entry_locked_at_seconds_left;
 
       if (remainingPlayers.length === 0) {
         await query(
@@ -1491,6 +1478,45 @@ function isSixPlayerSoftRejoinSession(session = {}) {
     && ['active', 'ready'].includes(String(session?.status || '').toLowerCase());
 }
 
+/**
+ * True when the player may leave without soft-away / pending-rejoin:
+ * - waiting lobby, or
+ * - first match-start countdown before entry fee lock (default last 3s).
+ * Never true for inter_deal / mid-match countdown / toss / dealing / active play.
+ */
+function isPregameFreeLeaveEligible(session = {}) {
+  const status = String(session?.status || '').toLowerCase();
+  if (!['waiting', 'ready'].includes(status)) return false;
+
+  const phase = String(session?.metadata?.phase || '').toLowerCase();
+  if (!phase || phase === 'waiting') return true;
+  if (phase !== 'countdown') return false;
+
+  // Session already started a deal once → this countdown is inter-deal / next round.
+  if (session?.started_at) return false;
+  const poolRoundNo = Number(session?.metadata?.pool_round_no);
+  if (Number.isFinite(poolRoundNo) && poolRoundNo > 1) return false;
+  const dealNo = Number(
+    session?.metadata?.current_deal
+    ?? session?.metadata?.deal_no
+    ?? session?.metadata?.deal
+  );
+  if (Number.isFinite(dealNo) && dealNo > 1) return false;
+
+  const countdownLockAt = Math.max(
+    1,
+    Number(process.env.MATCH_COUNTDOWN_LOCK_AT_SECONDS) || 3
+  );
+  const countdown = session?.metadata?.countdown || {};
+  const endsAtMs = countdown?.ends_at ? Date.parse(countdown.ends_at) : NaN;
+  const secondsLeft = Number.isFinite(endsAtMs)
+    ? Math.max(0, Math.ceil((endsAtMs - Date.now()) / 1000))
+    : null;
+  const entryLocked = session?.metadata?.entry_locked === true
+    || (secondsLeft != null && secondsLeft <= countdownLockAt);
+  return !entryLocked;
+}
+
 module.exports = {
   createSession,
   joinSession,
@@ -1505,5 +1531,6 @@ module.exports = {
   recordDisconnectAwayForPendingRejoin,
   markPendingRejoinOptOut,
   isSixPlayerSoftRejoinSession,
+  isPregameFreeLeaveEligible,
   userAllowedToAccessSessionMetadata,
 };

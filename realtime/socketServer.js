@@ -13028,8 +13028,12 @@ function registerSocketServer(httpServer) {
         const isReadySession = String(sourceSession.status || '').toLowerCase() === 'ready';
         const isActiveTwoPlayerExit = isActiveSession
           && Number(sourceSession.max_players) === 2;
+        // Match-start countdown before entry lock must free-leave (no soft-away / rejoin banner).
+        const isPregameFreeLeave = typeof gameplayService.isPregameFreeLeaveEligible === 'function'
+          && gameplayService.isPregameFreeLeaveEligible(sourceSession);
         const isSixPlayerSoftExit = Number(sourceSession.max_players) === 6
-          && (isActiveSession || isReadySession);
+          && (isActiveSession || isReadySession)
+          && !isPregameFreeLeave;
         const sourcePlayer = (Array.isArray(sourceSession.players) ? sourceSession.players : [])
           .find((player) => Number(player.user_id) === Number(socket.user.id));
         const leaveFlags = buildTableLeaveSeatFlags(
@@ -13069,6 +13073,25 @@ function registerSocketServer(httpServer) {
             } else {
               updatedSourceSession = sourceSession;
             }
+          }
+        } else if (isPregameFreeLeave) {
+          // Lobby / countdown before entry lock: remove seat, cancel pregame timers.
+          // Applies to 2P and 6P — never soft-away (that wrongly offered pending rejoin).
+          const leftSessionId = sourceSession.id;
+          updatedSourceSession = await gameplayService.leaveTableContinuation({
+            sourceSessionId: leftSessionId,
+            userId: socket.user.id,
+          });
+          try {
+            await cancelPregame(leftSessionId);
+          } catch (cancelErr) {
+            warnGame(
+              leftSessionId,
+              `table:leave cancelPregame failed uid=${socket.user.id}: ${cancelErr.message}`
+            );
+          }
+          if (updatedSourceSession) {
+            emitSessionStatePayload(io, updatedSourceSession);
           }
         } else if (isSixPlayerSoftExit) {
           // 6P only: drop mid-hand if needed, then soft-away (disconnect-style pending rejoin).

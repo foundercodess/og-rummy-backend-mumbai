@@ -4,6 +4,7 @@
  */
 
 const { query } = require('../db');
+const { getLivePlayStats } = require('./livePlayStats.service');
 
 function round2(v) {
   return Math.round((Number(v) || 0) * 100) / 100;
@@ -60,15 +61,13 @@ function isUserBotFromMap(botMap, userId) {
   return botMap.get(uid) === true;
 }
 
+/**
+ * Human players currently at live (non-practice) tables.
+ * Kept for callers that only need a single number; prefer getLivePlayStats().
+ */
 async function countPlayingNowPlayers() {
-  const res = await query(
-    `SELECT COUNT(DISTINCT gsp.user_id)::int AS cnt
-     FROM game_session_players gsp
-     INNER JOIN game_sessions gs ON gs.id = gsp.game_session_id
-     WHERE gs.status = 'active'
-       AND gsp.status IN ('joined', 'disconnected', 'eliminated')`
-  );
-  return Number(res.rows[0]?.cnt || 0);
+  const stats = await getLivePlayStats();
+  return stats.humans;
 }
 
 async function sumLedgerByEvent({ since = null } = {}) {
@@ -97,8 +96,10 @@ async function sumLedgerByEvent({ since = null } = {}) {
 
 /** @deprecated Use telemetryService.getGlobalTelemetryReport() instead. */
 async function getDashboardPayload() {
-  const playingNow = await countPlayingNowPlayers();
-  const totals = await sumLedgerByEvent();
+  const [liveStats, totals] = await Promise.all([
+    getLivePlayStats(),
+    sumLedgerByEvent(),
+  ]);
   const startOfUtcDay = new Date();
   startOfUtcDay.setUTCHours(0, 0, 0, 0);
   const today = await sumLedgerByEvent({ since: startOfUtcDay.toISOString() });
@@ -123,8 +124,15 @@ async function getDashboardPayload() {
       /** Commission + bot win credits since UTC midnight. */
       combined_total: todayCombined,
     },
+    // Additive fields only — existing `players` key kept for older admin clients.
     playing_now: {
-      players: playingNow,
+      /** @deprecated Prefer `humans`. Same value: live human players. */
+      players: liveStats.humans,
+      humans: liveStats.humans,
+      bots: liveStats.bots,
+      tables: liveStats.tables,
+      total: liveStats.total,
+      updated_at: liveStats.updated_at,
     },
   };
 }
