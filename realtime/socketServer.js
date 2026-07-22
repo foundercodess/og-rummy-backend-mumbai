@@ -156,6 +156,13 @@ const REMATCH_BOT_POOL_SIZE = Math.max(10, Math.min(10000, Number(process.env.BO
 const REMATCH_BOT_PHONE_PREFIX = String(process.env.BOT_PHONE_PREFIX || '98999').replace(/\D/g, '');
 const REMATCH_BOT_NAME_PREFIX = String(process.env.BOT_NAME_PREFIX || 'RummyBot-');
 const ALPHANUMERIC = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+
+/** Same semantics as botEngine: BOT_ENGINE_ENABLED off => no new bot seats anywhere. */
+function isBotInjectionEnabled() {
+  const raw = process.env.BOT_ENGINE_ENABLED;
+  if (raw == null || raw === '') return false;
+  return ['1', 'true', 'yes', 'on'].includes(String(raw).trim().toLowerCase());
+}
 const declarationRuntime = {
   startWindow: null,
   scheduleBotResponses: null,
@@ -7565,6 +7572,11 @@ async function completeSessionWithBotRelease(sessionId, fields = {}) {
 async function fillSessionWithBotsIfNeeded(sessionId) {
   const session = await gameplayService.getSessionState(sessionId);
   if (!session || session.status !== 'waiting') return session;
+  // Rematch / inter-deal fill must respect BOT_ENGINE_ENABLED (lobby scanner already does).
+  if (!isBotInjectionEnabled()) {
+    logGame(session.id, 'Bot fill skipped — BOT_ENGINE_ENABLED is off');
+    return session;
+  }
   const players = Array.isArray(session.players) ? session.players : [];
   const seatsNeeded = Math.max(0, Number(session.max_players) - players.length);
   if (seatsNeeded <= 0) return session;
@@ -7938,37 +7950,42 @@ async function runAutoRematchFromSource(io, sourceSessionId) {
 
   // Preserve existing bot participants from the source table so rematch continuity
   // works the same across mixed player types and game modes.
-  for (const eligibleUserId of (continuation.eligibleUserIds || [])) {
-    const numericUserId = Number(eligibleUserId);
-    if (Number.isNaN(numericUserId) || joinedUserIds.has(numericUserId)) continue;
-    const sourcePlayer = sourcePlayersByUserId.get(numericUserId);
-    if (sourcePlayer?.metadata?.is_bot !== true) continue;
-    try {
-      const leased = await botLeaseService.acquireBotLease(targetSession.id, numericUserId, {
-        refreshDisplayName: true,
-      });
-      if (!leased) continue;
-      await gameplayService.joinSession({
-        sessionIdOrCode: targetSession.id,
-        userId: numericUserId,
-        skipBalanceCheck: true,
-      });
-      const joinedBotPlayer = await gameSessionModel.findPlayer(targetSession.id, numericUserId);
-      if (joinedBotPlayer) {
-        await gameSessionModel.updatePlayerState(targetSession.id, numericUserId, {
-          metadata: {
-            ...(joinedBotPlayer.metadata || {}),
-            is_bot: true,
-            ready: true,
-            bot_engine: 'rematch_carry_forward',
-          },
+  // When bots are fully disabled, do not carry bots onto the next table.
+  if (isBotInjectionEnabled()) {
+    for (const eligibleUserId of (continuation.eligibleUserIds || [])) {
+      const numericUserId = Number(eligibleUserId);
+      if (Number.isNaN(numericUserId) || joinedUserIds.has(numericUserId)) continue;
+      const sourcePlayer = sourcePlayersByUserId.get(numericUserId);
+      if (sourcePlayer?.metadata?.is_bot !== true) continue;
+      try {
+        const leased = await botLeaseService.acquireBotLease(targetSession.id, numericUserId, {
+          refreshDisplayName: true,
         });
+        if (!leased) continue;
+        await gameplayService.joinSession({
+          sessionIdOrCode: targetSession.id,
+          userId: numericUserId,
+          skipBalanceCheck: true,
+        });
+        const joinedBotPlayer = await gameSessionModel.findPlayer(targetSession.id, numericUserId);
+        if (joinedBotPlayer) {
+          await gameSessionModel.updatePlayerState(targetSession.id, numericUserId, {
+            metadata: {
+              ...(joinedBotPlayer.metadata || {}),
+              is_bot: true,
+              ready: true,
+              bot_engine: 'rematch_carry_forward',
+            },
+          });
+        }
+        joinedUserIds.add(numericUserId);
+      } catch (err) {
+        await botLeaseService.releaseBotLease(targetSession.id, numericUserId);
+        warnGame(sourceSession.id, `Auto rematch bot carry-forward skipped uid=${numericUserId}: ${err.message}`);
       }
-      joinedUserIds.add(numericUserId);
-    } catch (err) {
-      await botLeaseService.releaseBotLease(targetSession.id, numericUserId);
-      warnGame(sourceSession.id, `Auto rematch bot carry-forward skipped uid=${numericUserId}: ${err.message}`);
     }
+  } else {
+    logGame(sourceSession.id, 'Rematch bot carry-forward skipped — BOT_ENGINE_ENABLED is off');
   }
 
   const liveTargetSession = await gameplayService.getSessionState(targetSession.id);
