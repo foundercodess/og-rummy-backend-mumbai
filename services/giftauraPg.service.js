@@ -229,6 +229,7 @@ function extractCallbackFields(query = {}) {
 }
 
 
+
 module.exports = {
   isConfigured,
   getRedirectUrl,
