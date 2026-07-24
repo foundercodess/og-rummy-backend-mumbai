@@ -123,6 +123,32 @@ async function cancel(opts = {}) {
   }
 }
 
+/**
+ * Read a durable timer without claiming/removing it.
+ * Used so turn-timeout flush can defer when another worker still owns a pending bot action.
+ * @returns {Promise<object|null>}
+ */
+async function peek(opts = {}) {
+  if (!isArmEnabled()) return null;
+  const kind = String(opts.kind || '').trim();
+  const sessionId = Number(opts.sessionId);
+  const token = opts.token;
+  if (!kind || Number.isNaN(sessionId) || token == null) return null;
+
+  const client = await ensureRedisConnection();
+  if (!client) return null;
+
+  const member = timerMember(kind, sessionId, token);
+  try {
+    const dataRaw = await client.get(timerDataKey(member));
+    if (!dataRaw) return null;
+    return JSON.parse(dataRaw);
+  } catch (err) {
+    console.error(`[DURABLE_TIMER] peek failed kind=${kind} session=${sessionId}:`, err.message);
+    return null;
+  }
+}
+
 async function armTurnTimeout(sessionId, turn, graceMs) {
   if (!turn || turn.turn_id == null || !turn.ends_at) return false;
   const fireAtMs = Date.parse(turn.ends_at);
@@ -261,6 +287,7 @@ async function getStats() {
 module.exports = {
   arm,
   cancel,
+  peek,
   armTurnTimeout,
   cancelTurnTimeout,
   startSweeper,

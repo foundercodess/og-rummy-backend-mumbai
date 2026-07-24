@@ -8995,14 +8995,134 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
   scheduleTurnTimeout(io, sessionId, nextTurn);
 }
 
+const BOT_TURN_DEFER_MARKER = '__botTurnTimeoutDeferMs';
+const BOT_TURN_HARD_DEADLINE_PAD_MS = BOT_POST_PICK_DELAY_MAX_MS + BOT_ACTION_DELAY_MAX_MS + 4000;
+const BOT_TURN_DURABLE_GRACE_MS = Math.max(
+  500,
+  Number(process.env.BOT_TURN_DURABLE_GRACE_MS) || 1500,
+);
+
+function getBotTurnHardDeadlineMs(turn) {
+  const endsAtTs = Date.parse(turn?.ends_at || '');
+  if (Number.isNaN(endsAtTs)) return Date.now() + BOT_TURN_HARD_DEADLINE_PAD_MS;
+  return endsAtTs + BOT_TURN_HARD_DEADLINE_PAD_MS;
+}
+
+function markBotTurnTimeoutDefer(session, deferUntilMs) {
+  if (!session || !Number.isFinite(deferUntilMs)) return session;
+  Object.defineProperty(session, BOT_TURN_DEFER_MARKER, {
+    value: deferUntilMs,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+  return session;
+}
+
+function takeBotTurnTimeoutDeferMs(session) {
+  if (!session) return null;
+  const deferUntilMs = Number(session[BOT_TURN_DEFER_MARKER]);
+  try {
+    delete session[BOT_TURN_DEFER_MARKER];
+  } catch (_) {
+    // ignore
+  }
+  return Number.isFinite(deferUntilMs) ? deferUntilMs : null;
+}
+
+async function peekPendingBotTurnTimer(sessionId, turnId, phase) {
+  const normalizedPhase = phase === 'discard' ? 'discard' : 'pick';
+  return durableTimer.peek({
+    kind: 'bot_turn',
+    sessionId,
+    token: `${Number(turnId)}:${normalizedPhase}`,
+  });
+}
+
+function scheduleDeferredTurnTimeout(io, sessionId, turnId, fireAtMs, turnType = 'normal') {
+  cleanupTurnTimeoutOnly(sessionId);
+  const delayMs = Math.max(50, Number(fireAtMs) - Date.now());
+  const timeoutHandle = setTimeout(() => {
+    onTurnTimeout(io, sessionId, Number(turnId)).catch((err) => {
+      errorGame(sessionId, `Deferred turn timeout handler failed: ${err.message}`);
+    });
+  }, delayMs);
+
+  activeTurnBySession.set(sessionId, {
+    timeoutHandle,
+    turnId: Number(turnId),
+    type: turnType || 'normal',
+    endsAt: new Date(Date.now() + delayMs).toISOString(),
+  });
+
+  durableTimer.arm({
+    kind: 'turn',
+    sessionId,
+    token: turnId,
+    fireAtMs: Date.now() + delayMs,
+    graceMs: 500,
+    payload: {
+      turn_id: Number(turnId),
+      type: turnType || 'normal',
+      deferred: true,
+    },
+  }).catch(() => {});
+
+  logGame(
+    sessionId,
+    `Turn timeout deferred ${delayMs}ms for bot pacing turn=${turnId}`,
+  );
+}
+
+/**
+ * Multi-instance safe bot flush:
+ * - If a durable/local bot action is still pending in the future, defer turn penalty
+ *   so another worker can finish pick/discard with human-like delays.
+ * - Never chain forced pick → forced discard in the same tick (that caused EC2
+ *   "pick+discard at timer end").
+ * - Only force the current phase when the bot timer is missing/overdue; after a
+ *   forced pick, schedule discard normally and defer the turn timeout.
+ */
 async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
   if (!isBotTurn(session, turn.user_id)) return session;
 
-  cleanupBotActionState(sessionId);
   const softRiggingEnabled = isBotSoftRiggingEnabled(session);
   const aggressiveEnabled = isBotAggressionEnabled(session);
   const phase = turn.has_picked === true ? 'discard' : 'pick';
+  const hardDeadlineMs = getBotTurnHardDeadlineMs(turn);
+  const pastHardDeadline = Date.now() >= hardDeadlineMs;
 
+  const localBot = getActiveBotActionState(sessionId);
+  const localOwnsPending = Boolean(
+    localBot
+    && Number(localBot.turnId) === Number(turn.turn_id)
+    && localBot.phase === phase
+    && localBot.timeoutHandle
+  );
+
+  const pendingDurable = await peekPendingBotTurnTimer(sessionId, turn.turn_id, phase);
+  const pendingFireAtMs = Number(pendingDurable?.fire_at_ms);
+  const durableStillPending = Number.isFinite(pendingFireAtMs)
+    && pendingFireAtMs > Date.now() - 200;
+
+  // Another worker (or this one) still has a scheduled bot action — wait for it.
+  if (!pastHardDeadline && (localOwnsPending || durableStillPending)) {
+    const deferUntilMs = Math.min(
+      hardDeadlineMs,
+      Math.max(
+        Date.now() + 250,
+        (durableStillPending ? pendingFireAtMs : Date.now()) + 900,
+      ),
+    );
+    logGame(
+      sessionId,
+      `Bot flush deferred — pending ${phase} turn=${turn.turn_id} local=${localOwnsPending} durable=${durableStillPending}`,
+    );
+    return markBotTurnTimeoutDefer(session, deferUntilMs);
+  }
+
+  // Orphan / overdue: force only the current phase (not pick+discard together).
+  cleanupBotActionState(sessionId);
   try {
     await executeBotTurnAction(io, sessionId, Number(turn.turn_id), phase);
   } catch (err) {
@@ -9018,30 +9138,66 @@ async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
     return refreshed;
   }
 
+  // After a forced/late pick, keep normal discard pacing and defer turn timeout.
   if (phase === 'pick' && refreshedTurn?.has_picked === true) {
-    try {
-      await executeBotTurnAction(io, sessionId, Number(turn.turn_id), 'discard');
-    } catch (err) {
-      warnGame(sessionId, `Bot forced discard before timeout failed uid=${turn.user_id}: ${err.message}`);
+    if (pastHardDeadline) {
+      try {
+        await executeBotTurnAction(io, sessionId, Number(turn.turn_id), 'discard');
+      } catch (err) {
+        warnGame(sessionId, `Bot forced discard before timeout failed uid=${turn.user_id}: ${err.message}`);
+      }
+      const afterDiscard = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
+      if (afterDiscard?.metadata?.turn?.turn_id !== turn.turn_id) {
+        logGame(sessionId, `Turn timeout skipped — bot discarded uid=${turn.user_id}`);
+        return afterDiscard;
+      }
+      return afterDiscard || refreshed;
     }
-    const afterDiscard = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
-    if (afterDiscard?.metadata?.turn?.turn_id !== turn.turn_id) {
-      logGame(sessionId, `Turn timeout skipped — bot discarded uid=${turn.user_id}`);
-      return afterDiscard;
-    }
-    return afterDiscard || refreshed;
+
+    scheduleBotTurnAction(io, sessionId, refreshedTurn, 'discard', {
+      softRiggingEnabled,
+      aggressiveEnabled,
+    });
+    const discardPending = await peekPendingBotTurnTimer(sessionId, turn.turn_id, 'discard');
+    const discardFireAt = Number(discardPending?.fire_at_ms);
+    const deferUntilMs = Math.min(
+      hardDeadlineMs,
+      Number.isFinite(discardFireAt)
+        ? discardFireAt + 900
+        : Date.now() + Math.max(BOT_POST_PICK_DELAY_MIN_MS, 2000) + 900,
+    );
+    logGame(sessionId, `Bot flush scheduled discard with delay — deferring turn timeout turn=${turn.turn_id}`);
+    return markBotTurnTimeoutDefer(refreshed, deferUntilMs);
   }
 
-  scheduleBotTurnAction(io, sessionId, refreshedTurn, phase, {
-    softRiggingEnabled,
-    aggressiveEnabled,
-  });
+  // Still same phase (force no-op / race): ensure a schedule exists, then defer.
+  if (!pastHardDeadline) {
+    scheduleBotTurnAction(io, sessionId, refreshedTurn, phase, {
+      softRiggingEnabled,
+      aggressiveEnabled,
+    });
+    const again = await peekPendingBotTurnTimer(sessionId, turn.turn_id, phase);
+    const fireAt = Number(again?.fire_at_ms);
+    const deferUntilMs = Math.min(
+      hardDeadlineMs,
+      Number.isFinite(fireAt) ? fireAt + 900 : Date.now() + 1500,
+    );
+    return markBotTurnTimeoutDefer(refreshed, deferUntilMs);
+  }
+
   return refreshed;
 }
 
 function executeBotTurnAction(io, sessionId, expectedTurnId, phase = 'pick') {
   cleanupBotActionState(sessionId);
   const normalizedPhase = phase === 'discard' ? 'discard' : 'pick';
+  // Cancel Redis bot timer even when this worker has no local state (cross-worker).
+  durableTimer.cancel({
+    kind: 'bot_turn',
+    sessionId,
+    token: `${Number(expectedTurnId)}:${normalizedPhase}`,
+  }).catch(() => {});
+
   const run = normalizedPhase === 'discard'
     ? () => executeBotDiscardAction(io, sessionId, expectedTurnId)
     : () => executeBotPickAction(io, sessionId, expectedTurnId);
@@ -9100,7 +9256,7 @@ function scheduleBotTurnAction(io, sessionId, turn, phase = 'pick', options = {}
     sessionId,
     token: `${Number(turn.turn_id)}:${normalizedPhase}`,
     fireAtMs: Date.now() + actionDelayMs,
-    graceMs: 500,
+    graceMs: BOT_TURN_DURABLE_GRACE_MS,
     payload: {
       turn_id: Number(turn.turn_id),
       phase: normalizedPhase,
@@ -9477,6 +9633,10 @@ async function finalizeGameByElimination(
 }
 
 async function onTurnTimeout(io, sessionId, expectedTurnId) {
+  // Prevent local+sweeper double-entry while we decide whether to defer for bot pacing.
+  cleanupTurnTimeoutOnly(sessionId);
+  await durableTimer.cancelTurnTimeout(sessionId, expectedTurnId).catch(() => {});
+
   let session = await gameplayService.getSessionState(sessionId);
   if (!session || session.status !== 'active') {
     cleanupTurnState(sessionId);
@@ -9501,6 +9661,18 @@ async function onTurnTimeout(io, sessionId, expectedTurnId) {
   }
 
   session = await flushBotTurnBeforeTimeout(io, sessionId, session, turn);
+  const deferUntilMs = takeBotTurnTimeoutDeferMs(session);
+  if (deferUntilMs != null) {
+    scheduleDeferredTurnTimeout(
+      io,
+      sessionId,
+      expectedTurnId,
+      deferUntilMs,
+      turn.type || 'normal',
+    );
+    return;
+  }
+
   if (!session || session.status !== 'active') {
     cleanupTurnState(sessionId);
     return;
