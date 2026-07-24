@@ -5,6 +5,7 @@ const userModel = require('../../models/user.model');
 const avatarModel = require('../../models/avatar.model');
 const redisLockService = require('../redisLock.service');
 const botLeaseService = require('../botLease.service');
+const { startProcessLeader } = require('../processLeader.service');
 const { startPregame } = require('../../realtime/pregameOrchestrator');
 const RummyBotAdapter = require('./rummyBot.adapter');
 
@@ -244,22 +245,42 @@ function startBotEngine(io) {
     }
   };
 
+  let leaderHandle = null;
+
   const intervalId = setInterval(() => {
+    if (leaderHandle && typeof leaderHandle.isLeader === 'function' && !leaderHandle.isLeader()) {
+      return;
+    }
     tick().catch((err) => {
       console.error(`[BOT] Tick crash: ${err.message}`);
     });
   }, config.scanEveryMs);
+
+  leaderHandle = startProcessLeader('bot-engine-scan', {
+    onBecomeLeader: () => {
+      console.log('[BOT] Acquired scan leadership');
+      tick().catch((err) => {
+        console.error(`[BOT] Leader initial tick failed: ${err.message}`);
+      });
+    },
+    onLoseLeadership: () => {
+      console.log('[BOT] Lost scan leadership');
+    },
+  });
 
   tick().catch((err) => {
     console.error(`[BOT] Initial tick failed: ${err.message}`);
   });
 
   console.log(
-    `[BOT] Engine started enabled=true injectAfter=${config.injectAfterSeconds}s scanEvery=${config.scanEveryMs}ms`
+    `[BOT] Engine started enabled=true injectAfter=${config.injectAfterSeconds}s scanEvery=${config.scanEveryMs}ms leader-elected`
   );
 
   return {
-    stop: () => clearInterval(intervalId),
+    stop: () => {
+      clearInterval(intervalId);
+      if (leaderHandle) leaderHandle.stop().catch(() => {});
+    },
     config,
   };
 }

@@ -3,14 +3,19 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const { testConnection } = require('./db');
-const { registerSocketServer } = require('./realtime/socketServer');
+const { registerSocketServer, getSocketRuntimeStats } = require('./realtime/socketServer');
 const { pingRedis } = require('./services/redis.service');
 const { pingKafka } = require('./services/kafka.service');
 const { startBotEngine } = require('./services/botEngine');
 const { startStaleSessionCleanupCron } = require('./services/staleSessionCleanup.scheduler');
 const { startWithdrawalPayoutSyncCron } = require('./services/withdrawalPayoutSync.scheduler');
 const { startRechargePayinSyncCron } = require('./services/rechargePayinSync.scheduler');
-const { startRuntimeObservability } = require('./realtime/runtimeObservability');
+const {
+  startRuntimeObservability,
+  setSocketStatsProvider,
+  getLastEventLoopLagMs,
+} = require('./realtime/runtimeObservability');
+const durableTimer = require('./services/durableTimer.service');
 
 const app = express();
 const server = http.createServer(app);
@@ -55,12 +60,22 @@ app.get('/health', async (req, res) => {
   const dbStatus = process.env.DATABASE_URL ? await testConnection() : { ok: null, message: 'not configured' };
   const redisStatus = await pingRedis();
   const kafkaStatus = await pingKafka();
+  let durable = null;
+  try {
+    durable = await durableTimer.getStats();
+  } catch (_) {
+    durable = null;
+  }
+  const sockets = io ? getSocketRuntimeStats(io) : null;
   res.json({
     status: 'ok',
     message: 'OG Rummy API is running on EC2, version 5',
     database: dbStatus.ok === true ? 'connected' : dbStatus.ok === false ? 'error' : 'not configured',
     redis: redisStatus.ok === true ? 'connected' : redisStatus.ok === false ? 'error' : 'not configured',
     kafka: kafkaStatus.ok === true ? 'connected' : kafkaStatus.ok === false ? 'error' : 'not configured',
+    event_loop_lag_ms: getLastEventLoopLagMs(),
+    sockets,
+    durable_timers: durable,
     ...(dbStatus.timestamp && { dbTimestamp: dbStatus.timestamp }),
     ...(dbStatus.error && { dbError: dbStatus.error }),
     ...(redisStatus.error && { redisError: redisStatus.error }),
@@ -76,6 +91,7 @@ app.get('/', (req, res) => {
 });
 
 const io = registerSocketServer(server);
+setSocketStatsProvider(() => getSocketRuntimeStats(io));
 startRuntimeObservability();
 startBotEngine(io);
 startStaleSessionCleanupCron();

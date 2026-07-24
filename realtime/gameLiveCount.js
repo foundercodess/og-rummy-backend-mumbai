@@ -1,6 +1,7 @@
 'use strict';
 
 const { query } = require('../db');
+const { startProcessLeader } = require('../services/processLeader.service');
 
 const BROADCAST_INTERVAL_MS = Math.max(
   2000,
@@ -11,6 +12,7 @@ let ioInstance = null;
 let broadcastTimer = null;
 let inFlight = false;
 let lastPayloadJson = '';
+let leaderHandle = null;
 
 /**
  * Players currently at tables (waiting / ready / active), excluding practice
@@ -80,26 +82,50 @@ async function tickBroadcast() {
   }
 }
 
-function startLiveCountBroadcaster(io) {
-  ioInstance = io;
+function startBroadcastLoop() {
+  if (broadcastTimer) return;
+  broadcastTimer = setInterval(() => {
+    tickBroadcast().catch(() => {});
+  }, BROADCAST_INTERVAL_MS);
+  tickBroadcast().catch(() => {});
+  console.log(
+    `[GAME_LIVE_COUNT] Broadcaster loop active (interval=${BROADCAST_INTERVAL_MS}ms)`,
+  );
+}
+
+function stopBroadcastLoop() {
   if (broadcastTimer) {
     clearInterval(broadcastTimer);
     broadcastTimer = null;
   }
-  broadcastTimer = setInterval(() => {
-    tickBroadcast().catch(() => {});
-  }, BROADCAST_INTERVAL_MS);
-  // Warm cache once so first connect is fast.
-  tickBroadcast().catch(() => {});
+}
+
+function startLiveCountBroadcaster(io) {
+  ioInstance = io;
+  stopBroadcastLoop();
+  if (leaderHandle) {
+    leaderHandle.stop().catch(() => {});
+    leaderHandle = null;
+  }
+
+  leaderHandle = startProcessLeader('game-live-count', {
+    onBecomeLeader: () => startBroadcastLoop(),
+    onLoseLeadership: () => {
+      console.log('[GAME_LIVE_COUNT] Lost leadership — stopping broadcast loop');
+      stopBroadcastLoop();
+    },
+  });
+
   console.log(
-    `[GAME_LIVE_COUNT] Broadcaster started (interval=${BROADCAST_INTERVAL_MS}ms)`,
+    `[GAME_LIVE_COUNT] Broadcaster registered (interval=${BROADCAST_INTERVAL_MS}ms, leader-elected)`,
   );
 }
 
 function stopLiveCountBroadcaster() {
-  if (broadcastTimer) {
-    clearInterval(broadcastTimer);
-    broadcastTimer = null;
+  stopBroadcastLoop();
+  if (leaderHandle) {
+    leaderHandle.stop().catch(() => {});
+    leaderHandle = null;
   }
   ioInstance = null;
   lastPayloadJson = '';

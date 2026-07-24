@@ -29,9 +29,21 @@ function getUserSocket(userId, io) {
   return null;
 }
 
+function getRegistryStats() {
+  let socketCount = 0;
+  for (const set of socketsByUserId.values()) {
+    socketCount += set.size;
+  }
+  return {
+    users: socketsByUserId.size,
+    sockets: socketCount,
+  };
+}
+
 module.exports = {
   addSocket,
   removeSocket,
   getSocketIds,
   getUserSocket,
+  getRegistryStats,
 };

@@ -15,6 +15,8 @@ const avatarModel = require('../models/avatar.model');
 const groupingService = require('../services/grouping.service');
 const { isJokerCard: isJokerCardWithWild } = require('../services/wildJokerRules');
 const redisLockService = require('../services/redisLock.service');
+const durableTimer = require('../services/durableTimer.service');
+const ephemeralSessionState = require('../services/ephemeralSessionState.service');
 const botLeaseService = require('../services/botLease.service');
 const {
   chooseBotDiscardCard,
@@ -594,6 +596,7 @@ function recordManualDeclareResponse(state, userId, groups = []) {
     auto: false,
     groups: Array.isArray(groups) ? groups : [],
   });
+  persistDeclareState(state);
 }
 
 /**
@@ -2382,9 +2385,90 @@ function declarationFinalizeKey(sessionId, sequence) {
   return `idem:declare:finalize:session:${sessionId}:seq:${sequence}`;
 }
 
+function armDeclareDurableTimer(state) {
+  if (!state?.sessionId || !state?.sequence || !state?.endsAt) return;
+  const fireAtMs = Date.parse(state.endsAt);
+  if (!Number.isFinite(fireAtMs)) return;
+  const awaiting = state.visibilityStage === DECLARATION_VISIBILITY_AWAITING_DECLARER;
+  const kind = awaiting ? 'declare_awaiting' : 'declare_finalize';
+  // Cancel sibling kind so stage transitions don't double-fire.
+  durableTimer.cancel({
+    kind: awaiting ? 'declare_finalize' : 'declare_awaiting',
+    sessionId: state.sessionId,
+    token: state.sequence,
+  }).catch(() => {});
+  durableTimer.arm({
+    kind,
+    sessionId: state.sessionId,
+    token: state.sequence,
+    fireAtMs,
+    payload: {
+      sequence: state.sequence,
+      visibility_stage: state.visibilityStage,
+      declare_by_user_id: state.declareByUserId,
+    },
+  }).catch(() => {});
+}
+
+function persistDeclareState(state) {
+  if (!state?.sessionId) return;
+  ephemeralSessionState.saveDeclareSnapshot(state.sessionId, state).catch(() => {});
+  armDeclareDurableTimer(state);
+}
+
+async function rebuildDeclareStateFromStore(sessionId, entry = null) {
+  const sid = Number(sessionId);
+  if (Number.isNaN(sid)) return null;
+  const existing = activeDeclareBySession.get(sid);
+  if (existing) return existing;
+
+  const session = await gameplayService.getSessionState(sid);
+  if (!session) return null;
+  const declaration = session.metadata?.declaration || {};
+  const snap = await ephemeralSessionState.loadDeclareSnapshot(sid);
+  const sequence = entry?.payload?.sequence
+    || entry?.token
+    || snap?.sequence
+    || declaration.sequence;
+  if (!sequence) return null;
+
+  const responses = ephemeralSessionState.deserializeDeclareResponses(
+    snap?.responses || {},
+  );
+  const state = {
+    sessionId: sid,
+    sequence,
+    declareByUserId: Number(
+      snap?.declare_by_user_id
+      || declaration.declare_by_user_id
+      || entry?.payload?.declare_by_user_id
+      || 0,
+    ),
+    participantUserIds: Array.isArray(snap?.participant_user_ids)
+      ? snap.participant_user_ids
+      : (Array.isArray(session.players) ? session.players.map((p) => p.user_id) : []),
+    visibilityStage: snap?.visibility_stage
+      || declaration.visibility_stage
+      || entry?.payload?.visibility_stage
+      || DECLARATION_VISIBILITY_OPEN_FOR_ALL,
+    startedAt: snap?.started_at || declaration.started_at || null,
+    endsAt: snap?.ends_at || declaration.ends_at || null,
+    finishCard: snap?.finish_card || declaration.finish_card || null,
+    responses,
+    countdownInterval: null,
+    timeoutHandle: null,
+    recovered: true,
+  };
+  activeDeclareBySession.set(sid, state);
+  return state;
+}
+
 function cleanupDeclareState(sessionId) {
   const state = activeDeclareBySession.get(sessionId);
-  if (!state) return;
+  if (!state) {
+    ephemeralSessionState.clearDeclareSnapshot(sessionId).catch(() => {});
+    return;
+  }
 
   if (state.countdownInterval) {
     clearInterval(state.countdownInterval);
@@ -2393,7 +2477,21 @@ function cleanupDeclareState(sessionId) {
     clearTimeout(state.timeoutHandle);
   }
 
+  if (state.sequence) {
+    durableTimer.cancel({
+      kind: 'declare_finalize',
+      sessionId,
+      token: state.sequence,
+    }).catch(() => {});
+    durableTimer.cancel({
+      kind: 'declare_awaiting',
+      sessionId,
+      token: state.sequence,
+    }).catch(() => {});
+  }
+
   activeDeclareBySession.delete(sessionId);
+  ephemeralSessionState.clearDeclareSnapshot(sessionId).catch(() => {});
 }
 
 /** True while a declaration response window is open — turn timers must not run in parallel. */
@@ -2413,7 +2511,13 @@ function cleanupTurnTimeoutOnly(sessionId) {
     clearTimeout(state.timeoutHandle);
   }
 
+  const turnId = state.turnId;
   activeTurnBySession.delete(sessionId);
+
+  // Dual-write cancel — no-op when Redis/ARM disabled. Does not change local clock.
+  if (turnId != null) {
+    durableTimer.cancelTurnTimeout(sessionId, turnId).catch(() => {});
+  }
 }
 
 function cleanupTurnState(sessionId) {
@@ -2427,6 +2531,14 @@ function cleanupBotActionState(sessionId) {
 
   if (state.timeoutHandle) {
     clearTimeout(state.timeoutHandle);
+  }
+
+  if (state.turnId != null && state.phase) {
+    durableTimer.cancel({
+      kind: 'bot_turn',
+      sessionId,
+      token: `${state.turnId}:${state.phase}`,
+    }).catch(() => {});
   }
 
   activeBotActionBySession.delete(sessionId);
@@ -7754,7 +7866,10 @@ async function maybeStartRematchFastDeal(io, targetSessionId, options = {}) {
 function clearAutoRematchTimer(sourceSessionId) {
   const key = Number(sourceSessionId);
   const state = pendingAutoRematchBySourceSession.get(key);
-  if (!state) return;
+  if (!state) {
+    durableTimer.cancel({ kind: 'auto_rematch', sessionId: key, token: 'rematch' }).catch(() => {});
+    return;
+  }
   if (state.intervalHandle) {
     clearInterval(state.intervalHandle);
   }
@@ -7762,6 +7877,7 @@ function clearAutoRematchTimer(sourceSessionId) {
     clearTimeout(state.timeoutHandle);
   }
   pendingAutoRematchBySourceSession.delete(key);
+  durableTimer.cancel({ kind: 'auto_rematch', sessionId: key, token: 'rematch' }).catch(() => {});
 }
 
 function detachUserFromSessionRoom(io, sessionId, userId) {
@@ -8066,6 +8182,14 @@ function scheduleAutoRematchFromResult(io, sourceSessionId) {
         intervalHandle,
         timeoutHandle,
       });
+
+      durableTimer.arm({
+        kind: 'auto_rematch',
+        sessionId: key,
+        token: 'rematch',
+        fireAtMs: endsAtMs,
+        payload: { ends_at: endsAtIso },
+      }).catch(() => {});
     })
     .catch((err) => {
       pendingAutoRematchBySourceSession.delete(key);
@@ -8917,15 +9041,24 @@ async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
 
 function executeBotTurnAction(io, sessionId, expectedTurnId, phase = 'pick') {
   cleanupBotActionState(sessionId);
-  const run = phase === 'discard'
+  const normalizedPhase = phase === 'discard' ? 'discard' : 'pick';
+  const run = normalizedPhase === 'discard'
     ? () => executeBotDiscardAction(io, sessionId, expectedTurnId)
     : () => executeBotPickAction(io, sessionId, expectedTurnId);
 
   // Yield once so inbound socket handlers/ACKs can run before heavy bot CPU.
   return new Promise((resolve, reject) => {
     setImmediate(() => {
-      Promise.resolve()
-        .then(run)
+      const claimKey = `idem:bot-turn:session:${sessionId}:turn:${expectedTurnId}:phase:${normalizedPhase}`;
+      // Short TTL — blocks local+sweeper double-fire; allows rare retry after ~20s.
+      redisLockService.claimEventIdempotency(claimKey, 20)
+        .then((claimed) => {
+          if (!claimed) {
+            resolve(null);
+            return null;
+          }
+          return Promise.resolve().then(run);
+        })
         .then(resolve)
         .catch(reject);
     });
@@ -8961,6 +9094,19 @@ function scheduleBotTurnAction(io, sessionId, turn, phase = 'pick', options = {}
     turnId: Number(turn.turn_id),
     phase: normalizedPhase,
   });
+
+  durableTimer.arm({
+    kind: 'bot_turn',
+    sessionId,
+    token: `${Number(turn.turn_id)}:${normalizedPhase}`,
+    fireAtMs: Date.now() + actionDelayMs,
+    graceMs: 500,
+    payload: {
+      turn_id: Number(turn.turn_id),
+      phase: normalizedPhase,
+      user_id: turn.user_id || null,
+    },
+  }).catch(() => {});
 
   logGame(sessionId, `Bot action scheduled turn=${Number(turn.turn_id)} phase=${normalizedPhase} delay=${actionDelayMs}ms`);
 }
@@ -9720,6 +9866,10 @@ function scheduleTurnTimeout(io, sessionId, turn) {
     type: turn.type || 'normal',
     endsAt: turn.ends_at,
   });
+
+  // Dual-write deadline to Redis (grace delayed). Local setTimeout remains primary.
+  // Sweeper is OFF by default — enable only after validating idempotent recovery.
+  durableTimer.armTurnTimeout(sessionId, turn).catch(() => {});
 }
 
 async function dropPlayerFromSession(io, sessionId, userId) {
@@ -10076,6 +10226,12 @@ async function finalizeActiveTwoPlayerExit(io, sessionId, userId, reason = 'play
 }
 
 function registerSocketServer(httpServer) {
+  const transportCsv = String(process.env.SOCKET_TRANSPORTS || 'websocket,polling')
+    .split(',')
+    .map((t) => t.trim().toLowerCase())
+    .filter((t) => t === 'websocket' || t === 'polling');
+  const transports = transportCsv.length ? transportCsv : ['websocket', 'polling'];
+
   const io = new Server(httpServer, {
     cors: {
       origin: process.env.CORS_ORIGIN || '*',
@@ -10086,7 +10242,7 @@ function registerSocketServer(httpServer) {
     pingInterval: Math.max(8000, Number(process.env.SOCKET_PING_INTERVAL_MS) || 15000),
     maxHttpBufferSize: Math.max(65536, Number(process.env.SOCKET_MAX_BUFFER_BYTES) || 1048576),
     perMessageDeflate: false,
-    transports: ['websocket', 'polling'],
+    transports,
   });
 
   setSocketIO(io);
@@ -10122,6 +10278,114 @@ function registerSocketServer(httpServer) {
       .catch((err) => {
         errorGame(sessionId, `Initial bot scheduling failed: ${err.message}`);
       });
+  });
+
+  // Optional Redis sweeper for orphaned timers (idempotent handlers).
+  // Enabled when DURABLE_TIMER_SWEEPER_ENABLED=true (default true when CLUSTER_INSTANCES>1).
+  durableTimer.startSweeper({
+    kinds: [
+      'turn',
+      'declare_finalize',
+      'declare_awaiting',
+      'auto_rematch',
+      'bot_turn',
+      'post_deal',
+      'pregame_deadline',
+    ],
+    onDue: async (entry) => {
+      const sessionId = Number(entry.session_id);
+      if (Number.isNaN(sessionId)) return;
+      const kind = String(entry.kind || '');
+
+      if (kind === 'turn') {
+        const turnId = Number(entry.payload?.turn_id ?? entry.token);
+        if (Number.isNaN(turnId)) return;
+        await onTurnTimeout(io, sessionId, turnId);
+        return;
+      }
+
+      if (kind === 'declare_finalize') {
+        await rebuildDeclareStateFromStore(sessionId, entry);
+        await finalizeDeclarationWindow(sessionId, 'timeout');
+        return;
+      }
+
+      if (kind === 'declare_awaiting') {
+        const liveState = await rebuildDeclareStateFromStore(sessionId, entry);
+        if (!liveState || liveState.visibilityStage !== DECLARATION_VISIBILITY_AWAITING_DECLARER) {
+          return;
+        }
+        if (liveState.responses.has(liveState.declareByUserId)) {
+          await openDeclarationWindowForAll(
+            await gameplayService.getSessionState(sessionId),
+            liveState,
+            {},
+          );
+          return;
+        }
+        const liveSession = await gameplayService.getSessionState(sessionId);
+        if (!liveSession) return;
+        const liveDistribution = liveSession.metadata?.distribution || null;
+        const declarerDistribution = getPlayerDistribution(liveDistribution, liveState.declareByUserId);
+        let autoGroups = [];
+        if (declarerDistribution) {
+          const autoGrouping = groupingService.buildBestGrouping(
+            declarerDistribution.cards || [],
+            liveDistribution?.wild_joker || null,
+          );
+          autoGroups = toSubmittedGroupsFromGrouping(autoGrouping);
+        }
+        liveState.responses.set(liveState.declareByUserId, {
+          submitted_at: new Date().toISOString(),
+          auto: true,
+          groups: autoGroups,
+        });
+        persistDeclareState(liveState);
+        const openResult = await openDeclarationWindowForAll(liveSession, liveState, {
+          distribution: liveDistribution,
+        });
+        scheduleBotDeclarationResponses(sessionId);
+        if ((openResult?.pending_count || 0) === 0) {
+          await finalizeDeclarationWindow(sessionId, 'all_submitted');
+        }
+        return;
+      }
+
+      if (kind === 'auto_rematch') {
+        const claimed = await redisLockService.claimEventIdempotency(
+          `idem:auto-rematch:session:${sessionId}`,
+          180,
+        );
+        if (!claimed) return;
+        try {
+          await runAutoRematchFromSource(io, sessionId);
+        } finally {
+          clearAutoRematchTimer(sessionId);
+        }
+        return;
+      }
+
+      if (kind === 'bot_turn') {
+        const turnId = Number(entry.payload?.turn_id ?? String(entry.token || '').split(':')[0]);
+        const phase = entry.payload?.phase
+          || (String(entry.token || '').includes('discard') ? 'discard' : 'pick');
+        if (Number.isNaN(turnId)) return;
+        // executeBotTurnAction claims idempotency — safe vs local timeout race.
+        await executeBotTurnAction(io, sessionId, turnId, phase);
+        return;
+      }
+
+      if (kind === 'post_deal' || kind === 'pregame_deadline') {
+        try {
+          const { recoverPregameDeadline } = require('./pregameOrchestrator');
+          if (typeof recoverPregameDeadline === 'function') {
+            await recoverPregameDeadline(io, sessionId, entry);
+          }
+        } catch (err) {
+          errorGame(sessionId, `Pregame durable recovery failed: ${err.message}`);
+        }
+      }
+    },
   });
 
   async function finalizeDeclarationWindow(sessionId, reason = 'timeout') {
@@ -11081,6 +11345,7 @@ function registerSocketServer(httpServer) {
               auto: true,
               groups: autoGroups,
             });
+            persistDeclareState(liveState);
 
             io.to(sessionRoom(sessionId)).emit('game:declare:submitted', {
               session_id: sessionId,
@@ -11112,6 +11377,8 @@ function registerSocketServer(httpServer) {
         }
       }, durationSeconds * 1000);
     }
+
+    persistDeclareState(state);
 
     return {
       sequence,
@@ -11231,6 +11498,8 @@ function registerSocketServer(httpServer) {
       });
     }, durationSeconds * 1000);
 
+    persistDeclareState(state);
+
     return {
       opened: true,
       sequence: state.sequence,
@@ -11298,6 +11567,7 @@ function registerSocketServer(httpServer) {
                 auto: true,
                 groups: submittedGroups,
               });
+              persistDeclareState(current);
 
               const totalPlayers = Array.isArray(current.participantUserIds)
                 ? current.participantUserIds.length
@@ -14162,6 +14432,7 @@ function registerSocketServer(httpServer) {
           auto: false,
           groups: submittedGroups,
         });
+        persistDeclareState(state);
 
         const totalPlayers = Array.isArray(state.participantUserIds)
           ? state.participantUserIds.length
@@ -14281,8 +14552,27 @@ function registerSocketServer(httpServer) {
   return io;
 }
 
+/** Process-local runtime snapshot for /health and metrics (safe / read-only). */
+function getSocketRuntimeStats(io) {
+  const registry = typeof socketRegistry.getRegistryStats === 'function'
+    ? socketRegistry.getRegistryStats()
+    : null;
+  return {
+    connected: io && io.engine ? io.engine.clientsCount : null,
+    registry,
+    timers: {
+      turns: activeTurnBySession.size,
+      declares: activeDeclareBySession.size,
+      bot_actions: activeBotActionBySession.size,
+      pool_splits: activePoolSplitBySession.size,
+      rematch: pendingAutoRematchBySourceSession.size,
+    },
+  };
+}
+
 module.exports = {
   registerSocketServer,
+  getSocketRuntimeStats,
   tryBuildBotFinishPlan,
   tryBuildFinishPlan,
   __testHooks: {

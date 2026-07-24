@@ -11,6 +11,7 @@ const gameSessionModel = require('../models/gameSession.model');
 const groupingService = require('../services/grouping.service');
 const { resolveWildRank } = require('../services/wildJokerRules');
 const redisLockService = require('../services/redisLock.service');
+const durableTimer = require('../services/durableTimer.service');
 const sessionCache = require('../services/sessionCache.service');
 const liveSessionState = require('../services/liveSessionState.service');
 const socketRegistry = require('./socketRegistry');
@@ -1035,13 +1036,23 @@ function buildPregameLockOwner(sessionId, sequence) {
 
 async function cleanupPregameSequence(sessionId) {
   const state = activePregameBySession.get(sessionId);
-  if (!state) return;
+  if (!state) {
+    durableTimer.cancel({ kind: 'pregame_deadline', sessionId, token: 'countdown' }).catch(() => {});
+    durableTimer.cancel({ kind: 'post_deal', sessionId, token: 'turn_start' }).catch(() => {});
+    return;
+  }
 
   if (state.countdownInterval) { clearInterval(state.countdownInterval); state.countdownInterval = null; }
   if (state.tossTimeout) { clearTimeout(state.tossTimeout); state.tossTimeout = null; }
   if (state.lockRenewInterval) { clearInterval(state.lockRenewInterval); state.lockRenewInterval = null; }
 
   activePregameBySession.delete(sessionId);
+
+  durableTimer.cancel({
+    kind: 'pregame_deadline',
+    sessionId,
+    token: state.sequence || 'countdown',
+  }).catch(() => {});
 
   if (state.lockKey && state.lockOwner) {
     await redisLockService.releaseLock(state.lockKey, state.lockOwner);
@@ -1469,6 +1480,8 @@ async function emitDealFromPregame({
       dealPayload.distribution
     );
 
+    durableTimer.cancel({ kind: 'post_deal', sessionId, token: 'turn_start' }).catch(() => {});
+
     startTurnTimerFromDeal({
       session_id: sessionId,
       turn: {
@@ -1479,6 +1492,20 @@ async function emitDealFromPregame({
       },
     });
   }, safePostDealDelaySeconds * 1000);
+
+  durableTimer.arm({
+    kind: 'post_deal',
+    sessionId,
+    token: 'turn_start',
+    fireAtMs: Date.now() + (safePostDealDelaySeconds * 1000),
+    graceMs: 1500,
+    payload: {
+      turn_id: turnId,
+      started_at: turnStartedAt,
+      ends_at: turnEndsAt,
+      user_id: firstTurnPlayer.user_id,
+    },
+  }).catch(() => {});
 
   return true;
 }
@@ -1592,6 +1619,15 @@ async function startPregame(io, sessionId, options = {}) {
       },
       entry_locked: false,
     });
+
+    durableTimer.arm({
+      kind: 'pregame_deadline',
+      sessionId,
+      token: sequence,
+      fireAtMs: endsAt.getTime(),
+      graceMs: 2500,
+      payload: { sequence, stage: 'countdown_end', inter_deal: useInterDealFastStart === true },
+    }).catch(() => {});
 
     if (!useInterDealFastStart) {
       io.to(sessionRoom(sessionId)).emit('match:filled', {
@@ -1863,9 +1899,68 @@ async function cancelPregame(sessionId) {
   await cleanupPregameSequence(sessionId);
 }
 
+/**
+ * Recover orphaned pregame / post-deal deadlines when the owning process died.
+ * Idempotent via existing deal emit claim + turn-timeout scheduling.
+ */
+async function recoverPregameDeadline(io, sessionId, entry = {}) {
+  const sid = Number(sessionId);
+  if (Number.isNaN(sid)) return false;
+
+  const kind = String(entry.kind || '');
+  if (kind === 'post_deal') {
+    const turn = entry.payload || {};
+    if (!turn.ends_at || turn.turn_id == null) return false;
+    const claimed = await redisLockService.claimEventIdempotency(
+      `idem:post-deal-turn:session:${sid}:turn:${turn.turn_id}`,
+      180,
+    );
+    if (!claimed) return false;
+    startTurnTimerFromDeal({
+      session_id: sid,
+      turn: {
+        turn_id: Number(turn.turn_id),
+        type: 'normal',
+        started_at: turn.started_at,
+        ends_at: turn.ends_at,
+      },
+    });
+    return true;
+  }
+
+  // If this process already owns pregame, local timers will finish it.
+  if (activePregameBySession.has(sid)) return false;
+
+  const session = await gameplayService.getSessionState(sid);
+  if (!session) return false;
+
+  const phase = String(session.metadata?.phase || '').toLowerCase();
+  const status = String(session.status || '').toLowerCase();
+
+  if (status === 'active' && phase === 'active' && session.metadata?.turn) {
+    // Deal already landed — ensure turn timer exists.
+    startTurnTimerFromDeal({
+      session_id: sid,
+      turn: session.metadata.turn,
+    });
+    return true;
+  }
+
+  if (status === 'ready' && (phase === 'countdown' || phase === 'toss' || !phase)) {
+    console.warn(`[PREGAME][${sid}] Durable recovery restarting pregame (phase=${phase || 'none'})`);
+    await startPregame(io, sid, {
+      preferredFirstTurnUserId: entry.payload?.preferred_first_turn_user_id || null,
+    });
+    return true;
+  }
+
+  return false;
+}
+
 module.exports = {
   startPregame,
   cancelPregame,
+  recoverPregameDeadline,
   __testHooks: {
     buildTossResult,
     getTossCardStrength,

@@ -49,7 +49,9 @@ if (process.env.DATABASE_URL) {
       rejectUnauthorized: false
     } : false,
     
-    // CRITICAL: Increase connection pool for better throughput
+    // Single-process default 30. With multiple Node workers put PgBouncer in
+    // front and lower per-process max (e.g. DB_POOL_MAX=8) so total PG
+    // connections stay under RDS max_connections.
     max: parseInt(process.env.DB_POOL_MAX, 10) || 30,
     
     // Keep connections alive to avoid reconnection overhead
@@ -69,13 +71,16 @@ if (process.env.DATABASE_URL) {
     idle_in_transaction_session_timeout: parseInt(process.env.DB_IDLE_IN_TX_TIMEOUT, 10) || 60000,
     
     // Application name for easier debugging in RDS logs
-    application_name: 'app-runner-service',
-  });
-  
-  pool.on('connect', (client) => {
-    console.log('[DB] New connection established to Postgres');
+    application_name: process.env.DB_APPLICATION_NAME
+      || `og-rummy-api${process.env.NODE_APP_INSTANCE != null ? `-w${process.env.NODE_APP_INSTANCE}` : ''}`,
   });
 
+  // Avoid flooding logs under connection churn (10k-scale). Enable with DB_LOG_CONNECT=true.
+  if (String(process.env.DB_LOG_CONNECT || '').toLowerCase() === 'true') {
+    pool.on('connect', () => {
+      console.log('[DB] New connection established to Postgres');
+    });
+  }
   // 'acquire' fires on every pool.connect() / pool.query() checkout — far too noisy for logs.
   // Uncomment only when debugging connection-leak issues.
   // pool.on('acquire', () => { console.log('[DB] Client acquired from pool'); });
