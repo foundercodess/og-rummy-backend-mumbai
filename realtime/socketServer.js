@@ -2544,8 +2544,34 @@ function cleanupBotActionState(sessionId) {
   activeBotActionBySession.delete(sessionId);
 }
 
+/** Clear process-local bot timer only — leave Redis durable timer for other workers. */
+function clearLocalBotActionStateOnly(sessionId) {
+  const state = activeBotActionBySession.get(sessionId);
+  if (!state) return;
+  if (state.timeoutHandle) {
+    clearTimeout(state.timeoutHandle);
+  }
+  activeBotActionBySession.delete(sessionId);
+}
+
 function getActiveBotActionState(sessionId) {
   return activeBotActionBySession.get(sessionId) || null;
+}
+
+function botTurnPhaseClaimKey(sessionId, turnId, phase) {
+  const normalizedPhase = phase === 'discard' ? 'discard' : 'pick';
+  return `idem:bot-turn:session:${sessionId}:turn:${turnId}:phase:${normalizedPhase}`;
+}
+
+async function botPhaseStillNeeded(sessionId, expectedTurnId, phase) {
+  const normalizedPhase = phase === 'discard' ? 'discard' : 'pick';
+  const session = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
+  if (!session || session.status !== 'active') return false;
+  const turn = session.metadata?.turn;
+  if (!turn || Number(turn.turn_id) !== Number(expectedTurnId)) return false;
+  if (!isBotTurn(session, turn.user_id)) return false;
+  if (normalizedPhase === 'pick') return turn.has_picked !== true;
+  return turn.has_picked === true;
 }
 
 function normalizeAttemptsUsedByUser(metadata = {}) {
@@ -3838,8 +3864,10 @@ function resolveBotDiscardDelayMs(turn, options = {}) {
 
   const remainingMs = endsAtTs - Date.now();
   const turnExpiryBufferMs = 800;
-  const safeRemaining = Math.max(cfgMin, remainingMs - turnExpiryBufferMs);
-  let finalDelay = Math.min(randomizedDelay, safeRemaining);
+  // Never schedule past the turn clock (old Math.max(cfgMin, remaining) could push
+  // discard 2s+ after ends_at when little time remained — looked like "bot after timer").
+  const maxDelay = Math.max(250, remainingMs - turnExpiryBufferMs);
+  let finalDelay = Math.min(randomizedDelay, maxDelay);
 
   // Soft rigging may shorten discard slightly, but keep human-plausible pacing.
   if (options?.softRiggingEnabled === true) {
@@ -3850,10 +3878,10 @@ function resolveBotDiscardDelayMs(turn, options = {}) {
 
   // Human think-time before discard — do not apply aggressive speed multipliers here.
   const urgencyMs = 1500;
-  if (remainingMs > urgencyMs) {
-    finalDelay = Math.max(cfgMin, finalDelay);
+  if (remainingMs > urgencyMs && maxDelay >= cfgMin) {
+    finalDelay = Math.max(cfgMin, Math.min(finalDelay, maxDelay));
   } else {
-    finalDelay = Math.max(400, Math.min(finalDelay, safeRemaining));
+    finalDelay = Math.max(250, Math.min(finalDelay, maxDelay));
   }
 
   return finalDelay;
@@ -9076,10 +9104,9 @@ function scheduleDeferredTurnTimeout(io, sessionId, turnId, fireAtMs, turnType =
 
 /**
  * Multi-instance safe bot flush:
- * - If a durable/local bot action is still pending in the future, defer turn penalty
- *   so another worker can finish pick/discard with human-like delays.
- * - Never chain forced pick → forced discard in the same tick (that caused EC2
- *   "pick+discard at timer end").
+ * - If a durable/local bot action is still pending in the future (and still inside
+ *   the turn clock), defer turn penalty so pick/discard keep human-like delays.
+ * - Never chain forced pick → forced discard in the same tick.
  * - Only force the current phase when the bot timer is missing/overdue; after a
  *   forced pick, schedule discard normally and defer the turn timeout.
  */
@@ -9091,6 +9118,8 @@ async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
   const phase = turn.has_picked === true ? 'discard' : 'pick';
   const hardDeadlineMs = getBotTurnHardDeadlineMs(turn);
   const pastHardDeadline = Date.now() >= hardDeadlineMs;
+  const endsAtMs = Date.parse(turn?.ends_at || '');
+  const withinTurnClock = Number.isNaN(endsAtMs) || Date.now() <= endsAtMs + 50;
 
   const localBot = getActiveBotActionState(sessionId);
   const localOwnsPending = Boolean(
@@ -9102,11 +9131,15 @@ async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
 
   const pendingDurable = await peekPendingBotTurnTimer(sessionId, turn.turn_id, phase);
   const pendingFireAtMs = Number(pendingDurable?.fire_at_ms);
+  // Only treat as "still pending" when fire time is still ahead (or barely due).
+  // Overdue timers mean the owning worker failed — force/recover instead of waiting
+  // until after the visible turn timer.
   const durableStillPending = Number.isFinite(pendingFireAtMs)
-    && pendingFireAtMs > Date.now() - 200;
+    && pendingFireAtMs >= Date.now() - 100
+    && pendingFireAtMs <= (Number.isNaN(endsAtMs) ? pendingFireAtMs : endsAtMs + 200);
 
-  // Another worker (or this one) still has a scheduled bot action — wait for it.
-  if (!pastHardDeadline && (localOwnsPending || durableStillPending)) {
+  // Another worker (or this one) still has a scheduled bot action inside the turn.
+  if (!pastHardDeadline && withinTurnClock && (localOwnsPending || durableStillPending)) {
     const deferUntilMs = Math.min(
       hardDeadlineMs,
       Math.max(
@@ -9164,13 +9197,13 @@ async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
       hardDeadlineMs,
       Number.isFinite(discardFireAt)
         ? discardFireAt + 900
-        : Date.now() + Math.max(BOT_POST_PICK_DELAY_MIN_MS, 2000) + 900,
+        : Date.now() + Math.min(BOT_POST_PICK_DELAY_MIN_MS, 1500) + 500,
     );
     logGame(sessionId, `Bot flush scheduled discard with delay — deferring turn timeout turn=${turn.turn_id}`);
     return markBotTurnTimeoutDefer(refreshed, deferUntilMs);
   }
 
-  // Still same phase (force no-op / race): ensure a schedule exists, then defer.
+  // Still same phase (force no-op / race): ensure a schedule exists, then defer briefly.
   if (!pastHardDeadline) {
     scheduleBotTurnAction(io, sessionId, refreshedTurn, phase, {
       softRiggingEnabled,
@@ -9180,7 +9213,7 @@ async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
     const fireAt = Number(again?.fire_at_ms);
     const deferUntilMs = Math.min(
       hardDeadlineMs,
-      Number.isFinite(fireAt) ? fireAt + 900 : Date.now() + 1500,
+      Number.isFinite(fireAt) ? fireAt + 900 : Date.now() + 800,
     );
     return markBotTurnTimeoutDefer(refreshed, deferUntilMs);
   }
@@ -9189,14 +9222,12 @@ async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
 }
 
 function executeBotTurnAction(io, sessionId, expectedTurnId, phase = 'pick') {
-  cleanupBotActionState(sessionId);
   const normalizedPhase = phase === 'discard' ? 'discard' : 'pick';
-  // Cancel Redis bot timer even when this worker has no local state (cross-worker).
-  durableTimer.cancel({
-    kind: 'bot_turn',
-    sessionId,
-    token: `${Number(expectedTurnId)}:${normalizedPhase}`,
-  }).catch(() => {});
+  const claimKey = botTurnPhaseClaimKey(sessionId, expectedTurnId, normalizedPhase);
+
+  // Drop this worker's local timer handle only. Do NOT cancel Redis yet — losing the
+  // claim race must leave durable recovery intact for the other worker.
+  clearLocalBotActionStateOnly(sessionId);
 
   const run = normalizedPhase === 'discard'
     ? () => executeBotDiscardAction(io, sessionId, expectedTurnId)
@@ -9205,15 +9236,58 @@ function executeBotTurnAction(io, sessionId, expectedTurnId, phase = 'pick') {
   // Yield once so inbound socket handlers/ACKs can run before heavy bot CPU.
   return new Promise((resolve, reject) => {
     setImmediate(() => {
-      const claimKey = `idem:bot-turn:session:${sessionId}:turn:${expectedTurnId}:phase:${normalizedPhase}`;
-      // Short TTL — blocks local+sweeper double-fire; allows rare retry after ~20s.
-      redisLockService.claimEventIdempotency(claimKey, 20)
-        .then((claimed) => {
+      // Keep claim only for a successful action; release on no-op so retries work.
+      redisLockService.claimEventIdempotency(claimKey, 45)
+        .then(async (claimed) => {
           if (!claimed) {
-            resolve(null);
             return null;
           }
-          return Promise.resolve().then(run);
+
+          await durableTimer.cancel({
+            kind: 'bot_turn',
+            sessionId,
+            token: `${Number(expectedTurnId)}:${normalizedPhase}`,
+          }).catch(() => {});
+
+          try {
+            const result = await Promise.resolve().then(run);
+            const stillNeeded = await botPhaseStillNeeded(sessionId, expectedTurnId, normalizedPhase);
+            if (stillNeeded) {
+              // Validation no-op / turn-not-started reschedule path: free the claim.
+              await redisLockService.releaseEventIdempotency(claimKey).catch(() => {});
+              const live = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
+              const liveTurn = live?.metadata?.turn;
+              if (
+                live
+                && live.status === 'active'
+                && liveTurn
+                && Number(liveTurn.turn_id) === Number(expectedTurnId)
+                && isBotTurn(live, liveTurn.user_id)
+              ) {
+                const softRiggingEnabled = isBotSoftRiggingEnabled(live);
+                const aggressiveEnabled = isBotAggressionEnabled(live);
+                // Avoid duplicate schedule if executeBot* already re-armed.
+                const pending = await peekPendingBotTurnTimer(sessionId, expectedTurnId, normalizedPhase);
+                const local = getActiveBotActionState(sessionId);
+                const alreadyArmed = Boolean(
+                  (local
+                    && Number(local.turnId) === Number(expectedTurnId)
+                    && local.phase === normalizedPhase)
+                  || (pending && Number(pending.fire_at_ms) > Date.now() - 50)
+                );
+                if (!alreadyArmed) {
+                  scheduleBotTurnAction(io, sessionId, liveTurn, normalizedPhase, {
+                    softRiggingEnabled,
+                    aggressiveEnabled,
+                  });
+                }
+              }
+            }
+            return result;
+          } catch (err) {
+            await redisLockService.releaseEventIdempotency(claimKey).catch(() => {});
+            throw err;
+          }
         })
         .then(resolve)
         .catch(reject);
@@ -9235,9 +9309,16 @@ function scheduleBotTurnAction(io, sessionId, turn, phase = 'pick', options = {}
   }
 
   cleanupBotActionState(sessionId);
-  const actionDelayMs = normalizedPhase === 'discard'
+  let actionDelayMs = normalizedPhase === 'discard'
     ? resolveBotDiscardDelayMs(turn, options)
     : resolveBotActionDelayMs(turn, { ...options, phase: 'pick' });
+
+  // Never arm a bot action after the visible turn clock when we can still clamp.
+  const endsAtTs = Date.parse(turn?.ends_at || '');
+  if (!Number.isNaN(endsAtTs)) {
+    const maxDelay = Math.max(250, endsAtTs - Date.now() - 400);
+    actionDelayMs = Math.min(actionDelayMs, maxDelay);
+  }
 
   const timeoutHandle = setTimeout(() => {
     executeBotTurnAction(io, sessionId, Number(turn.turn_id), normalizedPhase).catch((err) => {

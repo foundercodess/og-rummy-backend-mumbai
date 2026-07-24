@@ -63,6 +63,19 @@ async function claimEventIdempotency(key, ttlSeconds) {
     }
 }
 
+async function releaseEventIdempotency(key) {
+    const client = await ensureRedisConnection();
+    if (!client) return true;
+
+    try {
+        await client.del(key);
+        return true;
+    } catch (err) {
+        console.error('Failed to release Redis idempotency key:', err.message);
+        return false;
+    }
+}
+
 function pregameLockKey(sessionId) {
     return `lock:pregame:session:${sessionId}`;
 }
@@ -77,6 +90,7 @@ module.exports = {
     renewLock,
     releaseLock,
     claimEventIdempotency,
+    releaseEventIdempotency,
     pregameLockKey,
     dealEmitKey,
 };
