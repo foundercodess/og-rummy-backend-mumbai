@@ -12,16 +12,68 @@ async function getAll() {
   return result.rows;
 }
 
-async function getAllPaginated({ page = 1, limit = 20, last7days = false } = {}) {
+/**
+ * Paginated admin user list with live play + stale lobby flags.
+ * Stale = seated in waiting/ready non-practice lobby with no activity for staleAfterHours (default 2h).
+ */
+async function getAllPaginated({ page = 1, limit = 20, last7days = false, staleAfterHours = 2 } = {}) {
   const offset = (page - 1) * limit;
-  const condition = last7days ? `WHERE created_at >= NOW() - INTERVAL '7 days'` : '';
+  const staleHours = Number.isInteger(Number(staleAfterHours)) && Number(staleAfterHours) > 0
+    ? Number(staleAfterHours)
+    : 2;
+  const condition = last7days ? `WHERE u.created_at >= NOW() - INTERVAL '7 days'` : '';
 
-  const countResult = await query(`SELECT COUNT(*) FROM users ${condition}`);
+  const countResult = await query(`SELECT COUNT(*) FROM users u ${condition}`);
   const total = parseInt(countResult.rows[0].count, 10);
 
   const result = await query(
-    `SELECT id, name, phone, avatar, view_id, is_verified, active, created_at, updated_at FROM users ${condition} ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
-    [limit, offset]
+    `SELECT
+       u.id,
+       u.name,
+       u.phone,
+       u.avatar,
+       u.view_id,
+       u.is_verified,
+       u.active,
+       u.created_at,
+       u.updated_at,
+       COALESCE(play.is_playing, false) AS is_playing,
+       play.session_status,
+       play.player_status,
+       play.session_updated_at,
+       CASE
+         WHEN play.session_id IS NULL THEN 'none'
+         WHEN play.session_status IN ('waiting', 'ready')
+           AND play.session_updated_at < NOW() - ($3::int * INTERVAL '1 hour')
+           THEN 'stale'
+         WHEN play.player_status = 'disconnected' THEN 'disconnected'
+         ELSE 'ok'
+       END AS stale_status
+     FROM users u
+     LEFT JOIN LATERAL (
+       SELECT
+         gs.id AS session_id,
+         gs.status AS session_status,
+         gs.updated_at AS session_updated_at,
+         gsp.status AS player_status,
+         true AS is_playing
+       FROM game_session_players gsp
+       INNER JOIN game_sessions gs ON gs.id = gsp.game_session_id
+       WHERE gsp.user_id = u.id
+         AND gsp.status IN ('joined', 'disconnected')
+         AND gs.status IN ('waiting', 'ready', 'active')
+         AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
+         AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
+         AND COALESCE((gsp.metadata->>'is_bot')::boolean, false) = false
+       ORDER BY
+         CASE gs.status WHEN 'active' THEN 0 WHEN 'ready' THEN 1 ELSE 2 END,
+         gs.updated_at DESC
+       LIMIT 1
+     ) play ON true
+     ${condition}
+     ORDER BY u.created_at DESC
+     LIMIT $1 OFFSET $2`,
+    [limit, offset, staleHours]
   );
 
   return { users: result.rows, total };

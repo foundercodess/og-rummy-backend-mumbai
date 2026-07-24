@@ -112,6 +112,7 @@ async function listForAdmin({
         k.status,
         k.active,
         k.rejection_note,
+        k.approved_at,
         k.created_at,
         k.updated_at
      FROM kyc k
@@ -206,7 +207,14 @@ async function upsert(userId, data) {
     return result.rows[0];
   }
 
-  const sets = ['status = $1', 'active = $2', 'rejection_note = NULL', 'updated_at = NOW()'];
+  // Resubmit clears prior approval timestamp.
+  const sets = [
+    'status = $1',
+    'active = $2',
+    'rejection_note = NULL',
+    'approved_at = NULL',
+    'updated_at = NOW()',
+  ];
   const params = [statusVal, activeVal];
   let idx = params.length + 1;
 
@@ -242,14 +250,17 @@ function formatForResponse(row) {
   const docMode = row.doc_mode || 'pan';
   const panImage = row.pan_image_url || (docMode !== 'aadhaar' ? row.image_url : null);
   const panNo = row.pan_card_no || (docMode !== 'aadhaar' ? row.card_no : null);
+  const aadhaarFront = row.aadhaar_front_image_url
+    || (docMode === 'aadhaar' ? row.image_url : null)
+    || null;
   return {
-    kyc_id: row.id,
+    kyc_id: row.id ?? row.kyc_id ?? null,
     doc_mode: docMode,
-    image_url: row.image_url || panImage || row.aadhaar_front_image_url || null,
+    image_url: row.image_url || panImage || aadhaarFront || null,
     card_no: row.card_no || panNo || row.aadhaar_card_no || null,
     pan_image_url: panImage || null,
     pan_card_no: panNo || null,
-    aadhaar_front_image_url: row.aadhaar_front_image_url || null,
+    aadhaar_front_image_url: aadhaarFront,
     aadhaar_back_image_url: row.aadhaar_back_image_url || null,
     aadhaar_card_no: row.aadhaar_card_no || null,
     dob: row.dob,
@@ -258,6 +269,7 @@ function formatForResponse(row) {
     status: row.status,
     active: row.active,
     rejection_note: row.rejection_note,
+    approved_at: row.approved_at || null,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -268,6 +280,10 @@ async function adminUpdateStatusByUserId({ userId, status, rejectionNote = null 
     `UPDATE kyc
      SET status = $2,
          rejection_note = $3,
+         approved_at = CASE
+           WHEN $2 = 'approved' THEN COALESCE(approved_at, NOW())
+           ELSE NULL
+         END,
          updated_at = NOW()
      WHERE user_id = $1
      RETURNING *`,
@@ -295,6 +311,7 @@ function formatAdminListItem(row) {
     status: row.status,
     active: row.active,
     rejection_note: row.rejection_note,
+    approved_at: row.approved_at,
     created_at: row.created_at,
     updated_at: row.updated_at,
   });

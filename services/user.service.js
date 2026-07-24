@@ -15,7 +15,7 @@ function formatProfile(user) {
   };
 }
 
-/** Admin-facing profile shape – includes joining date. */
+/** Admin-facing profile shape – includes joining date and live play flags. */
 function formatAdminProfile(user) {
   return {
     id: user.id,
@@ -26,6 +26,10 @@ function formatAdminProfile(user) {
     is_verified: user.is_verified ?? false,
     active: user.active !== false,
     created_at: user.created_at,
+    is_playing: user.is_playing === true,
+    stale_status: user.stale_status || 'none',
+    session_status: user.session_status || null,
+    player_status: user.player_status || null,
   };
 }
 

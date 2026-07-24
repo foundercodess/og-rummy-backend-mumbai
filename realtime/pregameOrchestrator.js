@@ -1309,6 +1309,9 @@ async function emitDealFromPregame({
       attempts_used_by_user: {},
     },
   };
+  // Pregame countdown must not survive into the live hand — clients re-apply
+  // metadata.countdown on refresh and were looping back to countdown:0.
+  delete nextMetadata.countdown;
 
   const dealMode = resolveSessionGameMode(sessionForDeal);
   if (

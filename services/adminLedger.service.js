@@ -94,11 +94,111 @@ async function sumLedgerByEvent({ since = null } = {}) {
   return out;
 }
 
+function buildLast7DayBuckets() {
+  const labels = [];
+  const dayKeys = [];
+  const now = new Date();
+  for (let i = 6; i >= 0; i -= 1) {
+    const d = new Date(Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate() - i
+    ));
+    const key = d.toISOString().slice(0, 10);
+    dayKeys.push(key);
+    labels.push(d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' }));
+  }
+  return { labels, dayKeys };
+}
+
+async function getWeeklySeries() {
+  const { labels, dayKeys } = buildLast7DayBuckets();
+  const since = `${dayKeys[0]}T00:00:00.000Z`;
+
+  const [ledgerRes, gamesRes] = await Promise.all([
+    query(
+      `SELECT
+         (created_at AT TIME ZONE 'UTC')::date::text AS day,
+         event_type,
+         COALESCE(SUM(amount), 0)::numeric(14,2) AS total
+       FROM admin_ledger
+       WHERE created_at >= $1
+       GROUP BY day, event_type
+       ORDER BY day ASC`,
+      [since]
+    ),
+    query(
+      `SELECT
+         (COALESCE(ended_at, updated_at, created_at) AT TIME ZONE 'UTC')::date::text AS day,
+         COUNT(*)::int AS plays
+       FROM game_sessions
+       WHERE status = 'completed'
+         AND COALESCE(ended_at, updated_at, created_at) >= $1
+         AND COALESCE((metadata->>'practice_mode')::boolean, false) = false
+         AND COALESCE((metadata->>'practice_bot_only')::boolean, false) = false
+       GROUP BY day
+       ORDER BY day ASC`,
+      [since]
+    ),
+  ]);
+
+  const commissionByDay = Object.fromEntries(dayKeys.map((k) => [k, 0]));
+  const botByDay = Object.fromEntries(dayKeys.map((k) => [k, 0]));
+  const playsByDay = Object.fromEntries(dayKeys.map((k) => [k, 0]));
+
+  for (const row of ledgerRes.rows || []) {
+    const day = String(row.day || '');
+    if (!(day in commissionByDay)) continue;
+    const amount = round2(Number(row.total));
+    if (row.event_type === 'commission') commissionByDay[day] = amount;
+    if (row.event_type === 'bot_win_credit') botByDay[day] = amount;
+  }
+
+  for (const row of gamesRes.rows || []) {
+    const day = String(row.day || '');
+    if (day in playsByDay) playsByDay[day] = Number(row.plays) || 0;
+  }
+
+  const commission = dayKeys.map((k) => commissionByDay[k]);
+  const botWinnings = dayKeys.map((k) => botByDay[k]);
+  const combined = dayKeys.map((k) => round2(commissionByDay[k] + botByDay[k]));
+  const gameplay = dayKeys.map((k) => playsByDay[k]);
+
+  return {
+    labels,
+    days: dayKeys,
+    gameplay,
+    revenue: {
+      commission,
+      bot_winnings: botWinnings,
+      combined,
+    },
+  };
+}
+
+async function getUserCounts() {
+  const res = await query(
+    `SELECT
+       COUNT(*)::int AS total_users,
+       COUNT(*) FILTER (WHERE active IS DISTINCT FROM false)::int AS active_users,
+       COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS newly_onboarded_7d
+     FROM users`
+  );
+  const row = res.rows[0] || {};
+  return {
+    total_users: Number(row.total_users) || 0,
+    active_users: Number(row.active_users) || 0,
+    newly_onboarded_7d: Number(row.newly_onboarded_7d) || 0,
+  };
+}
+
 /** @deprecated Use telemetryService.getGlobalTelemetryReport() instead. */
 async function getDashboardPayload() {
-  const [liveStats, totals] = await Promise.all([
+  const [liveStats, totals, userCounts, weekly] = await Promise.all([
     getLivePlayStats(),
     sumLedgerByEvent(),
+    getUserCounts(),
+    getWeeklySeries(),
   ]);
   const startOfUtcDay = new Date();
   startOfUtcDay.setUTCHours(0, 0, 0, 0);
@@ -109,6 +209,11 @@ async function getDashboardPayload() {
 
   return {
     currency: 'INR',
+    users: {
+      total: userCounts.total_users,
+      active: userCounts.active_users,
+      newly_onboarded_7d: userCounts.newly_onboarded_7d,
+    },
     revenue: {
       /** Total recorded commission (platform rake) — primary “house” revenue line. */
       total_commission: totals.commission,
@@ -124,6 +229,7 @@ async function getDashboardPayload() {
       /** Commission + bot win credits since UTC midnight. */
       combined_total: todayCombined,
     },
+    weekly,
     // Additive fields only — existing `players` key kept for older admin clients.
     playing_now: {
       /** @deprecated Prefer `humans`. Same value: live human players. */
@@ -212,5 +318,7 @@ module.exports = {
   countPlayingNowPlayers,
   sumLedgerByEvent,
   getDashboardPayload,
+  getWeeklySeries,
+  getUserCounts,
   listLedgerEntries,
 };

@@ -1897,7 +1897,9 @@ async function updateUserActiveStatus({ userId, active }) {
 
 async function updateUserKycStatus({ userId, status, rejectionNote }) {
   const allowed = new Set(['submitted', 'approved', 'rejected']);
-  const normalizedStatus = String(status || '').trim().toLowerCase();
+  let normalizedStatus = String(status || '').trim().toLowerCase();
+  // Admin UI may send "pending" as the display alias for submitted.
+  if (normalizedStatus === 'pending') normalizedStatus = 'submitted';
   if (!allowed.has(normalizedStatus)) {
     const err = new Error('INVALID_KYC_STATUS');
     err.code = 'INVALID_KYC_STATUS';
@@ -1947,6 +1949,84 @@ async function updateUserKycStatus({ userId, status, rejectionNote }) {
   return kycModel.formatForResponse(updated);
 }
 
+/**
+ * Per-game win/loss summary for a user (completed non-practice sessions).
+ * Win/loss inferred from settlement metadata.result.results[].is_winner / won_amount.
+ */
+async function getUserGameProfile(userId) {
+  const uid = Number(userId);
+  if (!Number.isInteger(uid) || uid <= 0) return [];
+
+  const result = await query(
+    `SELECT
+       g.id AS game_id,
+       COALESCE(g.name, 'Unknown') AS game_name,
+       COUNT(*)::int AS games_played,
+       COUNT(*) FILTER (
+         WHERE COALESCE((player_result.item->>'is_winner')::boolean, false) = true
+       )::int AS wins,
+       COUNT(*) FILTER (
+         WHERE COALESCE((player_result.item->>'is_winner')::boolean, false) = false
+       )::int AS losses,
+       COALESCE(SUM(
+         CASE
+           WHEN COALESCE((player_result.item->>'is_winner')::boolean, false) = true
+           THEN COALESCE(NULLIF(player_result.item->>'won_amount', '')::numeric, 0)
+           ELSE 0
+         END
+       ), 0)::numeric(14,2) AS total_won,
+       COALESCE(SUM(
+         CASE
+           WHEN COALESCE((player_result.item->>'is_winner')::boolean, false) = false
+           THEN ABS(COALESCE(NULLIF(player_result.item->>'won_amount', '')::numeric, 0))
+           ELSE 0
+         END
+       ), 0)::numeric(14,2) AS total_lost
+     FROM game_session_players gsp
+     INNER JOIN game_sessions gs ON gs.id = gsp.game_session_id
+     LEFT JOIN games g ON g.id = gs.game_id
+     LEFT JOIN LATERAL (
+       SELECT item
+       FROM jsonb_array_elements(
+         CASE
+           WHEN jsonb_typeof(gs.metadata->'result'->'results') = 'array'
+           THEN gs.metadata->'result'->'results'
+           ELSE '[]'::jsonb
+         END
+       ) AS item
+       WHERE (item->>'user_id') ~ '^[0-9]+$'
+         AND (item->>'user_id')::int = gsp.user_id
+       LIMIT 1
+     ) player_result ON true
+     WHERE gsp.user_id = $1
+       AND gs.status = 'completed'
+       AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
+       AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
+       AND COALESCE((gsp.metadata->>'is_bot')::boolean, false) = false
+     GROUP BY g.id, g.name
+     ORDER BY games_played DESC, g.name ASC`,
+    [uid]
+  );
+
+  return (result.rows || []).map((row) => {
+    const wins = Number(row.wins) || 0;
+    const losses = Number(row.losses) || 0;
+    const gamesPlayed = Number(row.games_played) || 0;
+    const totalWon = Number(row.total_won) || 0;
+    const totalLost = Number(row.total_lost) || 0;
+    return {
+      game_id: row.game_id == null ? null : Number(row.game_id),
+      game: row.game_name,
+      wins,
+      losses,
+      count: gamesPlayed,
+      total_won: Number(totalWon.toFixed(2)),
+      total_lost: Number(totalLost.toFixed(2)),
+      total: Number((totalWon - totalLost).toFixed(2)),
+    };
+  });
+}
+
 async function getUserDetailsById(userId) {
   const user = await userModel.findById(userId);
   if (!user) {
@@ -1955,9 +2035,10 @@ async function getUserDetailsById(userId) {
     throw err;
   }
 
-  const [kyc, wallet] = await Promise.all([
+  const [kyc, wallet, gameProfile] = await Promise.all([
     kycModel.findByUserId(userId),
     walletModel.getOrCreateByUserId(userId),
+    getUserGameProfile(userId),
   ]);
 
   return {
@@ -1974,6 +2055,7 @@ async function getUserDetailsById(userId) {
     },
     kyc_details: kyc ? kycModel.formatForResponse(kyc) : null,
     wallet,
+    game_profile: gameProfile,
   };
 }
 
