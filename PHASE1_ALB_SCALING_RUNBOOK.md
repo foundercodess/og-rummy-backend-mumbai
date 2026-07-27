@@ -74,11 +74,21 @@ Create an Application Load Balancer:
 
 ## Step 4: Preflight Verification on Each Node
 
-Run:
+Inside the API container (recommended; env already injected, no `/app/.env` file):
 
 ```bash
-./scripts/phase1_preflight.sh
+sudo docker exec -it og-rummy-api \
+  sh -c 'HEALTH_URL=http://127.0.0.1:3000/health ./scripts/phase1_preflight.sh'
 ```
+
+Or from the EC2 host (if host has curl and you only need health):
+
+```bash
+curl -s http://127.0.0.1/health
+HEALTH_URL=http://127.0.0.1/health ./scripts/phase1_preflight.sh
+```
+
+Do **not** dump container env to the terminal (`printenv` / `export $(grep .env)`), secrets will leak into shell history.
 
 This checks:
 - required env vars
