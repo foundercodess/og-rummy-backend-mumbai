@@ -642,7 +642,11 @@ async function createSession({ gameId, contestId, hostUserId, maxPlayers, metada
   }
 
   // Matchmaking behavior for session API: join an existing waiting session before creating a new one.
-  const openSession = isPracticeGame
+  // Load-test / private tables must get a fresh session so both scripted seats can join.
+  const skipMatchmaking = metadata?.skip_matchmaking === true
+    || metadata?.load_test_gameplay === true
+    || metadata?.load_test === true;
+  const openSession = (isPracticeGame || skipMatchmaking)
     ? null
     : await gameSessionModel.findOpenWaitingSession({
       gameId,

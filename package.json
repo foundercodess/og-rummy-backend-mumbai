@@ -8,6 +8,7 @@
     "migrate": "node scripts/migrate.js",
     "load:prepare": "node scripts/load_test_prepare_users.js",
     "load:connect": "node scripts/load_test_concurrency.js",
+    "load:gameplay": "node scripts/load_test_gameplay.js",
     "test:bot": "node scripts/test_bot_strategy.js",
     "verify:transitions": "node scripts/verify_transition_flows.js",
     "verify:transition-sockets": "node scripts/verify_transition_socket_callbacks.js",

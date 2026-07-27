@@ -9,8 +9,9 @@
  *
  * Usage:
  *   node scripts/load_test_prepare_users.js --count 1000 --out /tmp/load_tokens.jsonl
+ *   node scripts/load_test_prepare_users.js --local-docker --count 200 --fund 10000 --out load_tokens.jsonl
  *
- * Requires DATABASE_URL + JWT_SECRET (from .env).
+ * --fund tops up wallet deposit (default 10000) so entry fees succeed in gameplay load.
  */
 
 require('dotenv').config();
@@ -41,12 +42,29 @@ const userModel = require('../models/user.model');
 const loginAttemptModel = require('../models/loginAttempt.model');
 const walletModel = require('../models/wallet.model');
 
+const { query } = require('../db');
+
 const count = Math.max(1, Number(arg('count', '100')) || 100);
 const outPath = path.resolve(arg('out', path.join(process.cwd(), 'load_tokens.jsonl')));
 const phonePrefix = String(arg('phone-prefix', process.env.LOAD_TEST_PHONE_PREFIX || '97000'));
 const startIndex = Math.max(0, Number(arg('start', '1')) || 1);
+const fundAmount = Math.max(0, Number(arg('fund', process.env.LOAD_TEST_WALLET_FUND || '10000')) || 0);
 const jwtSecret = process.env.JWT_SECRET;
 const jwtExpiresIn = process.env.JWT_EXPIRES_IN || '7d';
+
+async function ensureWalletFunded(userId, amount) {
+  if (!amount || amount <= 0) return;
+  await query(
+    `UPDATE wallets
+     SET deposit = GREATEST(COALESCE(deposit, 0), $2),
+         total_balance = GREATEST(COALESCE(deposit, 0), $2)
+           + COALESCE(withdrawable, 0)
+           + COALESCE(released_bonus, 0),
+         updated_at = NOW()
+     WHERE user_id = $1`,
+    [userId, amount],
+  );
+}
 
 function databaseHostLabel(url) {
   try {
@@ -105,7 +123,9 @@ function makeSessionId() {
   let ok = 0;
   let failed = 0;
 
-  console.log(`[LOAD_PREPARE] count=${count} prefix=${phonePrefix} out=${outPath}`);
+  console.log(
+    `[LOAD_PREPARE] count=${count} prefix=${phonePrefix} fund=${fundAmount} out=${outPath}`,
+  );
 
   for (let i = 0; i < count; i += 1) {
     const phone = padPhone(startIndex + i);
@@ -127,6 +147,7 @@ function makeSessionId() {
       }
 
       await walletModel.getOrCreateByUserId(user.id);
+      await ensureWalletFunded(user.id, fundAmount);
 
       const sessionId = makeSessionId();
       await loginAttemptModel.createActiveSession({
