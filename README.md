@@ -226,6 +226,11 @@ The workflow file [deploy-ec2.yml](.github/workflows/deploy-ec2.yml) will:
 1. Push code to `main`, or
 2. Run the workflow manually from GitHub Actions using `workflow_dispatch`
 
+### Phase 1 (ALB + Multi-EC2)
+
+- Runbook: `PHASE1_ALB_SCALING_RUNBOOK.md`
+- Node preflight: `npm run phase1:preflight`
+
 ---
 
 ## Need Help?

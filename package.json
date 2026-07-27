@@ -17,7 +17,8 @@
     "verify:bot-adapters": "node scripts/verify_bot_adapter_matching.js",
     "verify:telemetry": "node scripts/verify_telemetry.js",
     "verify:score-models": "node scripts/verify_scoreboard_models.js",
-    "verify:pool-penalties": "node scripts/verify_penalty_rules.js && node scripts/verify_timeout_elimination.js && node scripts/verify_pool_logic.js && node scripts/verify_pool_transition.js && node scripts/verify_pool_final_completion.js && node scripts/verify_scoreboard_models.js && node scripts/verify_spin_go_integration.js && node scripts/verify_spin_go_settlement_runtime.js && node scripts/verify_bot_adapter_matching.js"
+    "verify:pool-penalties": "node scripts/verify_penalty_rules.js && node scripts/verify_timeout_elimination.js && node scripts/verify_pool_logic.js && node scripts/verify_pool_transition.js && node scripts/verify_pool_final_completion.js && node scripts/verify_scoreboard_models.js && node scripts/verify_spin_go_integration.js && node scripts/verify_spin_go_settlement_runtime.js && node scripts/verify_bot_adapter_matching.js",
+    "phase1:preflight": "./scripts/phase1_preflight.sh"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1009.0",
