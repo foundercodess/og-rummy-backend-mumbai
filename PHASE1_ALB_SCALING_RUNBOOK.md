@@ -78,6 +78,8 @@ GitHub Actions [`.github/workflows/deploy-ec2.yml`](.github/workflows/deploy-ec2
 
 Set repository secrets (same SSH key/user on both):
 
+
+
 | Secret | Example |
 |--------|---------|
 | `EC2_HOST_1` | `13.233.105.184` |
