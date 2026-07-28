@@ -9,26 +9,60 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Rolling: finish node 1 (health OK) before node 2 so ALB keeps one target up.
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        node: [1, 2]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Debug SSH config
+      - name: Resolve target host
+        id: target
+        env:
+          HOST_1: ${{ secrets.EC2_HOST_1 }}
+          HOST_LEGACY: ${{ secrets.EC2_HOST }}
+          HOST_2: ${{ secrets.EC2_HOST_2 }}
         run: |
-          echo "USER:"
-          echo "${{ secrets.EC2_USER }}"
+          set -eu
+          if [ "${{ matrix.node }}" = "1" ]; then
+            H="${HOST_1:-$HOST_LEGACY}"
+            if [ -z "$H" ]; then
+              echo "Missing EC2_HOST_1 (or legacy EC2_HOST)"
+              exit 1
+            fi
+            echo "host=$H" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Deploying node 1 -> $H"
+          else
+            if [ -z "$HOST_2" ]; then
+              echo "EC2_HOST_2 not set — skipping second node"
+              echo "host=" >> "$GITHUB_OUTPUT"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "host=$HOST_2" >> "$GITHUB_OUTPUT"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "Deploying node 2 -> $HOST_2"
+            fi
+          fi
 
-          echo "HOST:"
-          echo "${{ secrets.EC2_HOST }}"
-
+      - name: Debug SSH config
+        if: steps.target.outputs.skip != 'true'
+        run: |
+          echo "NODE: ${{ matrix.node }}"
+          echo "USER: ${{ secrets.EC2_USER }}"
+          echo "HOST: ${{ steps.target.outputs.host }}"
           echo "KEY LENGTH:"
           echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" | wc -c
 
       - name: Copy application to EC2
+        if: steps.target.outputs.skip != 'true'
         uses: appleboy/scp-action@v0.1.7
         with:
-          host: ${{ secrets.EC2_HOST }}
+          host: ${{ steps.target.outputs.host }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
           source: "."
@@ -38,6 +72,7 @@ jobs:
           strip_components: 0
 
       - name: Deploy application on EC2
+        if: steps.target.outputs.skip != 'true'
         uses: appleboy/ssh-action@v1.0.3
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -109,7 +144,7 @@ jobs:
           FIREBASE_SERVICE_ACCOUNT_BASE64: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_BASE64 }}
           FCM_ANDROID_CHANNEL_ID: og_rummy_default
         with:
-          host: ${{ secrets.EC2_HOST }}
+          host: ${{ steps.target.outputs.host }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
           script_stop: true

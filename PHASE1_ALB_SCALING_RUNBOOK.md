@@ -72,6 +72,21 @@ Create an Application Load Balancer:
 3. Add both instances to target group.
 4. Confirm target health is green in ALB.
 
+### Dual-host CI deploy (recommended)
+
+GitHub Actions [`.github/workflows/deploy-ec2.yml`](.github/workflows/deploy-ec2.yml) rolls out to both nodes on push to `main`.
+
+Set repository secrets (same SSH key/user on both):
+
+| Secret | Example |
+|--------|---------|
+| `EC2_HOST_1` | `13.233.105.184` |
+| `EC2_HOST_2` | `15.206.67.107` |
+| `EC2_USER` | `ec2-user` |
+| `EC2_SSH_PRIVATE_KEY` | contents of `og-rummy-mumbai.pem` |
+
+Legacy `EC2_HOST` still works as fallback for node 1. Without `EC2_HOST_2`, only one node deploys.
+
 ## Step 4: Preflight Verification on Each Node
 
 Inside the API container (recommended; env already injected, no `/app/.env` file):

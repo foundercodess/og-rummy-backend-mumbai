@@ -55,17 +55,83 @@ app.use('/api/coupons', couponRoutes);
 app.use('/api/support', supportRoutes);
 app.use('/api/admin', adminRoutes);
 
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    event_loop_lag_ms: getLastEventLoopLagMs(),
+  });
+});
+
 // Health check - useful for Docker and load balancers
-app.get('/health', async (req, res) => {
-  const dbStatus = process.env.DATABASE_URL ? await testConnection() : { ok: null, message: 'not configured' };
-  const redisStatus = await pingRedis();
-  const kafkaStatus = await pingKafka();
-  let durable = null;
-  try {
-    durable = await durableTimer.getStats();
-  } catch (_) {
-    durable = null;
-  }
+app.get('/health/details', async (req, res) => {
+  // const dbStatus = process.env.DATABASE_URL ? await testConnection() : { ok: null, message: 'not configured' };
+  // const redisStatus = await pingRedis();
+  // const kafkaStatus = await pingKafka();
+  // // let durable = null;
+  // // try {
+  // //   durable = await durableTimer.getStats();
+  // // } catch (_) {
+  // //   durable = null;
+  // // }
+
+  // const [
+  //   dbStatus,
+  //   redisStatus,
+  //   kafkaStatus,
+  //   durable,
+  // ] = await Promise.all([
+  //   process.env.DATABASE_URL
+  //     ? testConnection().catch(err => ({
+  //         ok: false,
+  //         error: err.message,
+  //       }))
+  //     : Promise.resolve({
+  //         ok: null,
+  //         message: 'not configured',
+  //       }),
+
+  //   pingRedis().catch(err => ({
+  //     ok: false,
+  //     error: err.message,
+  //   })),
+
+  //   // process.env.KAFKA_ENABLED === 'true'
+  //   //   ? pingKafka().catch(err => ({
+  //   //       ok: false,
+  //   //       error: err.message,
+  //   //     }))
+  //   //   : 
+  //     Promise.resolve({
+  //         ok: null,
+  //         message: 'disabled',
+  //       }),
+
+  //   durableTimer.getStats().catch(() => null),
+  // ]);
+
+
+  const results = await Promise.allSettled([
+    process.env.DATABASE_URL
+      ? testConnection()
+      : Promise.resolve({ ok: null }),
+  
+    pingRedis(),
+  
+    process.env.KAFKA_ENABLED === 'true'
+      ? pingKafka()
+      : Promise.resolve({ ok: null, message: 'disabled' }),
+  
+    durableTimer.getStats(),
+  ]);
+  
+  const [dbStatus, redisStatus, kafkaStatus, durable] = results.map(r =>
+    r.status === 'fulfilled'
+      ? r.value
+      : { ok: false, error: r.reason?.message }
+  );
+
   const sockets = io ? getSocketRuntimeStats(io) : null;
   res.json({
     status: 'ok',

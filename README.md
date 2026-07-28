@@ -182,28 +182,32 @@ After you create your EKS cluster and ECR repo in AWS, you can deploy automatica
 
 ## Deploy to EC2 (Automatic Redeploy on Push)
 
-Use this when you want the existing backend to redeploy automatically to a single EC2 instance on every push to `main`.
+On every push to `main`, GitHub Actions deploys to your ALB game nodes **one at a time** (rolling), so at least one target stays up.
 
 ### One-Time EC2 Setup
 
-1. Launch an EC2 instance in the same region/VPC as RDS.
-2. Install Docker and Git on the instance.
+1. Launch EC2 instance(s) in the same region/VPC as RDS (same key pair / `ec2-user` on all nodes).
+2. Install Docker and Git on each instance.
 3. Ensure the deployment user can run Docker without `sudo`.
-4. Open inbound port `80` on the EC2 security group.
-5. Allow the EC2 security group to reach the RDS security group on port `5432`.
+4. Open inbound port `80` on the EC2 security group (from ALB SG preferred).
+5. Allow the EC2 security group to reach RDS (`5432`) and Redis (`6379`/TLS).
 
 ### GitHub Secrets Required
 
 Add these repository secrets before using the workflow:
 
-- `EC2_HOST` - Public IP or DNS of the EC2 instance
-- `EC2_USER` - SSH user, for example `ec2-user`
-- `EC2_SSH_PRIVATE_KEY` - Private SSH key contents used to access the instance
+- `EC2_HOST_1` - Public IP/DNS of node A (e.g. `13.233.105.184`)
+- `EC2_HOST_2` - Public IP/DNS of node B (e.g. `15.206.67.107`) — required for dual deploy
+- `EC2_USER` - SSH user, for example `ec2-user` (same on both)
+- `EC2_SSH_PRIVATE_KEY` - Private SSH key contents (same key pair on both)
 - `DATABASE_URL` - Production PostgreSQL connection string
-- `JWT_SECRET` - Production JWT secret
-- `AWS_REGION` - Example: `us-east-1`
+- `JWT_SECRET` - Production JWT secret (must match on all nodes)
+- `AWS_REGION` - Example: `ap-south-1`
 - `AWS_S3_BUCKET` - S3 bucket name used by the app
 - `AWS_S3_BASE_URL` - Public base URL for S3 assets
+- `REDIS_URL` - Shared ElastiCache URL (required for multi-EC2)
+
+Backwards compatible: if `EC2_HOST_1` is unset, the workflow falls back to legacy `EC2_HOST`. If `EC2_HOST_2` is unset, node 2 is skipped.
 
 Optional secrets:
 
@@ -213,18 +217,32 @@ Optional secrets:
 
 ### Workflow
 
-The workflow file [deploy-ec2.yml](.github/workflows/deploy-ec2.yml) will:
+The workflow file [deploy-ec2.yml](.github/workflows/deploy-ec2.yml) will, for each host:
 
 1. Copy the repository contents to EC2.
 2. Rebuild the Docker image on the server.
 3. Regenerate the `.env` file from GitHub secrets.
 4. Restart the `og-rummy-api` container.
-5. Fail the deploy if `http://localhost/health` is not healthy.
+5. Fail that node’s deploy if `http://localhost/health` is not healthy.
+
+Deploy order: **node 1 → node 2** (`max-parallel: 1`).
 
 ### Triggering Deploys
 
 1. Push code to `main`, or
 2. Run the workflow manually from GitHub Actions using `workflow_dispatch`
+
+### Confirm both nodes updated
+
+```bash
+for H in <EC2_HOST_1> <EC2_HOST_2>; do
+  echo "===== $H ====="
+  ssh -i ~/.ssh/og-rummy-mumbai.pem ec2-user@$H 'curl -s http://127.0.0.1/health'
+  echo
+done
+```
+
+Both should show the same app message / healthy Redis+DB. ALB target group should show both **Healthy**.
 
 ### Phase 1 (ALB + Multi-EC2)
 
