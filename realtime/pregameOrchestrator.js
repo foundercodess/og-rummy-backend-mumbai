@@ -617,6 +617,8 @@ function computeDistributionVariance(handsByUser = {}) {
   }, 0) / strengths.length;
 }
 
+
+
 function computeShuffleEntropyScore(handsByUser = {}) {
   const handScores = Object.values(handsByUser).map((cards) => {
     const fp = buildHandFingerprint(cards);
