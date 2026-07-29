@@ -7,3 +7,4 @@ captures/
 *.pcap
 load_tokens.jsonl
 **/load_tokens*.jsonl
+load_reports/

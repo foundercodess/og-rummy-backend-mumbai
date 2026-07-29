@@ -7,18 +7,22 @@
  * Spawns N parallel 2-seat tables. Both seats are JWT clients from
  * load_tokens.jsonl that auto pick/discard until game:result (or timeout → drop).
  *
+ * Writes detailed per-table JSONL + summary JSON (errors, stolen games, root causes).
+ *
  * Prep (fund wallets for entry fees):
  *   node scripts/load_test_prepare_users.js --allow-remote-db --count 200 --fund 10000 --out load_tokens.jsonl
  *
- * Example (50 tables = 100 sockets):
+ * Example:
  *   node scripts/load_test_gameplay.js \
- *     --url http://13.233.105.184 \
+ *     --url http://og-rummy-alb-791534744.ap-south-1.elb.amazonaws.com \
  *     --tokens load_tokens.jsonl \
- *     --game-id 1 \
- *     --contest-id 1 \
- *     --tables 50 \
- *     --concurrency 10 \
- *     --max-game-seconds 240
+ *     --game-id 3 \
+ *     --contest-id 198 \
+ *     --tables 200 \
+ *     --concurrency 80 \
+ *     --max-game-seconds 300 \
+ *     --report-dir ./load_reports \
+ *     --report-prefix alb_200
  *
  * Flags:
  *   --url                API base URL
@@ -26,13 +30,16 @@
  *   --game-id            Required
  *   --contest-id         Required
  *   --tables             Parallel tables (default 10)
- *   --concurrency        Tables started at once (default 5)
+ *   --concurrency        Tables started at once (default 5). Keep ≤100 on current ALB.
  *   --max-players        Seats per table (default 2; only 2 supported)
- *   --max-game-seconds   Force drop if no result (default 240)
+ *   --max-game-seconds   Force drop if no result (default 300)
  *   --pick-delay-ms      Pause after turn start before pick (default 250)
  *   --discard-delay-ms   Pause before discard (default 350)
  *   --action-retries     Retries for pick/discard on transient errors (default 5)
+ *   --create-retries     Retries for POST /sessions on timeout (default 4)
  *   --mode               dual (2 scripts) | vs-bot (1 script + server bot fill)
+ *   --report-dir         Directory for JSONL + summary (default ./load_reports)
+ *   --report-prefix      Filename prefix (default gameplay)
  */
 
 const fs = require('fs');
@@ -59,13 +66,16 @@ const tokensPath = path.resolve(arg('tokens', ''));
 const tables = Math.max(1, Number(arg('tables', '10')) || 10);
 const concurrency = Math.max(1, Number(arg('concurrency', '5')) || 5);
 const maxPlayers = Math.max(2, Number(arg('max-players', '2')) || 2);
-const maxGameSeconds = Math.max(30, Number(arg('max-game-seconds', '240')) || 240);
+const maxGameSeconds = Math.max(30, Number(arg('max-game-seconds', '300')) || 300);
 const pickDelayMs = Math.max(0, Number(arg('pick-delay-ms', '250')) || 0);
 const discardDelayMs = Math.max(0, Number(arg('discard-delay-ms', '350')) || 0);
 const actionRetries = Math.max(1, Number(arg('action-retries', '5')) || 5);
+const createRetries = Math.max(1, Number(arg('create-retries', '4')) || 4);
 const gameId = Number(arg('game-id', process.env.LOAD_TEST_GAME_ID));
 const contestId = Number(arg('contest-id', process.env.LOAD_TEST_CONTEST_ID));
 const mode = String(arg('mode', 'dual')).toLowerCase(); // dual | vs-bot
+const reportDir = path.resolve(arg('report-dir', './load_reports'));
+const reportPrefix = String(arg('report-prefix', 'gameplay') || 'gameplay').replace(/[^\w.-]+/g, '_');
 
 if (!tokensPath || !fs.existsSync(tokensPath)) {
   console.error('Missing --tokens <load_tokens.jsonl>');
@@ -99,6 +109,98 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function classifyRootCause(message, event = '') {
+  const m = String(message || '').toLowerCase();
+  const ev = String(event || '').toLowerCase();
+  if (
+    m.includes('headers_timeout')
+    || m.includes('und_err_headers_timeout')
+    || m.includes('fetch failed')
+    || (ev.includes('create') && (m.includes('timeout') || m.includes('econnreset') || m.includes('socket hang')))
+  ) {
+    return 'admit_overload';
+  }
+  if (m.includes('ack_timeout')) return 'server_backpressure';
+  if (m.includes('connect_timeout') || m.includes('connect_error') || m.includes('websocket error')) {
+    return 'connect_failure';
+  }
+  if (m.includes('not your turn') || m.includes('already picked') || m.includes('discard first')) {
+    return 'stale_turn_race';
+  }
+  if (m.includes('session is not active') || m.includes('session not found') || m.includes('not active')) {
+    return 'session_already_ended';
+  }
+  if (m.includes('must pick') || m.includes('before discarding') || m.includes('no_card')) {
+    return 'action_order';
+  }
+  if (m.includes('session is full')) return 'matchmaking_conflict';
+  if (m.includes('insufficient') || m.includes('balance')) return 'wallet_balance';
+  if (m.includes('timeout_no_result') || m.includes('forced_drop')) return 'game_timeout';
+  return 'unknown';
+}
+
+function isBenignRaceError(msg) {
+  const m = String(msg || '').toLowerCase();
+  return m.includes('not your turn')
+    || m.includes('already picked')
+    || m.includes('discard first')
+    || m.includes('session is not active');
+}
+
+function isRetryableActionError(msg) {
+  const m = String(msg || '').toLowerCase();
+  return m.includes('not started')
+    || m.includes('retry')
+    || m.includes('in progress')
+    || m.includes('ack_timeout')
+    || m.includes('try again');
+}
+
+function isAlreadyPickedError(msg) {
+  const m = String(msg || '').toLowerCase();
+  return m.includes('already picked') || m.includes('discard first');
+}
+
+function isRetryableCreateError(err) {
+  const m = String(err || '').toLowerCase();
+  return m.includes('timeout')
+    || m.includes('fetch failed')
+    || m.includes('econnreset')
+    || m.includes('socket hang')
+    || m.includes('network')
+    || m.includes('503')
+    || m.includes('502')
+    || m.includes('504');
+}
+
+function pushDetailedError(shared, {
+  seat = null,
+  event = null,
+  message,
+  turnId = null,
+  attempt = null,
+  extra = null,
+}) {
+  const rootCause = classifyRootCause(message, event);
+  const entry = {
+    ts: new Date().toISOString(),
+    seat,
+    event,
+    message: String(message || 'unknown'),
+    root_cause: rootCause,
+    turn_id: turnId,
+    attempt,
+    ...(extra && typeof extra === 'object' ? { extra } : {}),
+  };
+  shared.errorEvents.push(entry);
+  shared.rootCauseCounts[rootCause] = (shared.rootCauseCounts[rootCause] || 0) + 1;
+
+  const key = `${seat || 'T'}:${event || 'err'}:${message}`;
+  shared.errors.push(key);
+  shared.errorCounts[key] = (shared.errorCounts[key] || 0) + 1;
+  return entry;
+}
+
 function emitAck(socket, event, payload, timeoutMs = 15000) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve({ ok: false, error: 'ack_timeout', event }), timeoutMs);
@@ -118,17 +220,70 @@ function emitAck(socket, event, payload, timeoutMs = 15000) {
   });
 }
 
-async function postJson(urlPath, body, token) {
-  const res = await fetch(`${baseUrl}${urlPath}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(body || {}),
-  });
-  const json = await res.json().catch(() => ({}));
-  return { status: res.status, json };
+async function postJson(urlPath, body, token, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${baseUrl}${urlPath}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(body || {}),
+      signal: controller.signal,
+    });
+    const json = await res.json().catch(() => ({}));
+    return { ok: res.ok || res.status < 500, status: res.status, json, error: null };
+  } catch (err) {
+    const cause = err?.cause?.code || err?.cause?.message || '';
+    const message = err?.name === 'AbortError'
+      ? 'headers_timeout'
+      : `${err.message}${cause ? `:${cause}` : ''}`;
+    return { ok: false, status: 0, json: {}, error: message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function createSessionWithRetry(token, tableIndex, shared) {
+  let last = null;
+  for (let attempt = 1; attempt <= createRetries; attempt += 1) {
+    last = await postJson(
+      '/api/gameplay/sessions',
+      {
+        game_id: gameId,
+        contest_id: contestId,
+        max_players: maxPlayers,
+        metadata: { load_test_gameplay: true, table: tableIndex, mode },
+      },
+      token,
+      30000,
+    );
+    const sessionId = Number(last.json?.session?.id);
+    if (sessionId) return { ok: true, sessionId, status: last.status, attempt };
+
+    const errMsg = last.error
+      || last.json?.message
+      || `http_${last.status}`
+      || 'create_failed';
+    pushDetailedError(shared, {
+      seat: `T${tableIndex}:A`,
+      event: 'create_session',
+      message: errMsg,
+      attempt,
+    });
+    if (!isRetryableCreateError(errMsg) && last.status > 0 && last.status < 500) {
+      break;
+    }
+    await sleep(250 * attempt);
+  }
+  return {
+    ok: false,
+    sessionId: null,
+    status: last?.status || 0,
+    error: last?.error || last?.json?.message || 'create_failed',
+  };
 }
 
 function connectClient(tokenRow, label) {
@@ -205,11 +360,6 @@ function cardUidsFromGroups(groups) {
   return out;
 }
 
-function pushError(shared, key) {
-  shared.errors.push(key);
-  shared.errorCounts[key] = (shared.errorCounts[key] || 0) + 1;
-}
-
 async function waitUntilTurnStarted(turnPayload) {
   const startedAt = Date.parse(turnPayload?.started_at || '');
   if (Number.isNaN(startedAt)) return;
@@ -217,22 +367,83 @@ async function waitUntilTurnStarted(turnPayload) {
   if (waitMs > 0) await sleep(Math.min(waitMs, 8000));
 }
 
-function isRetryableActionError(msg) {
-  const m = String(msg || '').toLowerCase();
-  return m.includes('not started')
-    || m.includes('retry')
-    || m.includes('in progress')
-    || m.includes('ack_timeout')
-    || m.includes('try again');
+function summarizeResult(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const players = payload.players || payload.results || payload.scoreboard || null;
+  return {
+    reason: payload.reason || payload.result_reason || payload.end_reason || null,
+    winner_user_id: payload.winner_user_id ?? payload.winner?.user_id ?? payload.winner_id ?? null,
+    declared_by: payload.declared_by ?? payload.declarer_user_id ?? null,
+    players: Array.isArray(players)
+      ? players.slice(0, 8).map((p) => ({
+        user_id: p.user_id ?? p.id ?? null,
+        points: p.points ?? p.score ?? p.display_points ?? null,
+        status: p.status ?? p.result ?? null,
+        is_bot: p.is_bot ?? p.bot ?? null,
+      }))
+      : null,
+    raw_keys: Object.keys(payload).slice(0, 24),
+  };
 }
 
-function isAlreadyPickedError(msg) {
-  const m = String(msg || '').toLowerCase();
-  return m.includes('already picked') || m.includes('discard first');
+function detectStolen(shared, seatUserIds) {
+  const end = String(shared.endReason || '').toLowerCase();
+  const hasResult = Boolean(shared.result);
+  const forcedTimeout = !hasResult && (
+    end === 'timeout_no_result' || shared.forcedDrop === true
+  );
+
+  if (forcedTimeout) {
+    return {
+      stolen: true,
+      stolen_reason: 'timeout_no_result',
+      root_cause: 'game_timeout',
+    };
+  }
+
+  if (shared.forcedDrop && hasResult) {
+    return {
+      stolen: true,
+      stolen_reason: 'forced_drop_before_natural_end',
+      root_cause: 'game_timeout',
+    };
+  }
+
+  const winner = Number(
+    shared.result?.winner_user_id
+    ?? shared.result?.winner?.user_id
+    ?? shared.result?.winner_id
+    ?? NaN,
+  );
+  if (hasResult && Number.isFinite(winner) && seatUserIds.length && !seatUserIds.includes(winner)) {
+    // Opponent/bot win is normal in vs-bot; only flag dual when winner is outside both seats.
+    if (mode === 'dual') {
+      return {
+        stolen: true,
+        stolen_reason: 'winner_outside_scripted_seats',
+        root_cause: 'unexpected_winner',
+      };
+    }
+  }
+
+  const severe = (shared.errorEvents || []).filter((e) => (
+    e.root_cause === 'admit_overload'
+    || e.root_cause === 'server_backpressure'
+    || e.root_cause === 'connect_failure'
+  ));
+  if (!hasResult && severe.length > 0) {
+    return {
+      stolen: true,
+      stolen_reason: 'ended_without_result_after_infra_errors',
+      root_cause: severe[0].root_cause,
+    };
+  }
+
+  return { stolen: false, stolen_reason: null, root_cause: null };
 }
 
 /**
- * Auto-play one seat until game ends or deadline.
+ * Auto-play one seat until game ends or deadline (bot-like pick/discard loop).
  */
 function attachAutoPlayer(seat, sessionId, shared) {
   const { socket, user_id: userId, label } = seat;
@@ -240,21 +451,25 @@ function attachAutoPlayer(seat, sessionId, shared) {
   let turns = 0;
   let lastHandGroups = [];
   let activeTurnId = null;
+  const handledTurnIds = new Set();
 
-  const playTurn = async (turnPayload) => {
+  const playTurn = async (turnPayload, source) => {
     if (shared.done) return;
     const turnUser = Number(turnPayload?.user_id ?? turnPayload?.turn?.user_id);
     if (turnUser !== Number(userId)) return;
 
     const turnId = Number(turnPayload?.turn_id ?? turnPayload?.turn?.turn_id ?? 0) || null;
     if (busy) return;
-    if (turnId != null && activeTurnId === turnId && turns > 0) {
-      // Same turn already handled (deal + game:turn double fire).
+    if (turnId != null) {
+      if (handledTurnIds.has(turnId)) return;
+      // Reserve immediately to avoid deal+turn double fire.
+      handledTurnIds.add(turnId);
+      activeTurnId = turnId;
+    } else if (activeTurnId != null && turns > 0) {
       return;
     }
 
     busy = true;
-    if (turnId != null) activeTurnId = turnId;
     turns += 1;
     shared.turns += 1;
 
@@ -299,7 +514,28 @@ function attachAutoPlayer(seat, sessionId, shared) {
             break;
           }
 
-          pushError(shared, `${label}:pick:${errMsg}`);
+          // Benign races: log once, do not spam retries.
+          if (isBenignRaceError(errMsg)) {
+            pushDetailedError(shared, {
+              seat: label,
+              event: 'player:pick',
+              message: errMsg,
+              turnId,
+              attempt,
+              extra: { source },
+            });
+            shared.picksFail += 1;
+            return;
+          }
+
+          pushDetailedError(shared, {
+            seat: label,
+            event: 'player:pick',
+            message: errMsg,
+            turnId,
+            attempt,
+            extra: { source },
+          });
           shared.picksFail += 1;
           if (!isRetryableActionError(errMsg) || attempt >= actionRetries) break;
           await sleep(200 * attempt);
@@ -320,13 +556,18 @@ function attachAutoPlayer(seat, sessionId, shared) {
       for (let attempt = 1; attempt <= actionRetries; attempt += 1) {
         if (shared.done) return;
         if (!discardUid) {
-          // Refresh groups once if we somehow have no card uid.
           const auto2 = await emitAck(socket, 'player:autogroup', { session_id: sessionId });
           groups = groupsFromAck(auto2);
           allUids = cardUidsFromGroups(groups);
           discardUid = allUids[allUids.length - 1] || allUids[0] || null;
           if (!discardUid) {
-            pushError(shared, `${label}:discard:no_card`);
+            pushDetailedError(shared, {
+              seat: label,
+              event: 'player:discard',
+              message: 'no_card',
+              turnId,
+              attempt,
+            });
             shared.discardsFail += 1;
             return;
           }
@@ -347,25 +588,50 @@ function attachAutoPlayer(seat, sessionId, shared) {
         }
 
         const errMsg = discardAck.error || 'discard_failed';
-        pushError(shared, `${label}:discard:${errMsg}`);
+        if (isBenignRaceError(errMsg)) {
+          pushDetailedError(shared, {
+            seat: label,
+            event: 'player:discard',
+            message: errMsg,
+            turnId,
+            attempt,
+            extra: { source },
+          });
+          shared.discardsFail += 1;
+          return;
+        }
+
+        pushDetailedError(shared, {
+          seat: label,
+          event: 'player:discard',
+          message: errMsg,
+          turnId,
+          attempt,
+          extra: { source },
+        });
         shared.discardsFail += 1;
         if (!isRetryableActionError(errMsg) || attempt >= actionRetries) return;
         await sleep(250 * attempt);
       }
     } catch (err) {
-      pushError(shared, `${label}:turn:${err.message}`);
+      pushDetailedError(shared, {
+        seat: label,
+        event: 'turn',
+        message: err.message,
+        turnId,
+      });
     } finally {
       busy = false;
     }
   };
 
   socket.on('game:turn', (payload) => {
-    playTurn(payload?.turn || payload).catch(() => {});
+    playTurn(payload?.turn || payload, 'game:turn').catch(() => {});
   });
 
   socket.on('game:deal', (payload) => {
     const turn = payload?.turn || payload?.game_state?.turn;
-    if (turn) playTurn(turn).catch(() => {});
+    if (turn) playTurn(turn, 'game:deal').catch(() => {});
   });
 
   socket.on('game:declare:requested', async () => {
@@ -399,6 +665,7 @@ function attachAutoPlayer(seat, sessionId, shared) {
     if (shared.done) return;
     shared.done = true;
     shared.result = payload;
+    shared.resultSummary = summarizeResult(payload);
     shared.endedAt = Date.now();
     shared.endReason = payload?.reason || payload?.result_reason || 'game:result';
   });
@@ -406,16 +673,17 @@ function attachAutoPlayer(seat, sessionId, shared) {
   return {
     getTurns: () => turns,
     forceDrop: async () => {
+      shared.forcedDrop = true;
       await emitAck(socket, 'player:drop', { session_id: sessionId });
     },
   };
 }
 
-async function runOneTable(tableIndex, seatsTokens) {
-  const startedAt = Date.now();
-  const shared = {
+function emptyShared() {
+  return {
     done: false,
     result: null,
+    resultSummary: null,
     endReason: null,
     endedAt: null,
     turns: 0,
@@ -426,76 +694,99 @@ async function runOneTable(tableIndex, seatsTokens) {
     declareEvents: 0,
     errors: [],
     errorCounts: {},
+    errorEvents: [],
+    rootCauseCounts: {},
     sessionId: null,
+    forcedDrop: false,
+    seatUserIds: [],
   };
+}
+
+async function runOneTable(tableIndex, seatsTokens) {
+  const startedAt = Date.now();
+  const shared = emptyShared();
 
   const seatsNeeded = mode === 'vs-bot' ? 1 : 2;
   const clients = [];
   for (let i = 0; i < seatsNeeded; i += 1) {
     const c = await connectClient(seatsTokens[i], `T${tableIndex}:${i === 0 ? 'A' : 'B'}`);
     if (!c.ok) {
-      return {
+      pushDetailedError(shared, {
+        seat: `T${tableIndex}:${i === 0 ? 'A' : 'B'}`,
+        event: 'connect',
+        message: c.error || 'connect_failed',
+      });
+      const stolen = detectStolen(shared, []);
+      return buildTableResult({
         ok: false,
         table: tableIndex,
-        error: `connect_failed:${c.error}`,
-        ms: Date.now() - startedAt,
+        sessionId: null,
+        startedAt,
         shared,
-      };
+        error: `connect_failed:${c.error}`,
+        stolen,
+      });
     }
     clients.push(c);
   }
+  shared.seatUserIds = clients.map((c) => Number(c.user_id));
 
   const creator = clients[0];
-  const created = await postJson(
-    '/api/gameplay/sessions',
-    {
-      game_id: gameId,
-      contest_id: contestId,
-      max_players: maxPlayers,
-      metadata: { load_test_gameplay: true, table: tableIndex, mode },
-    },
-    creator.token,
-  );
-
-  const sessionId = Number(created.json?.session?.id);
-  if (!sessionId) {
-    for (const c of clients) c.socket.close();
-    return {
+  const created = await createSessionWithRetry(creator.token, tableIndex, shared);
+  if (!created.ok || !created.sessionId) {
+    for (const c of clients) {
+      try { c.socket.close(); } catch (_) { /* ignore */ }
+    }
+    const stolen = detectStolen(shared, shared.seatUserIds);
+    return buildTableResult({
       ok: false,
       table: tableIndex,
-      error: `create_session:${created.status}:${created.json?.message || JSON.stringify(created.json).slice(0, 120)}`,
-      ms: Date.now() - startedAt,
+      sessionId: null,
+      startedAt,
       shared,
-    };
+      error: `create_session:${created.status}:${created.error || 'failed'}`,
+      stolen: {
+        stolen: true,
+        stolen_reason: 'create_session_failed',
+        root_cause: classifyRootCause(created.error || '', 'create_session'),
+      },
+    });
   }
+
+  const sessionId = created.sessionId;
   shared.sessionId = sessionId;
 
-  // Attach listeners before ready so we never miss game:deal / first game:turn.
   const controllers = clients.map((c) => attachAutoPlayer(c, sessionId, shared));
 
   for (const c of clients) {
     const join = await emitAck(c.socket, 'session:join', { session_id: sessionId });
     if (!join.ok) {
-      pushError(shared, `${c.label}:join:${join.error}`);
+      pushDetailedError(shared, {
+        seat: c.label,
+        event: 'session:join',
+        message: join.error || 'join_failed',
+      });
     }
     const ready = await emitAck(c.socket, 'player:ready', { session_id: sessionId, ready: true });
     if (!ready.ok) {
       const msg = String(ready.error || '');
-      // Pregame orchestrator often owns ready — not a hard failure.
       if (!/managed automatically/i.test(msg)) {
-        pushError(shared, `${c.label}:ready:${ready.error}`);
+        pushDetailedError(shared, {
+          seat: c.label,
+          event: 'player:ready',
+          message: ready.error || 'ready_failed',
+        });
       }
     }
   }
 
-  // vs-bot: wait for server bot inject + deal; dual: both ready should start countdown/deal
+  // Play full game until result or max-game-seconds (bot-like loop).
   const deadline = startedAt + maxGameSeconds * 1000;
   while (!shared.done && Date.now() < deadline) {
     await sleep(500);
   }
 
   if (!shared.done) {
-    // Force end so we don't leave zombie tables under load.
     for (const ctrl of controllers) {
       try {
         await ctrl.forceDrop();
@@ -509,6 +800,11 @@ async function runOneTable(tableIndex, seatsTokens) {
     }
     if (!shared.done) {
       shared.endReason = 'timeout_no_result';
+      pushDetailedError(shared, {
+        seat: `T${tableIndex}`,
+        event: 'timeout',
+        message: 'timeout_no_result',
+      });
     }
   }
 
@@ -521,12 +817,23 @@ async function runOneTable(tableIndex, seatsTokens) {
     }
   }
 
-  const ok = Boolean(shared.result) || shared.endReason === 'timeout_no_result';
-  // timeout_no_result counts as soft-fail for summary
-  return {
+  const stolen = detectStolen(shared, shared.seatUserIds);
+  return buildTableResult({
     ok: Boolean(shared.result),
-    softTimeout: !shared.result && shared.endReason === 'timeout_no_result',
     table: tableIndex,
+    sessionId,
+    startedAt,
+    shared,
+    error: shared.result ? null : (shared.endReason || 'unknown'),
+    stolen,
+  });
+}
+
+function buildTableResult({ ok, table, sessionId, startedAt, shared, error, stolen }) {
+  return {
+    ok,
+    softTimeout: !shared.result && shared.endReason === 'timeout_no_result',
+    table,
     sessionId,
     ms: Date.now() - startedAt,
     turns: shared.turns,
@@ -536,8 +843,17 @@ async function runOneTable(tableIndex, seatsTokens) {
     discardsFail: shared.discardsFail,
     declareEvents: shared.declareEvents,
     endReason: shared.endReason || (shared.result ? 'result' : 'unknown'),
-    errors: shared.errors.slice(0, 12),
+    forcedDrop: Boolean(shared.forcedDrop),
+    stolen: Boolean(stolen?.stolen),
+    stolenReason: stolen?.stolen_reason || null,
+    stolenRootCause: stolen?.root_cause || null,
+    resultSummary: shared.resultSummary,
+    seatUserIds: shared.seatUserIds || [],
+    errorEvents: shared.errorEvents.slice(0, 80),
+    rootCauseCounts: shared.rootCauseCounts,
+    errors: shared.errors.slice(0, 24),
     errorCounts: shared.errorCounts,
+    error: error || null,
   };
 }
 
@@ -553,6 +869,125 @@ async function runPool(items, limit, worker) {
   }
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => runner()));
   return results;
+}
+
+function ensureReportDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function writeReports(results, meta) {
+  ensureReportDir(reportDir);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const jsonlPath = path.join(reportDir, `${reportPrefix}_${stamp}.jsonl`);
+  const summaryPath = path.join(reportDir, `${reportPrefix}_${stamp}_summary.json`);
+
+  const lines = results.map((r) => JSON.stringify({
+    table: r.table,
+    session_id: r.sessionId,
+    ok: r.ok,
+    soft_timeout: r.softTimeout,
+    stolen: r.stolen,
+    stolen_reason: r.stolenReason,
+    stolen_root_cause: r.stolenRootCause,
+    end_reason: r.endReason,
+    forced_drop: r.forcedDrop,
+    duration_ms: r.ms,
+    turns: r.turns,
+    picks_ok: r.picksOk,
+    picks_fail: r.picksFail,
+    discards_ok: r.discardsOk,
+    discards_fail: r.discardsFail,
+    declare_events: r.declareEvents,
+    seat_user_ids: r.seatUserIds,
+    result: r.resultSummary,
+    error: r.error,
+    root_cause_counts: r.rootCauseCounts,
+    errors: r.errorEvents,
+  }));
+  fs.writeFileSync(jsonlPath, `${lines.join('\n')}\n`, 'utf8');
+
+  const ok = results.filter((r) => r.ok).length;
+  const softTimeout = results.filter((r) => r.softTimeout).length;
+  const stolen = results.filter((r) => r.stolen).length;
+  const failed = results.length - ok;
+  const durations = results.map((r) => r.ms).sort((a, b) => a - b);
+  const pct = (p) => durations[Math.min(durations.length - 1, Math.floor((p / 100) * durations.length))] || null;
+
+  const mergedErrors = {};
+  const mergedRootCauses = {};
+  for (const r of results) {
+    for (const [k, v] of Object.entries(r.errorCounts || {})) {
+      mergedErrors[k] = (mergedErrors[k] || 0) + v;
+    }
+    for (const [k, v] of Object.entries(r.rootCauseCounts || {})) {
+      mergedRootCauses[k] = (mergedRootCauses[k] || 0) + v;
+    }
+  }
+
+  const stolenReasons = {};
+  for (const r of results.filter((x) => x.stolen)) {
+    const key = r.stolenReason || 'unknown';
+    stolenReasons[key] = (stolenReasons[key] || 0) + 1;
+  }
+
+  const topErrors = Object.entries(mergedErrors)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 20)
+    .map(([error, count]) => ({ error, count, root_cause: classifyRootCause(error) }));
+
+  const rootCauses = Object.entries(mergedRootCauses)
+    .sort((a, b) => b[1] - a[1])
+    .map(([root_cause, count]) => ({ root_cause, count }));
+
+  const failSamples = results.filter((r) => !r.ok).slice(0, 20).map((r) => ({
+    table: r.table,
+    session_id: r.sessionId,
+    error: r.error || r.endReason,
+    stolen: r.stolen,
+    stolen_reason: r.stolenReason,
+    top_root_causes: Object.entries(r.rootCauseCounts || {})
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([root_cause, count]) => ({ root_cause, count })),
+    sample_errors: (r.errorEvents || []).slice(0, 5),
+  }));
+
+  const stolenSamples = results.filter((r) => r.stolen).slice(0, 20).map((r) => ({
+    table: r.table,
+    session_id: r.sessionId,
+    stolen_reason: r.stolenReason,
+    stolen_root_cause: r.stolenRootCause,
+    end_reason: r.endReason,
+    result: r.resultSummary,
+  }));
+
+  const summary = {
+    ...meta,
+    tables: results.length,
+    ok,
+    failed,
+    soft_timeout_drop: softTimeout,
+    stolen_games: stolen,
+    stolen_reasons: stolenReasons,
+    total_turns: results.reduce((s, r) => s + (r.turns || 0), 0),
+    picks_ok: results.reduce((s, r) => s + (r.picksOk || 0), 0),
+    picks_fail: results.reduce((s, r) => s + (r.picksFail || 0), 0),
+    discards_ok: results.reduce((s, r) => s + (r.discardsOk || 0), 0),
+    discards_fail: results.reduce((s, r) => s + (r.discardsFail || 0), 0),
+    avg_turns_per_table: Number((results.reduce((s, r) => s + (r.turns || 0), 0) / Math.max(1, results.length)).toFixed(1)),
+    game_ms_p50: pct(50),
+    game_ms_p95: pct(95),
+    game_ms_p99: pct(99),
+    root_causes: rootCauses,
+    top_errors: topErrors,
+    fail_samples: failSamples,
+    stolen_samples: stolenSamples,
+    report_jsonl: jsonlPath,
+    report_summary: summaryPath,
+  };
+
+  fs.writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, 'utf8');
+  return { jsonlPath, summaryPath, summary };
 }
 
 (async () => {
@@ -575,6 +1010,9 @@ async function runPool(items, limit, worker) {
     pickDelayMs,
     discardDelayMs,
     actionRetries,
+    createRetries,
+    reportDir,
+    reportPrefix,
     tokens: tokens.length,
   });
 
@@ -589,55 +1027,44 @@ async function runPool(items, limit, worker) {
     runOneTable(index + 1, seatTokens),
   );
 
-  const ok = results.filter((r) => r.ok).length;
-  const softTimeout = results.filter((r) => r.softTimeout).length;
-  const failed = results.length - ok;
-  const durations = results.map((r) => r.ms).sort((a, b) => a - b);
-  const pct = (p) => durations[Math.min(durations.length - 1, Math.floor((p / 100) * durations.length))] || null;
-  const totalTurns = results.reduce((s, r) => s + (r.turns || 0), 0);
-  const picksOk = results.reduce((s, r) => s + (r.picksOk || 0), 0);
-  const picksFail = results.reduce((s, r) => s + (r.picksFail || 0), 0);
-  const discardsOk = results.reduce((s, r) => s + (r.discardsOk || 0), 0);
-  const discardsFail = results.reduce((s, r) => s + (r.discardsFail || 0), 0);
-
-  const mergedErrors = {};
-  for (const r of results) {
-    for (const [k, v] of Object.entries(r.errorCounts || {})) {
-      mergedErrors[k] = (mergedErrors[k] || 0) + v;
-    }
-  }
-  const topErrors = Object.entries(mergedErrors)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 12)
-    .map(([error, count]) => ({ error, count }));
-
-  const failSamples = results.filter((r) => !r.ok).slice(0, 15).map((r) => ({
-    table: r.table,
-    error: r.error || r.endReason,
-    errors: r.errors,
-    sessionId: r.sessionId,
-  }));
-
-  console.log('[LOAD_GAMEPLAY] summary', {
-    tables,
-    ok,
-    failed,
-    soft_timeout_drop: softTimeout,
-    total_turns: totalTurns,
-    picks_ok: picksOk,
-    picks_fail: picksFail,
-    discards_ok: discardsOk,
-    discards_fail: discardsFail,
-    avg_turns_per_table: Number((totalTurns / Math.max(1, tables)).toFixed(1)),
+  const { jsonlPath, summaryPath, summary } = writeReports(results, {
+    url: baseUrl,
+    mode,
+    game_id: gameId,
+    contest_id: contestId,
+    concurrency,
+    max_game_seconds: maxGameSeconds,
     elapsed_s: Number(((Date.now() - t0) / 1000).toFixed(1)),
-    game_ms_p50: pct(50),
-    game_ms_p95: pct(95),
-    game_ms_p99: pct(99),
-    top_errors: topErrors,
-    fail_samples: failSamples,
+    started_at: new Date(t0).toISOString(),
+    finished_at: new Date().toISOString(),
   });
 
-  process.exit(failed > tables * 0.2 ? 2 : 0);
+  console.log('[LOAD_GAMEPLAY] summary', {
+    tables: summary.tables,
+    ok: summary.ok,
+    failed: summary.failed,
+    soft_timeout_drop: summary.soft_timeout_drop,
+    stolen_games: summary.stolen_games,
+    stolen_reasons: summary.stolen_reasons,
+    total_turns: summary.total_turns,
+    picks_ok: summary.picks_ok,
+    picks_fail: summary.picks_fail,
+    discards_ok: summary.discards_ok,
+    discards_fail: summary.discards_fail,
+    avg_turns_per_table: summary.avg_turns_per_table,
+    elapsed_s: summary.elapsed_s,
+    game_ms_p50: summary.game_ms_p50,
+    game_ms_p95: summary.game_ms_p95,
+    game_ms_p99: summary.game_ms_p99,
+    root_causes: summary.root_causes,
+    top_errors: summary.top_errors,
+    fail_samples: summary.fail_samples,
+    stolen_samples: summary.stolen_samples,
+    report_jsonl: jsonlPath,
+    report_summary: summaryPath,
+  });
+
+  process.exit(summary.failed > tables * 0.2 ? 2 : 0);
 })().catch((err) => {
   console.error(err);
   process.exit(1);
