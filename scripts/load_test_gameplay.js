@@ -352,6 +352,31 @@ function groupsFromAck(ack) {
   })).filter((g) => g.cards.length > 0);
 }
 
+function finishPlanFromAck(ack) {
+  const plan = ack?.ack?.data?.finish_plan;
+  if (!plan || plan.valid_for_declare_after_finish !== true) return null;
+  const finishCard = plan.finish_card;
+  const finishCardUid = typeof finishCard === 'string'
+    ? finishCard
+    : finishCard?.card_uid;
+  if (!finishCardUid || !Array.isArray(plan.submitted_groups) || !plan.submitted_groups.length) {
+    return null;
+  }
+  return {
+    finishCardUid,
+    submittedGroups: plan.submitted_groups,
+  };
+}
+
+function normalizeGroups(groups) {
+  return (groups || []).map((g, idx) => ({
+    group_id: g.group_id || idx + 1,
+    cards: (g.cards || [])
+      .map((c) => (typeof c === 'string' ? c : c?.card_uid))
+      .filter(Boolean),
+  })).filter((g) => g.cards.length > 0);
+}
+
 function cardUidsFromGroups(groups) {
   const out = [];
   for (const g of groups || []) {
@@ -451,6 +476,7 @@ function attachAutoPlayer(seat, sessionId, shared) {
   let turns = 0;
   let lastHandGroups = [];
   let activeTurnId = null;
+  let declareResponseSent = false;
   const handledTurnIds = new Set();
 
   const playTurn = async (turnPayload, source) => {
@@ -480,6 +506,7 @@ function attachAutoPlayer(seat, sessionId, shared) {
 
       const auto = await emitAck(socket, 'player:autogroup', { session_id: sessionId });
       let groups = groupsFromAck(auto);
+      let finishPlan = finishPlanFromAck(auto);
       if (!groups.length && lastHandGroups.length) groups = lastHandGroups;
 
       let hasPicked = turnPayload?.has_picked === true || turnPayload?.turn?.has_picked === true;
@@ -498,6 +525,7 @@ function attachAutoPlayer(seat, sessionId, shared) {
             pickOk = true;
             shared.picksOk += 1;
             pickedUid = pickAck.ack?.data?.picked_card?.card_uid || null;
+            finishPlan = finishPlanFromAck(pickAck);
             const afterPickGroups = groupsFromAck(pickAck);
             if (afterPickGroups.length) {
               groups = afterPickGroups;
@@ -546,6 +574,35 @@ function attachAutoPlayer(seat, sessionId, shared) {
 
       if (discardDelayMs) await sleep(discardDelayMs);
       if (shared.done) return;
+
+      // The server computes a valid finish plan after a pick. Use it instead of
+      // endlessly discarding so scripted seats can naturally complete games.
+      if (finishPlan) {
+        const finishGroups = normalizeGroups(finishPlan.submittedGroups);
+        lastHandGroups = finishGroups;
+        shared.finishAttempts += 1;
+        const finishAck = await emitAck(socket, 'player:finish', {
+          session_id: sessionId,
+          card_uid: finishPlan.finishCardUid,
+          groups: finishGroups,
+        });
+        if (finishAck.ok) {
+          shared.finishOk += 1;
+          return;
+        }
+
+        shared.finishFail += 1;
+        pushDetailedError(shared, {
+          seat: label,
+          event: 'player:finish',
+          message: finishAck.error || 'finish_failed',
+          turnId,
+          attempt: 1,
+          extra: { source, finish_card_uid: finishPlan.finishCardUid },
+        });
+        // If the finish raced with another terminal event, do not send a stale discard.
+        if (isBenignRaceError(finishAck.error) || shared.done) return;
+      }
 
       let discardUid = pickedUid;
       let allUids = cardUidsFromGroups(groups);
@@ -634,16 +691,39 @@ function attachAutoPlayer(seat, sessionId, shared) {
     if (turn) playTurn(turn, 'game:deal').catch(() => {});
   });
 
-  socket.on('game:declare:requested', async () => {
+  const submitDeclareResponse = async (source) => {
+    if (declareResponseSent || shared.done) return;
+    declareResponseSent = true;
     try {
-      await emitAck(socket, 'player:declare:response', {
+      const response = await emitAck(socket, 'player:declare:response', {
         session_id: sessionId,
         groups: lastHandGroups,
       });
-    } catch (_) {
-      // ignore
+      if (!response.ok) {
+        declareResponseSent = false;
+        pushDetailedError(shared, {
+          seat: label,
+          event: 'player:declare:response',
+          message: response.error || 'declare_response_failed',
+          extra: { source },
+        });
+        return;
+      }
+      shared.declareResponsesOk += 1;
+    } catch (err) {
+      declareResponseSent = false;
+      pushDetailedError(shared, {
+        seat: label,
+        event: 'player:declare:response',
+        message: err.message,
+        extra: { source },
+      });
     }
     shared.declareEvents += 1;
+  };
+
+  socket.on('game:declare:requested', async () => {
+    await submitDeclareResponse('game:declare:requested');
   });
 
   socket.on('game:declare:state', async (payload) => {
@@ -651,14 +731,7 @@ function attachAutoPlayer(seat, sessionId, shared) {
       ? payload.pending_user_ids.map(Number).includes(Number(userId))
       : true;
     if (!needsResponse) return;
-    try {
-      await emitAck(socket, 'player:declare:response', {
-        session_id: sessionId,
-        groups: lastHandGroups,
-      });
-    } catch (_) {
-      // ignore
-    }
+    await submitDeclareResponse('game:declare:state');
   });
 
   socket.on('game:result', (payload) => {
@@ -691,7 +764,11 @@ function emptyShared() {
     picksFail: 0,
     discardsOk: 0,
     discardsFail: 0,
+    finishAttempts: 0,
+    finishOk: 0,
+    finishFail: 0,
     declareEvents: 0,
+    declareResponsesOk: 0,
     errors: [],
     errorCounts: {},
     errorEvents: [],
@@ -819,7 +896,7 @@ async function runOneTable(tableIndex, seatsTokens) {
 
   const stolen = detectStolen(shared, shared.seatUserIds);
   return buildTableResult({
-    ok: Boolean(shared.result),
+    ok: Boolean(shared.result) && !stolen.stolen,
     table: tableIndex,
     sessionId,
     startedAt,
@@ -841,7 +918,11 @@ function buildTableResult({ ok, table, sessionId, startedAt, shared, error, stol
     picksFail: shared.picksFail,
     discardsOk: shared.discardsOk,
     discardsFail: shared.discardsFail,
+    finishAttempts: shared.finishAttempts,
+    finishOk: shared.finishOk,
+    finishFail: shared.finishFail,
     declareEvents: shared.declareEvents,
+    declareResponsesOk: shared.declareResponsesOk,
     endReason: shared.endReason || (shared.result ? 'result' : 'unknown'),
     forcedDrop: Boolean(shared.forcedDrop),
     stolen: Boolean(stolen?.stolen),
@@ -897,7 +978,11 @@ function writeReports(results, meta) {
     picks_fail: r.picksFail,
     discards_ok: r.discardsOk,
     discards_fail: r.discardsFail,
+    finish_attempts: r.finishAttempts,
+    finish_ok: r.finishOk,
+    finish_fail: r.finishFail,
     declare_events: r.declareEvents,
+    declare_responses_ok: r.declareResponsesOk,
     seat_user_ids: r.seatUserIds,
     result: r.resultSummary,
     error: r.error,
@@ -974,6 +1059,10 @@ function writeReports(results, meta) {
     picks_fail: results.reduce((s, r) => s + (r.picksFail || 0), 0),
     discards_ok: results.reduce((s, r) => s + (r.discardsOk || 0), 0),
     discards_fail: results.reduce((s, r) => s + (r.discardsFail || 0), 0),
+    finish_attempts: results.reduce((s, r) => s + (r.finishAttempts || 0), 0),
+    finish_ok: results.reduce((s, r) => s + (r.finishOk || 0), 0),
+    finish_fail: results.reduce((s, r) => s + (r.finishFail || 0), 0),
+    declare_responses_ok: results.reduce((s, r) => s + (r.declareResponsesOk || 0), 0),
     avg_turns_per_table: Number((results.reduce((s, r) => s + (r.turns || 0), 0) / Math.max(1, results.length)).toFixed(1)),
     game_ms_p50: pct(50),
     game_ms_p95: pct(95),
@@ -1051,6 +1140,10 @@ function writeReports(results, meta) {
     picks_fail: summary.picks_fail,
     discards_ok: summary.discards_ok,
     discards_fail: summary.discards_fail,
+    finish_attempts: summary.finish_attempts,
+    finish_ok: summary.finish_ok,
+    finish_fail: summary.finish_fail,
+    declare_responses_ok: summary.declare_responses_ok,
     avg_turns_per_table: summary.avg_turns_per_table,
     elapsed_s: summary.elapsed_s,
     game_ms_p50: summary.game_ms_p50,
