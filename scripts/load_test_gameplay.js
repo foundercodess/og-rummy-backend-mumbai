@@ -133,6 +133,9 @@ function classifyRootCause(message, event = '') {
   if (m.includes('must pick') || m.includes('before discarding') || m.includes('no_card')) {
     return 'action_order';
   }
+  if (m.includes('no active declaration window') || m.includes('declaration window')) {
+    return 'declaration_window_race';
+  }
   if (m.includes('session is full')) return 'matchmaking_conflict';
   if (m.includes('insufficient') || m.includes('balance')) return 'wallet_balance';
   if (m.includes('timeout_no_result') || m.includes('forced_drop')) return 'game_timeout';
@@ -343,13 +346,84 @@ function connectClient(tokenRow, label) {
 }
 
 function groupsFromAck(ack) {
-  const groups = ack?.ack?.data?.groups
-    || ack?.ack?.data?.grouping?.groups
-    || [];
+  const groups = groupingFromAck(ack)?.groups || [];
   return (groups || []).map((g, idx) => ({
     group_id: g.group_id || idx + 1,
     cards: (g.cards || []).map((c) => (typeof c === 'string' ? c : c.card_uid)).filter(Boolean),
   })).filter((g) => g.cards.length > 0);
+}
+
+function groupingFromAck(ack) {
+  const data = ack?.ack?.data;
+  if (data?.grouping && typeof data.grouping === 'object') return data.grouping;
+  if (Array.isArray(data?.groups)) {
+    return {
+      groups: data.groups,
+      ungrouped_cards: data.ungrouped_cards || [],
+      summary: data.summary || {},
+    };
+  }
+  return null;
+}
+
+function cardUid(card) {
+  return typeof card === 'string' ? card : card?.card_uid;
+}
+
+function estimatedCardPoints(card) {
+  if (!card || typeof card === 'string') return 0;
+  if (
+    card.is_joker === true
+    || card.is_wild_joker === true
+    || card.is_printed_joker === true
+    || String(card.suit || '').toLowerCase().includes('joker')
+  ) {
+    return -1; // retain zero-point jokers
+  }
+  const explicit = Number(card.points ?? card.point_value ?? card.card_points);
+  if (Number.isFinite(explicit)) return explicit;
+  const rank = String(card.rank ?? card.value ?? '').toUpperCase();
+  if (rank === 'A' || rank === 'K' || rank === 'Q' || rank === 'J') return 10;
+  const numeric = Number(rank);
+  return Number.isFinite(numeric) ? Math.min(10, numeric) : 0;
+}
+
+function selectStrategicDiscard(ack, pickedUid) {
+  const grouping = groupingFromAck(ack);
+  if (!grouping) return { cardUid: pickedUid || null, reason: 'no_grouping_fallback' };
+
+  // Best-grouping output explicitly exposes cards outside valid melds. Discard
+  // the highest-cost one so the hand evolves instead of always throwing back
+  // the card just picked.
+  let candidates = Array.isArray(grouping.ungrouped_cards)
+    ? grouping.ungrouped_cards.filter((card) => cardUid(card))
+    : [];
+
+  if (!candidates.length) {
+    candidates = (grouping.groups || [])
+      .filter((group) => group?.is_valid_meld !== true)
+      .flatMap((group) => group?.cards || [])
+      .filter((card) => cardUid(card));
+  }
+
+  if (!candidates.length) {
+    return { cardUid: pickedUid || null, reason: 'no_ungrouped_fallback' };
+  }
+
+  candidates.sort((left, right) => {
+    const pointsDiff = estimatedCardPoints(right) - estimatedCardPoints(left);
+    if (pointsDiff !== 0) return pointsDiff;
+    // On equal cost, retain the newly picked card so hands change over time.
+    const leftPicked = cardUid(left) === pickedUid ? 1 : 0;
+    const rightPicked = cardUid(right) === pickedUid ? 1 : 0;
+    return leftPicked - rightPicked;
+  });
+
+  return {
+    cardUid: cardUid(candidates[0]),
+    reason: 'highest_point_ungrouped',
+    points: estimatedCardPoints(candidates[0]),
+  };
 }
 
 function finishPlanFromAck(ack) {
@@ -507,6 +581,7 @@ function attachAutoPlayer(seat, sessionId, shared) {
       const auto = await emitAck(socket, 'player:autogroup', { session_id: sessionId });
       let groups = groupsFromAck(auto);
       let finishPlan = finishPlanFromAck(auto);
+      let latestGroupingAck = auto;
       if (!groups.length && lastHandGroups.length) groups = lastHandGroups;
 
       let hasPicked = turnPayload?.has_picked === true || turnPayload?.turn?.has_picked === true;
@@ -526,6 +601,7 @@ function attachAutoPlayer(seat, sessionId, shared) {
             shared.picksOk += 1;
             pickedUid = pickAck.ack?.data?.picked_card?.card_uid || null;
             finishPlan = finishPlanFromAck(pickAck);
+            latestGroupingAck = pickAck;
             const afterPickGroups = groupsFromAck(pickAck);
             if (afterPickGroups.length) {
               groups = afterPickGroups;
@@ -604,10 +680,17 @@ function attachAutoPlayer(seat, sessionId, shared) {
         if (isBenignRaceError(finishAck.error) || shared.done) return;
       }
 
-      let discardUid = pickedUid;
+      const discardDecision = selectStrategicDiscard(latestGroupingAck, pickedUid);
+      let discardUid = discardDecision.cardUid;
+      shared.discardStrategies[discardDecision.reason] =
+        (shared.discardStrategies[discardDecision.reason] || 0) + 1;
       let allUids = cardUidsFromGroups(groups);
       if (!discardUid || !allUids.includes(discardUid)) {
-        discardUid = allUids[allUids.length - 1] || allUids[0] || null;
+        // The grouping response is authoritative, but retain a safe fallback if
+        // an older deployment omits ungrouped card metadata.
+        discardUid = pickedUid && allUids.includes(pickedUid)
+          ? pickedUid
+          : (allUids[allUids.length - 1] || allUids[0] || null);
       }
 
       for (let attempt = 1; attempt <= actionRetries; attempt += 1) {
@@ -722,7 +805,15 @@ function attachAutoPlayer(seat, sessionId, shared) {
     shared.declareEvents += 1;
   };
 
-  socket.on('game:declare:requested', async () => {
+  socket.on('game:declare:requested', async (payload = {}) => {
+    const pending = Array.isArray(payload.pending_user_ids)
+      ? payload.pending_user_ids.map(Number)
+      : null;
+    const declareBy = Number(payload.declare_by_user_id);
+    const shouldRespond = pending
+      ? pending.includes(Number(userId))
+      : (Number.isFinite(declareBy) ? declareBy === Number(userId) : payload.open_for_all === true);
+    if (!shouldRespond) return;
     await submitDeclareResponse('game:declare:requested');
   });
 
@@ -769,6 +860,7 @@ function emptyShared() {
     finishFail: 0,
     declareEvents: 0,
     declareResponsesOk: 0,
+    discardStrategies: {},
     errors: [],
     errorCounts: {},
     errorEvents: [],
@@ -923,6 +1015,7 @@ function buildTableResult({ ok, table, sessionId, startedAt, shared, error, stol
     finishFail: shared.finishFail,
     declareEvents: shared.declareEvents,
     declareResponsesOk: shared.declareResponsesOk,
+    discardStrategies: shared.discardStrategies,
     endReason: shared.endReason || (shared.result ? 'result' : 'unknown'),
     forcedDrop: Boolean(shared.forcedDrop),
     stolen: Boolean(stolen?.stolen),
@@ -983,6 +1076,7 @@ function writeReports(results, meta) {
     finish_fail: r.finishFail,
     declare_events: r.declareEvents,
     declare_responses_ok: r.declareResponsesOk,
+    discard_strategies: r.discardStrategies,
     seat_user_ids: r.seatUserIds,
     result: r.resultSummary,
     error: r.error,
@@ -1000,12 +1094,16 @@ function writeReports(results, meta) {
 
   const mergedErrors = {};
   const mergedRootCauses = {};
+  const mergedDiscardStrategies = {};
   for (const r of results) {
     for (const [k, v] of Object.entries(r.errorCounts || {})) {
       mergedErrors[k] = (mergedErrors[k] || 0) + v;
     }
     for (const [k, v] of Object.entries(r.rootCauseCounts || {})) {
       mergedRootCauses[k] = (mergedRootCauses[k] || 0) + v;
+    }
+    for (const [k, v] of Object.entries(r.discardStrategies || {})) {
+      mergedDiscardStrategies[k] = (mergedDiscardStrategies[k] || 0) + v;
     }
   }
 
@@ -1063,6 +1161,7 @@ function writeReports(results, meta) {
     finish_ok: results.reduce((s, r) => s + (r.finishOk || 0), 0),
     finish_fail: results.reduce((s, r) => s + (r.finishFail || 0), 0),
     declare_responses_ok: results.reduce((s, r) => s + (r.declareResponsesOk || 0), 0),
+    discard_strategies: mergedDiscardStrategies,
     avg_turns_per_table: Number((results.reduce((s, r) => s + (r.turns || 0), 0) / Math.max(1, results.length)).toFixed(1)),
     game_ms_p50: pct(50),
     game_ms_p95: pct(95),
@@ -1144,6 +1243,7 @@ function writeReports(results, meta) {
     finish_ok: summary.finish_ok,
     finish_fail: summary.finish_fail,
     declare_responses_ok: summary.declare_responses_ok,
+    discard_strategies: summary.discard_strategies,
     avg_turns_per_table: summary.avg_turns_per_table,
     elapsed_s: summary.elapsed_s,
     game_ms_p50: summary.game_ms_p50,
