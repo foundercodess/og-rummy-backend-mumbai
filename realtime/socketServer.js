@@ -2411,9 +2411,10 @@ function armDeclareDurableTimer(state) {
 }
 
 function persistDeclareState(state) {
-  if (!state?.sessionId) return;
-  ephemeralSessionState.saveDeclareSnapshot(state.sessionId, state).catch(() => {});
+  if (!state?.sessionId) return Promise.resolve(false);
+  const saved = ephemeralSessionState.saveDeclareSnapshot(state.sessionId, state);
   armDeclareDurableTimer(state);
+  return saved;
 }
 
 async function rebuildDeclareStateFromStore(sessionId, entry = null) {
@@ -11718,6 +11719,11 @@ function registerSocketServer(httpServer) {
       metadata: nextMetadata,
     });
 
+    // Make the open-stage snapshot visible before notifying sockets on other
+    // PM2/EC2 workers. Their responses may arrive immediately and must be able
+    // to rebuild the declaration state from Redis.
+    await persistDeclareState(state);
+
     io.to(sessionRoom(sessionId)).emit('game:declare:requested', {
       session_id: sessionId,
       server_time: new Date().toISOString(),
@@ -11750,8 +11756,6 @@ function registerSocketServer(httpServer) {
         errorGame(sessionId, `Failed to finalize declaration on timeout: ${err.message}`);
       });
     }, durationSeconds * 1000);
-
-    persistDeclareState(state);
 
     return {
       opened: true,
@@ -14140,7 +14144,11 @@ function registerSocketServer(httpServer) {
           throw new Error('Valid session_id is required');
         }
 
-        const state = activeDeclareBySession.get(sessionId);
+        // Declaration state is process-local, but the responding player's
+        // socket may live on another PM2/EC2 worker. Recover the shared Redis
+        // snapshot before treating this as a late/closed-window response.
+        const state = activeDeclareBySession.get(sessionId)
+          || await rebuildDeclareStateFromStore(sessionId);
         if (!state) {
           // Late / desynced submit: window already finalized (timeout or all players done).
           // Do not fail hard — return settled state so client can show result seamlessly.
