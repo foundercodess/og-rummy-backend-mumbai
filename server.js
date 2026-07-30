@@ -3,7 +3,11 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const { testConnection } = require('./db');
-const { registerSocketServer, getSocketRuntimeStats } = require('./realtime/socketServer');
+const {
+  registerSocketServer,
+  getSocketRuntimeStats,
+  getClusterSocketRuntimeStats,
+} = require('./realtime/socketServer');
 const { pingRedis } = require('./services/redis.service');
 const { pingKafka } = require('./services/kafka.service');
 const { startBotEngine } = require('./services/botEngine');
@@ -132,7 +136,7 @@ app.get('/health/details', async (req, res) => {
       : { ok: false, error: r.reason?.message }
   );
 
-  const sockets = io ? getSocketRuntimeStats(io) : null;
+  const sockets = io ? await getClusterSocketRuntimeStats(io) : null;
   res.json({
     status: 'ok',
     message: 'OG Rummy API is running on EC2, version 5',

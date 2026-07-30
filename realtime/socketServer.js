@@ -11862,6 +11862,10 @@ function registerSocketServer(httpServer) {
 
   io.on('connection', (socket) => {
     instrumentSocket(socket);
+    // Socket.IO Redis adapter includes socket.data in cluster-wide
+    // fetchSockets() results. Keep only the non-sensitive user identifier.
+    socket.data = socket.data || {};
+    socket.data.user_id = Number(socket.user.id);
     socketRegistry.addSocket(socket.user.id, socket.id);
     console.log(`[SOCKET] Connected uid=${socket.user.id} socketId=${socket.id}`);
     socket.emit('connection:ready', {
@@ -14831,9 +14835,54 @@ function getSocketRuntimeStats(io) {
   };
 }
 
+/**
+ * Cluster-wide socket snapshot for the detailed diagnostics endpoint.
+ * This queries every Socket.IO Redis-adapter worker, so do not use it as the
+ * high-frequency ALB health check.
+ */
+async function getClusterSocketRuntimeStats(io) {
+  const local = getSocketRuntimeStats(io);
+  if (!io || typeof io.fetchSockets !== 'function') {
+    return {
+      scope: 'local',
+      connected: local.connected,
+      users: local.registry?.users ?? null,
+      local,
+    };
+  }
+
+  try {
+    const sockets = await io.fetchSockets();
+    const userIds = new Set();
+    for (const socket of sockets) {
+      const userId = Number(
+        socket?.data?.user_id
+        ?? socket?.handshake?.auth?.user_id
+        ?? NaN,
+      );
+      if (!Number.isNaN(userId)) userIds.add(userId);
+    }
+    return {
+      scope: 'cluster',
+      connected: sockets.length,
+      users: userIds.size,
+      local,
+    };
+  } catch (err) {
+    return {
+      scope: 'local_fallback',
+      connected: local.connected,
+      users: local.registry?.users ?? null,
+      error: err.message,
+      local,
+    };
+  }
+}
+
 module.exports = {
   registerSocketServer,
   getSocketRuntimeStats,
+  getClusterSocketRuntimeStats,
   tryBuildBotFinishPlan,
   tryBuildFinishPlan,
   __testHooks: {

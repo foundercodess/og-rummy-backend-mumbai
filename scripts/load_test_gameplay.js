@@ -38,6 +38,8 @@
  *   --action-retries     Retries for pick/discard on transient errors (default 5)
  *   --create-retries     Retries for POST /sessions on timeout (default 4)
  *   --mode               dual (2 scripts) | vs-bot (1 script + server bot fill)
+ *   --target-active-tables  Ramp/hold mode: simultaneous active table target
+ *   --hold-seconds       Hold full target before allowing finishes (default 120)
  *   --report-dir         Directory for JSONL + summary (default ./load_reports)
  *   --report-prefix      Filename prefix (default gameplay)
  */
@@ -71,11 +73,28 @@ const pickDelayMs = Math.max(0, Number(arg('pick-delay-ms', '250')) || 0);
 const discardDelayMs = Math.max(0, Number(arg('discard-delay-ms', '350')) || 0);
 const actionRetries = Math.max(1, Number(arg('action-retries', '5')) || 5);
 const createRetries = Math.max(1, Number(arg('create-retries', '4')) || 4);
+const targetActiveTables = Math.max(0, Number(arg('target-active-tables', '0')) || 0);
+const holdSeconds = Math.max(0, Number(arg('hold-seconds', '120')) || 0);
 const gameId = Number(arg('game-id', process.env.LOAD_TEST_GAME_ID));
 const contestId = Number(arg('contest-id', process.env.LOAD_TEST_CONTEST_ID));
 const mode = String(arg('mode', 'dual')).toLowerCase(); // dual | vs-bot
 const reportDir = path.resolve(arg('report-dir', './load_reports'));
 const reportPrefix = String(arg('report-prefix', 'gameplay') || 'gameplay').replace(/[^\w.-]+/g, '_');
+const loadRuntime = {
+  openSockets: 0,
+  peakOpenSockets: 0,
+  activeSessions: 0,
+  peakActiveSessions: 0,
+  sessionsStarted: 0,
+  tablesCompleted: 0,
+};
+const rampControl = {
+  enabled: targetActiveTables > 0,
+  targetActiveTables,
+  releaseFinishes: targetActiveTables <= 0,
+  targetReachedAt: null,
+  holdSeconds,
+};
 
 if (!tokensPath || !fs.existsSync(tokensPath)) {
   console.error('Missing --tokens <load_tokens.jsonl>');
@@ -87,6 +106,10 @@ if (!Number.isFinite(gameId) || gameId <= 0 || !Number.isFinite(contestId) || co
 }
 if (maxPlayers !== 2) {
   console.error('Only --max-players 2 is supported in this script');
+  process.exit(1);
+}
+if (targetActiveTables > tables) {
+  console.error('--target-active-tables cannot be greater than --tables');
   process.exit(1);
 }
 
@@ -332,6 +355,20 @@ function connectClient(tokenRow, label) {
     });
 
     socket.on('connection:ready', (data) => {
+      if (socket.__loadCounted !== true) {
+        socket.__loadCounted = true;
+        loadRuntime.openSockets += 1;
+        loadRuntime.peakOpenSockets = Math.max(
+          loadRuntime.peakOpenSockets,
+          loadRuntime.openSockets,
+        );
+        socket.once('disconnect', () => {
+          if (socket.__loadCounted === true) {
+            socket.__loadCounted = false;
+            loadRuntime.openSockets = Math.max(0, loadRuntime.openSockets - 1);
+          }
+        });
+      }
       finish({
         ok: true,
         error: null,
@@ -653,7 +690,11 @@ function attachAutoPlayer(seat, sessionId, shared) {
 
       // The server computes a valid finish plan after a pick. Use it instead of
       // endlessly discarding so scripted seats can naturally complete games.
-      if (finishPlan) {
+      if (finishPlan && !rampControl.releaseFinishes) {
+        // During ramp/hold, keep the table alive. The same hand continues
+        // playing and can produce another finish plan after release.
+        shared.finishSuppressed += 1;
+      } else if (finishPlan) {
         const finishGroups = normalizeGroups(finishPlan.submittedGroups);
         lastHandGroups = finishGroups;
         shared.finishAttempts += 1;
@@ -858,6 +899,7 @@ function emptyShared() {
     finishAttempts: 0,
     finishOk: 0,
     finishFail: 0,
+    finishSuppressed: 0,
     declareEvents: 0,
     declareResponsesOk: 0,
     discardStrategies: {},
@@ -871,7 +913,7 @@ function emptyShared() {
   };
 }
 
-async function runOneTable(tableIndex, seatsTokens) {
+async function runOneTable(tableIndex, seatsTokens, lifecycle = {}) {
   const startedAt = Date.now();
   const shared = emptyShared();
 
@@ -924,6 +966,12 @@ async function runOneTable(tableIndex, seatsTokens) {
 
   const sessionId = created.sessionId;
   shared.sessionId = sessionId;
+  loadRuntime.sessionsStarted += 1;
+  loadRuntime.activeSessions += 1;
+  loadRuntime.peakActiveSessions = Math.max(
+    loadRuntime.peakActiveSessions,
+    loadRuntime.activeSessions,
+  );
 
   const controllers = clients.map((c) => attachAutoPlayer(c, sessionId, shared));
 
@@ -949,8 +997,23 @@ async function runOneTable(tableIndex, seatsTokens) {
     }
   }
 
+  if (typeof lifecycle.onStarted === 'function') {
+    lifecycle.onStarted({
+      table: tableIndex,
+      sessionId,
+      sockets: clients.length,
+    });
+  }
+
   // Play full game until result or max-game-seconds (bot-like loop).
-  const deadline = startedAt + maxGameSeconds * 1000;
+  if (rampControl.enabled) {
+    while (!shared.done && !rampControl.releaseFinishes) {
+      await sleep(250);
+    }
+  }
+  const deadline = rampControl.enabled
+    ? Date.now() + maxGameSeconds * 1000
+    : startedAt + maxGameSeconds * 1000;
   while (!shared.done && Date.now() < deadline) {
     await sleep(500);
   }
@@ -987,6 +1050,7 @@ async function runOneTable(tableIndex, seatsTokens) {
   }
 
   const stolen = detectStolen(shared, shared.seatUserIds);
+  loadRuntime.activeSessions = Math.max(0, loadRuntime.activeSessions - 1);
   return buildTableResult({
     ok: Boolean(shared.result) && !stolen.stolen,
     table: tableIndex,
@@ -1013,6 +1077,7 @@ function buildTableResult({ ok, table, sessionId, startedAt, shared, error, stol
     finishAttempts: shared.finishAttempts,
     finishOk: shared.finishOk,
     finishFail: shared.finishFail,
+    finishSuppressed: shared.finishSuppressed,
     declareEvents: shared.declareEvents,
     declareResponsesOk: shared.declareResponsesOk,
     discardStrategies: shared.discardStrategies,
@@ -1038,10 +1103,96 @@ async function runPool(items, limit, worker) {
     while (idx < items.length) {
       const my = idx;
       idx += 1;
-      results[my] = await worker(items[my], my);
+      try {
+        results[my] = await worker(items[my], my);
+      } finally {
+        loadRuntime.tablesCompleted += 1;
+      }
     }
   }
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => runner()));
+  return results;
+}
+
+/**
+ * Admission concurrency limits only connection/session startup. Once a table
+ * starts, its gameplay promise remains alive while the starter admits another
+ * table. Finishes stay suppressed until the full target has been held.
+ */
+async function runRampHold(items, limit) {
+  const targetItems = items.slice(0, targetActiveTables);
+  const results = new Array(targetItems.length);
+  const completions = [];
+  let idx = 0;
+
+  async function starter() {
+    while (idx < targetItems.length) {
+      const my = idx;
+      idx += 1;
+
+      let signalStarted;
+      let signaled = false;
+      const started = new Promise((resolve) => {
+        signalStarted = () => {
+          if (signaled) return;
+          signaled = true;
+          resolve();
+        };
+      });
+
+      const completion = runOneTable(my + 1, targetItems[my], {
+        onStarted: signalStarted,
+      })
+        .then((result) => {
+          results[my] = result;
+          return result;
+        })
+        .finally(() => {
+          // Failed admission must release this starter slot too.
+          signalStarted();
+          loadRuntime.tablesCompleted += 1;
+        });
+      completions.push(completion);
+
+      // Admit the next table as soon as this one is ready; do not wait for its
+      // entire game to finish.
+      await started;
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(limit, targetItems.length) },
+      () => starter(),
+    ),
+  );
+
+  const reached = loadRuntime.activeSessions >= targetActiveTables;
+  if (reached) {
+    rampControl.targetReachedAt = new Date().toISOString();
+    console.log('[LOAD_GAMEPLAY] target active tables reached', {
+      target_active_tables: targetActiveTables,
+      active_sessions: loadRuntime.activeSessions,
+      open_sockets: loadRuntime.openSockets,
+      hold_seconds: holdSeconds,
+    });
+    if (holdSeconds > 0) await sleep(holdSeconds * 1000);
+  } else {
+    console.warn('[LOAD_GAMEPLAY] target active tables not reached', {
+      target_active_tables: targetActiveTables,
+      active_sessions: loadRuntime.activeSessions,
+      sessions_started: loadRuntime.sessionsStarted,
+      admission_failures: targetActiveTables - loadRuntime.sessionsStarted,
+    });
+  }
+
+  rampControl.releaseFinishes = true;
+  console.log('[LOAD_GAMEPLAY] hold complete; natural finishes enabled', {
+    active_sessions: loadRuntime.activeSessions,
+    open_sockets: loadRuntime.openSockets,
+  });
+
+  await Promise.all(completions);
   return results;
 }
 
@@ -1074,6 +1225,7 @@ function writeReports(results, meta) {
     finish_attempts: r.finishAttempts,
     finish_ok: r.finishOk,
     finish_fail: r.finishFail,
+    finish_suppressed_during_hold: r.finishSuppressed,
     declare_events: r.declareEvents,
     declare_responses_ok: r.declareResponsesOk,
     discard_strategies: r.discardStrategies,
@@ -1160,6 +1312,7 @@ function writeReports(results, meta) {
     finish_attempts: results.reduce((s, r) => s + (r.finishAttempts || 0), 0),
     finish_ok: results.reduce((s, r) => s + (r.finishOk || 0), 0),
     finish_fail: results.reduce((s, r) => s + (r.finishFail || 0), 0),
+    finish_suppressed_during_hold: results.reduce((s, r) => s + (r.finishSuppressed || 0), 0),
     declare_responses_ok: results.reduce((s, r) => s + (r.declareResponsesOk || 0), 0),
     discard_strategies: mergedDiscardStrategies,
     avg_turns_per_table: Number((results.reduce((s, r) => s + (r.turns || 0), 0) / Math.max(1, results.length)).toFixed(1)),
@@ -1180,10 +1333,11 @@ function writeReports(results, meta) {
 
 (async () => {
   const seatsPerTable = mode === 'vs-bot' ? 1 : 2;
-  const needTokens = tables * seatsPerTable;
+  const effectiveTables = rampControl.enabled ? targetActiveTables : tables;
+  const needTokens = effectiveTables * seatsPerTable;
   const tokens = loadTokens(tokensPath, needTokens);
   if (tokens.length < needTokens) {
-    console.error(`Need ${needTokens} tokens for ${tables} tables (mode=${mode}), found ${tokens.length}`);
+    console.error(`Need ${needTokens} tokens for ${effectiveTables} tables (mode=${mode}), found ${tokens.length}`);
     process.exit(1);
   }
 
@@ -1199,21 +1353,40 @@ function writeReports(results, meta) {
     discardDelayMs,
     actionRetries,
     createRetries,
+    rampHoldMode: rampControl.enabled,
+    targetActiveTables: rampControl.enabled ? targetActiveTables : null,
+    holdSeconds: rampControl.enabled ? holdSeconds : null,
     reportDir,
     reportPrefix,
     tokens: tokens.length,
   });
 
   const tableJobs = [];
-  for (let t = 0; t < tables; t += 1) {
+  for (let t = 0; t < effectiveTables; t += 1) {
     const offset = t * seatsPerTable;
     tableJobs.push(tokens.slice(offset, offset + seatsPerTable));
   }
 
   const t0 = Date.now();
-  const results = await runPool(tableJobs, concurrency, (seatTokens, index) =>
-    runOneTable(index + 1, seatTokens),
-  );
+  const progressTimer = setInterval(() => {
+    console.log('[LOAD_GAMEPLAY] progress', {
+      sessions_started: loadRuntime.sessionsStarted,
+      active_sessions: loadRuntime.activeSessions,
+      peak_active_sessions: loadRuntime.peakActiveSessions,
+      open_sockets: loadRuntime.openSockets,
+      peak_open_sockets: loadRuntime.peakOpenSockets,
+      tables_completed: loadRuntime.tablesCompleted,
+      target_tables: effectiveTables,
+    });
+  }, 10000);
+  progressTimer.unref?.();
+
+  const results = rampControl.enabled
+    ? await runRampHold(tableJobs, concurrency)
+    : await runPool(tableJobs, concurrency, (seatTokens, index) =>
+      runOneTable(index + 1, seatTokens),
+    );
+  clearInterval(progressTimer);
 
   const { jsonlPath, summaryPath, summary } = writeReports(results, {
     url: baseUrl,
@@ -1222,9 +1395,15 @@ function writeReports(results, meta) {
     contest_id: contestId,
     concurrency,
     max_game_seconds: maxGameSeconds,
+    ramp_hold_mode: rampControl.enabled,
+    target_active_tables: rampControl.enabled ? targetActiveTables : null,
+    hold_seconds: rampControl.enabled ? holdSeconds : null,
+    target_reached_at: rampControl.targetReachedAt,
     elapsed_s: Number(((Date.now() - t0) / 1000).toFixed(1)),
     started_at: new Date(t0).toISOString(),
     finished_at: new Date().toISOString(),
+    peak_active_sessions: loadRuntime.peakActiveSessions,
+    peak_open_sockets: loadRuntime.peakOpenSockets,
   });
 
   console.log('[LOAD_GAMEPLAY] summary', {
@@ -1242,6 +1421,7 @@ function writeReports(results, meta) {
     finish_attempts: summary.finish_attempts,
     finish_ok: summary.finish_ok,
     finish_fail: summary.finish_fail,
+    finish_suppressed_during_hold: summary.finish_suppressed_during_hold,
     declare_responses_ok: summary.declare_responses_ok,
     discard_strategies: summary.discard_strategies,
     avg_turns_per_table: summary.avg_turns_per_table,
@@ -1253,11 +1433,13 @@ function writeReports(results, meta) {
     top_errors: summary.top_errors,
     fail_samples: summary.fail_samples,
     stolen_samples: summary.stolen_samples,
+    peak_active_sessions: summary.peak_active_sessions,
+    peak_open_sockets: summary.peak_open_sockets,
     report_jsonl: jsonlPath,
     report_summary: summaryPath,
   });
 
-  process.exit(summary.failed > tables * 0.2 ? 2 : 0);
+  process.exit(summary.failed > effectiveTables * 0.2 ? 2 : 0);
 })().catch((err) => {
   console.error(err);
   process.exit(1);
