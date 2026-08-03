@@ -98,6 +98,16 @@ async function invalidate(sessionId) {
   await cacheDel(rowKey(sessionId), playersKey(sessionId));
 }
 
+/**
+ * Drop only the session-row cache. Use after metadata/turn/status updates that
+ * do not change game_session_players — keeps players cache warm on pick/discard.
+ */
+async function invalidateSessionRow(sessionId) {
+  if (!isEnabled() || sessionId == null) return;
+  stats.invalidations += 1;
+  await cacheDel(rowKey(sessionId));
+}
+
 /** Invalidate many sessions (e.g. bulk cron cancels). */
 async function invalidateMany(sessionIds = []) {
   if (!isEnabled() || !Array.isArray(sessionIds) || sessionIds.length === 0) return;
@@ -156,6 +166,7 @@ module.exports = {
   getPlayers,
   setPlayers,
   invalidate,
+  invalidateSessionRow,
   invalidateMany,
   getStats,
 };

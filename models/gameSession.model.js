@@ -409,7 +409,9 @@ async function updateSessionStatus(sessionId, status, fields = {}) {
 
     const nextLive = liveSessionState.applyStatusUpdate(base, status, fields);
     await liveSessionState.set(sessionId, nextLive);
-    if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
+    // Status/turn/metadata updates do not change the players roster — keep
+    // sess:players:* warm so pick/discard avoid a PG JOIN every move.
+    if (sessionCache.isEnabled()) await sessionCache.invalidateSessionRow(sessionId);
 
     const terminal = status === 'completed' || status === 'cancelled';
     const awaitPg = liveSessionState.mustAwaitPostgres(status, fields);
@@ -460,7 +462,7 @@ async function updateSessionStatus(sessionId, status, fields = {}) {
 
   // ── Classic path (LIVE disabled) ───────────────────────────────────────────
   const row = await persistSessionStatusToPostgres(sessionId, status, fields);
-  if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
+  if (sessionCache.isEnabled()) await sessionCache.invalidateSessionRow(sessionId);
   return row;
 }
 

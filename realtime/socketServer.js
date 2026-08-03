@@ -2738,7 +2738,9 @@ async function maybeScheduleAutoDropAction(io, sessionId, turn) {
   const turnUserId = Number(turn?.user_id);
   const turnId = Number(turn?.turn_id);
   if (Number.isNaN(sessionId) || Number.isNaN(turnUserId) || Number.isNaN(turnId)) return;
-  const session = await gameplayService.getSessionState(sessionId);
+  // Same fields as before (status / turn / players / auto_drop flags) — skip
+  // events + game/contest joins that were loaded on every discard for no reason.
+  const session = await gameplayService.loadTurnActionSession(sessionId);
   if (!session || session.status !== 'active') return;
   if (Number(session.current_turn_user_id) !== turnUserId) return;
   if (activeDeclareBySession.has(sessionId)) return;
@@ -12559,7 +12561,8 @@ function registerSocketServer(httpServer) {
         const requestedPosition = normalizeCardPosition(requestedPositionRaw);
 
         const source = resolvePickSource(payload.source);
-        const session = await gameplayService.getSessionState(sessionId, null, TURN_ACTION_SESSION_OPTS);
+        // Lean load: same validation fields; ACK payload built below unchanged.
+        const session = await gameplayService.loadTurnActionSession(sessionId);
         if (!session) {
           throw new Error('Session not found');
         }
@@ -12801,9 +12804,9 @@ function registerSocketServer(httpServer) {
             ...buildGroupingResponseData(grouping),
           },
         };
-        await turnActionIdempotency.storeAck(pickResultKey, { ...pickAck, idempotent_replay: true });
-        // ACK the picker first — room fan-out must not add latency to their hand UI.
+        // ACK first with the exact client payload; persist idempotent copy before unlock.
         callback(pickAck);
+        await turnActionIdempotency.storeAck(pickResultKey, { ...pickAck, idempotent_replay: true });
 
         if (reshufflePayload) {
           emitDeckReshuffled(io, sessionId, reshufflePayload);
@@ -12851,7 +12854,7 @@ function registerSocketServer(httpServer) {
           throw new Error('card_uid is required');
         }
 
-        const session = await gameplayService.getSessionState(sessionId, null, TURN_ACTION_SESSION_OPTS);
+        const session = await gameplayService.loadTurnActionSession(sessionId);
         if (!session) {
           throw new Error('Session not found');
         }
@@ -13013,8 +13016,9 @@ function registerSocketServer(httpServer) {
             ...buildGroupingResponseData(grouping),
           },
         };
-        await turnActionIdempotency.storeAck(discardResultKey, { ...discardAck, idempotent_replay: true });
+        // ACK first with the exact client payload; persist idempotent copy before unlock.
         callback(discardAck);
+        await turnActionIdempotency.storeAck(discardResultKey, { ...discardAck, idempotent_replay: true });
 
         logGame(sessionId, `Discard — uid=${socket.user.id} card=${discardedCard.card_uid} → next=uid:${nextTurnUser} timer=${turnTimerSeconds}s`);
 

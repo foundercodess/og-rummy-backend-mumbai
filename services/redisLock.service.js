@@ -80,6 +80,10 @@ function pregameLockKey(sessionId) {
     return `lock:pregame:session:${sessionId}`;
 }
 
+/** Serializes seat assignment across workers for the same waiting table. */
+function joinSessionLockKey(sessionId) {
+    return `lock:join:session:${sessionId}`;
+}
 
 function dealEmitKey(sessionId, sequence) {
     return `idem:deal:session:${sessionId}:seq:${sequence}`;
@@ -92,5 +96,6 @@ module.exports = {
     claimEventIdempotency,
     releaseEventIdempotency,
     pregameLockKey,
+    joinSessionLockKey,
     dealEmitKey,
 };

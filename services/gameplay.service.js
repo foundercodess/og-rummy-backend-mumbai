@@ -6,6 +6,7 @@ const { computeWalletDebitSplit } = require('./walletDebitSplit');
 const { buildPoolSessionPrizePoolFields } = require('./poolPrizePool.service');
 const sessionCache = require('./sessionCache.service');
 const liveSessionState = require('./liveSessionState.service');
+const redisLockService = require('./redisLock.service');
 const { pool, query } = require('../db');
 
 function createSessionCode() {
@@ -754,56 +755,107 @@ async function joinSession({ sessionIdOrCode, userId, skipBalanceCheck = false }
     }
   }
 
-  const joinedCount = await gameSessionModel.countJoinedPlayers(session.id);
-  if (joinedCount >= session.max_players) {
-    const error = new Error('Session is full');
-    error.code = 'SESSION_FULL';
-    throw error;
-  }
-
-  const existingSeats = await gameSessionModel.listSessionPlayers(session.id);
-  let seatNo = resolveFirstAvailableSeat({
-    players: existingSeats,
-    maxPlayers: session.max_players,
-  });
-  if (session.metadata?.continuation_source_session_id) {
-    const sourcePlayer = await gameSessionModel.findPlayer(session.metadata.continuation_source_session_id, userId);
-    const sourceSeatNo = Number(sourcePlayer?.seat_no);
-    const isSourceSeatAvailable = Number.isFinite(sourceSeatNo)
-      && sourceSeatNo >= 1
-      && sourceSeatNo <= Number(session.max_players)
-      && !(existingSeats || []).some((item) => Number(item?.seat_no) === sourceSeatNo);
-    if (isSourceSeatAvailable) {
-      seatNo = sourcePlayer.seat_no;
+  // Serialize seat assignment across ALB/workers. Without this, two joiners can
+  // pick the same seat_no and hit game_session_players_unique_seat (23505).
+  const joinLockKey = redisLockService.joinSessionLockKey(session.id);
+  const joinLockOwner = `join:${userId}:${process.pid}:${Date.now()}`;
+  let joinLockGot = await redisLockService.acquireLock(joinLockKey, joinLockOwner, 15);
+  if (!joinLockGot) {
+    for (let i = 0; i < 20 && !joinLockGot; i += 1) {
+      await new Promise((r) => setTimeout(r, 50));
+      joinLockGot = await redisLockService.acquireLock(joinLockKey, joinLockOwner, 15);
     }
   }
-  if (!Number.isFinite(Number(seatNo)) || Number(seatNo) < 1) {
-    const error = new Error('Session is full');
-    error.code = 'SESSION_FULL';
+  if (!joinLockGot) {
+    const error = new Error('Session join busy — retry shortly');
+    error.code = 'SESSION_JOIN_BUSY';
     throw error;
   }
 
-  await gameSessionModel.addPlayer({
-    sessionId: session.id,
-    userId,
-    seatNo,
-    metadata: { ready: false, host: false },
-  });
+  try {
+    // Re-check inside the lock (reconnect / double-submit races).
+    const lockedExistingPlayer = await gameSessionModel.findPlayer(session.id, userId);
+    if (lockedExistingPlayer) {
+      return getSessionState(session.id);
+    }
 
-  const nextJoinedCount = joinedCount + 1;
-  const nextStatus = nextJoinedCount === session.max_players ? 'ready' : session.status;
-  if (nextStatus !== session.status) {
-    await gameSessionModel.updateSessionStatus(session.id, nextStatus);
+    const joinedCount = await gameSessionModel.countJoinedPlayers(session.id);
+    if (joinedCount >= session.max_players) {
+      const error = new Error('Session is full');
+      error.code = 'SESSION_FULL';
+      throw error;
+    }
+
+    let seatNo = null;
+    let inserted = false;
+    for (let attempt = 0; attempt < 3 && !inserted; attempt += 1) {
+      const existingSeats = await gameSessionModel.listSessionPlayers(session.id);
+      seatNo = resolveFirstAvailableSeat({
+        players: existingSeats,
+        maxPlayers: session.max_players,
+      });
+      if (session.metadata?.continuation_source_session_id) {
+        const sourcePlayer = await gameSessionModel.findPlayer(
+          session.metadata.continuation_source_session_id,
+          userId
+        );
+        const sourceSeatNo = Number(sourcePlayer?.seat_no);
+        const isSourceSeatAvailable = Number.isFinite(sourceSeatNo)
+          && sourceSeatNo >= 1
+          && sourceSeatNo <= Number(session.max_players)
+          && !(existingSeats || []).some((item) => Number(item?.seat_no) === sourceSeatNo);
+        if (isSourceSeatAvailable) {
+          seatNo = sourcePlayer.seat_no;
+        }
+      }
+      if (!Number.isFinite(Number(seatNo)) || Number(seatNo) < 1) {
+        const error = new Error('Session is full');
+        error.code = 'SESSION_FULL';
+        throw error;
+      }
+
+      try {
+        await gameSessionModel.addPlayer({
+          sessionId: session.id,
+          userId,
+          seatNo,
+          metadata: { ready: false, host: false },
+        });
+        inserted = true;
+      } catch (err) {
+        if (err?.code !== '23505') throw err;
+        const uniqHint = `${err.constraint || ''} ${err.detail || ''}`.toLowerCase();
+        if (uniqHint.includes('unique_user') || uniqHint.includes('(game_session_id, user_id)')) {
+          // Another request already seated this user.
+          return getSessionState(session.id);
+        }
+        // Seat taken between list + insert (or unknown unique) — retry with a fresh seat map.
+        continue;
+      }
+    }
+    if (!inserted) {
+      const error = new Error('Session is full');
+      error.code = 'SESSION_FULL';
+      throw error;
+    }
+
+    const nextJoinedCount = joinedCount + 1;
+    const nextStatus = nextJoinedCount === session.max_players ? 'ready' : session.status;
+    if (nextStatus !== session.status) {
+      await gameSessionModel.updateSessionStatus(session.id, nextStatus);
+    }
+
+    await gameSessionModel.insertEvent({
+      sessionId: session.id,
+      userId,
+      eventType: 'player_joined',
+      payload: { seat_no: seatNo },
+    });
+
+    return getSessionState(session.id);
+  } finally {
+    await redisLockService.releaseLock(joinLockKey, joinLockOwner).catch(() => {});
   }
-
-  await gameSessionModel.insertEvent({
-    sessionId: session.id,
-    userId,
-    eventType: 'player_joined',
-    payload: { seat_no: seatNo },
-  });
-
-  return getSessionState(session.id);
 }
 
 async function markPlayerReady({ sessionId, userId, ready }) {
@@ -919,6 +971,30 @@ async function getSessionState(sessionIdOrCode, existingPlayers = null, options 
     ...prizePoolFields,
     ...gameInfoAndRules,
   });
+}
+
+/**
+ * Hot-path loader for pick/discard/auto-drop.
+ * Same session row + players needed for turn validation — skips events, contest,
+ * score, and prize-pool assembly that never appear in pick/discard ACKs.
+ */
+async function loadTurnActionSession(sessionId) {
+  const session = await gameSessionModel.findSessionById(sessionId);
+  if (!session) return null;
+  const rows = await gameSessionModel.listSessionPlayers(session.id);
+  const players = (rows || []).map((player) => ({
+    id: player.id,
+    user_id: player.user_id,
+    seat_no: player.seat_no,
+    status: player.status,
+    metadata: player.metadata || {},
+    name: player.name,
+    view_id: player.view_id,
+  }));
+  return {
+    ...session,
+    players,
+  };
 }
 
 async function getPendingRejoinSession(userId, options = {}) {
@@ -1526,6 +1602,7 @@ module.exports = {
   joinSession,
   markPlayerReady,
   getSessionState,
+  loadTurnActionSession,
   getPendingRejoinSession,
   resolveRejoinPendingMaxAgeMinutes,
   createOrJoinContinuationSession,
