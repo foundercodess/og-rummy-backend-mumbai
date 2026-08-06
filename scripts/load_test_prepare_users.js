@@ -44,6 +44,8 @@ const walletModel = require('../models/wallet.model');
 
 const { query } = require('../db');
 
+
+
 const count = Math.max(1, Number(arg('count', '100')) || 100);
 const outPath = path.resolve(arg('out', path.join(process.cwd(), 'load_tokens.jsonl')));
 const phonePrefix = String(arg('phone-prefix', process.env.LOAD_TEST_PHONE_PREFIX || '97000'));
