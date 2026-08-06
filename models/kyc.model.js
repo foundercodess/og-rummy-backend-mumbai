@@ -278,10 +278,10 @@ function formatForResponse(row) {
 async function adminUpdateStatusByUserId({ userId, status, rejectionNote = null }) {
   const result = await query(
     `UPDATE kyc
-     SET status = $2,
+     SET status = $2::kyc_status,
          rejection_note = $3,
          approved_at = CASE
-           WHEN $2 = 'approved' THEN COALESCE(approved_at, NOW())
+           WHEN $2::kyc_status = 'approved'::kyc_status THEN COALESCE(approved_at, NOW())
            ELSE NULL
          END,
          updated_at = NOW()
