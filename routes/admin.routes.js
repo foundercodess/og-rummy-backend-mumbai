@@ -61,6 +61,9 @@ router.patch('/support/add-cash-complaint/:complaintId/status', requireAdmin, ad
 router.get('/maintenance-mode', requireAdmin, adminController.getMaintenanceMode);
 router.patch('/maintenance-mode', requireAdmin, adminController.updateMaintenanceMode);
 
+router.get('/bot-injection', requireAdmin, adminController.getBotInjectionSettings);
+router.patch('/bot-injection', requireAdmin, adminController.updateBotInjectionSettings);
+
 // Admin: unified app settings (includes disabled records)
 router.get('/app-settings', requireAdmin, adminController.getAppSettings);
 router.get('/app-update', requireAdmin, adminController.getAppUpdateConfig);

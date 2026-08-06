@@ -18,6 +18,7 @@ const redisLockService = require('../services/redisLock.service');
 const durableTimer = require('../services/durableTimer.service');
 const ephemeralSessionState = require('../services/ephemeralSessionState.service');
 const botLeaseService = require('../services/botLease.service');
+const { isBotInjectionEnabled } = require('../services/botInjectionSettings.service');
 const {
   chooseBotDiscardCard,
   buildDiscardCandidateRanking,
@@ -159,12 +160,6 @@ const REMATCH_BOT_PHONE_PREFIX = String(process.env.BOT_PHONE_PREFIX || '98999')
 const REMATCH_BOT_NAME_PREFIX = String(process.env.BOT_NAME_PREFIX || 'RummyBot-');
 const ALPHANUMERIC = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 
-/** Same semantics as botEngine: BOT_ENGINE_ENABLED off => no new bot seats anywhere. */
-function isBotInjectionEnabled() {
-  const raw = process.env.BOT_ENGINE_ENABLED;
-  if (raw == null || raw === '') return false;
-  return ['1', 'true', 'yes', 'on'].includes(String(raw).trim().toLowerCase());
-}
 const declarationRuntime = {
   startWindow: null,
   scheduleBotResponses: null,
@@ -7717,7 +7712,7 @@ async function fillSessionWithBotsIfNeeded(sessionId) {
   if (!session || session.status !== 'waiting') return session;
   // Rematch / inter-deal fill must respect BOT_ENGINE_ENABLED (lobby scanner already does).
   if (!isBotInjectionEnabled()) {
-    logGame(session.id, 'Bot fill skipped — BOT_ENGINE_ENABLED is off');
+    logGame(session.id, 'Bot fill skipped — bot injection disabled');
     return session;
   }
   const players = Array.isArray(session.players) ? session.players : [];
@@ -8132,7 +8127,7 @@ async function runAutoRematchFromSource(io, sourceSessionId) {
       }
     }
   } else {
-    logGame(sourceSession.id, 'Rematch bot carry-forward skipped — BOT_ENGINE_ENABLED is off');
+    logGame(sourceSession.id, 'Rematch bot carry-forward skipped — bot injection disabled');
   }
 
   const liveTargetSession = await gameplayService.getSessionState(targetSession.id);

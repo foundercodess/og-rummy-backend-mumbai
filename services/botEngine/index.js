@@ -7,6 +7,7 @@ const redisLockService = require('../redisLock.service');
 const botLeaseService = require('../botLease.service');
 const { startProcessLeader } = require('../processLeader.service');
 const { startPregame } = require('../../realtime/pregameOrchestrator');
+const { isBotInjectionEnabled } = require('../botInjectionSettings.service');
 const RummyBotAdapter = require('./rummyBot.adapter');
 
 const DEFAULTS = {
@@ -112,6 +113,7 @@ async function ensureBotUser(index, config) {
 
 async function maybeInjectBotsInSession(io, session, config, adapters) {
   if (!session || session.status !== 'waiting') return;
+  if (!isBotInjectionEnabled()) return;
 
   const lockKey = `lock:bot-inject:session:${session.id}`;
   const lockOwner = `bot-engine:${process.pid}`;
@@ -215,17 +217,10 @@ function startBotEngine(io) {
   const config = buildConfig();
   const adapters = [new RummyBotAdapter()];
 
-  if (!config.enabled) {
-    console.log('[BOT] Engine disabled');
-    return {
-      stop: () => {},
-      config,
-    };
-  }
-
   let running = false;
 
   const tick = async () => {
+    if (!isBotInjectionEnabled()) return;
     if (running) return;
     running = true;
     try {
@@ -278,7 +273,8 @@ function startBotEngine(io) {
   });
 
   console.log(
-    `[BOT] Engine started enabled=true injectAfter=${config.injectAfterSeconds}s scanEvery=${config.scanEveryMs}ms leader-elected`
+    `[BOT] Engine started injectAfter=${config.injectAfterSeconds}s scanEvery=${config.scanEveryMs}ms ` +
+      'leader-elected (injection gated by admin bot-injection toggle)'
   );
 
   return {

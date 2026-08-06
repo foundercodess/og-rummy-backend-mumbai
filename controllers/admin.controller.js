@@ -759,6 +759,49 @@ async function updateMaintenanceMode(req, res) {
   }
 }
 
+async function getBotInjectionSettings(req, res) {
+  try {
+    const result = await adminService.getBotInjectionSettingsForAdmin();
+    return res.json({
+      success: true,
+      message: 'Bot injection settings fetched successfully',
+      ...result,
+    });
+  } catch (err) {
+    console.error('getBotInjectionSettings error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to fetch bot injection settings' });
+  }
+}
+
+async function updateBotInjectionSettings(req, res) {
+  try {
+    const { enabled } = req.body || {};
+
+    const result = await adminService.updateBotInjectionSettingsForAdmin({
+      enabled,
+      updatedBy: req.auth?.userId || null,
+    });
+
+    const effective = result?.bot_injection?.effective_enabled === true;
+    return res.json({
+      success: true,
+      message: effective
+        ? 'Bot injection enabled — new bot seats may be added to waiting tables'
+        : 'Bot injection disabled — no new bot seats will be added (active games unchanged)',
+      ...result,
+    });
+  } catch (err) {
+    console.error('updateBotInjectionSettings error:', err);
+    if (err.code === 'INVALID_BOT_INJECTION_ENABLED') {
+      return res.status(400).json({ success: false, message: 'enabled must be true or false' });
+    }
+    if (err.code === 'INVALID_UPDATED_BY_ADMIN_ID') {
+      return res.status(400).json({ success: false, message: 'updated_by admin id must be a valid positive integer' });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to update bot injection settings' });
+  }
+}
+
 async function getAppSettings(req, res) {
   try {
     const result = await adminService.getAppSettingsForAdmin();
@@ -1498,6 +1541,7 @@ module.exports = {
   listAppUpdateVersions,
   getAppSettings,
   getMaintenanceMode,
+  getBotInjectionSettings,
   getGameHistoryDetails,
   listGameTelemetry,
   getGameTelemetrySessionReport,
@@ -1516,6 +1560,7 @@ module.exports = {
   updateAvatarActive,
   updateFaqActive,
   updateMaintenanceMode,
+  updateBotInjectionSettings,
   updateSupport,
   listGamesHistory,
   triggerStaleSessionCleanup,

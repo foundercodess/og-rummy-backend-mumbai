@@ -19,6 +19,7 @@ const {
   setSocketStatsProvider,
   getLastEventLoopLagMs,
 } = require('./realtime/runtimeObservability');
+const { startBotInjectionSettingsPoller } = require('./services/botInjectionSettings.service');
 const durableTimer = require('./services/durableTimer.service');
 
 const app = express();
@@ -163,6 +164,7 @@ app.get('/', (req, res) => {
 const io = registerSocketServer(server);
 setSocketStatsProvider(() => getSocketRuntimeStats(io));
 startRuntimeObservability();
+startBotInjectionSettingsPoller();
 startBotEngine(io);
 startStaleSessionCleanupCron();
 startWithdrawalPayoutSyncCron();
