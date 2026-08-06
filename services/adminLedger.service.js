@@ -182,7 +182,8 @@ async function getUserCounts() {
        COUNT(*)::int AS total_users,
        COUNT(*) FILTER (WHERE active IS DISTINCT FROM false)::int AS active_users,
        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS newly_onboarded_7d
-     FROM users`
+     FROM users
+     WHERE COALESCE(is_bot, false) = false`
   );
   const row = res.rows[0] || {};
   return {

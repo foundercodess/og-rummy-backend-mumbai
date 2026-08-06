@@ -81,6 +81,10 @@ async function ensureBotUser(index, config) {
   const phone = buildBotPhone(index, config.phonePrefix);
   const existing = await userModel.findByPhone(phone);
   if (existing) {
+    if (existing.is_bot !== true) {
+      await userModel.markAsBot(existing.id);
+    }
+
     const shouldUpdateName = shouldRefreshBotName(existing.name, config);
     const shouldUpdateAvatar = !existing.avatar || String(existing.avatar).trim() === '';
 
@@ -102,6 +106,7 @@ async function ensureBotUser(index, config) {
   const randomName = generateRandomBotName();
   const randomAvatar = await avatarModel.getRandomAvatarUrl();
   await userModel.verifyOtpAndMarkVerified(phone, randomName, null, randomAvatar);
+  await userModel.markAsBot(created.id);
   return userModel.findByPhone(phone);
 }
 

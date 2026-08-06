@@ -1,5 +1,8 @@
 const { query } = require('../db');
 
+/** SQL fragment: only human accounts (admin lists / dashboard user counts). */
+const HUMAN_USERS_WHERE = 'COALESCE(u.is_bot, false) = false';
+
 async function findById(id) {
   const result = await query('SELECT * FROM users WHERE id = $1', [id]);
   return result.rows[0] || null;
@@ -21,7 +24,9 @@ async function getAllPaginated({ page = 1, limit = 20, last7days = false, staleA
   const staleHours = Number.isInteger(Number(staleAfterHours)) && Number(staleAfterHours) > 0
     ? Number(staleAfterHours)
     : 2;
-  const condition = last7days ? `WHERE u.created_at >= NOW() - INTERVAL '7 days'` : '';
+  const condition = last7days
+    ? `WHERE ${HUMAN_USERS_WHERE} AND u.created_at >= NOW() - INTERVAL '7 days'`
+    : `WHERE ${HUMAN_USERS_WHERE}`;
 
   const countResult = await query(`SELECT COUNT(*) FROM users u ${condition}`);
   const total = parseInt(countResult.rows[0].count, 10);
@@ -179,7 +184,20 @@ async function updateActiveStatus(userId, active) {
   return result.rows[0] || null;
 }
 
+async function markAsBot(userId) {
+  const result = await query(
+    `UPDATE users
+     SET is_bot = true,
+         updated_at = NOW()
+     WHERE id = $1
+     RETURNING id`,
+    [userId]
+  );
+  return result.rows[0] || null;
+}
+
 module.exports = {
+  HUMAN_USERS_WHERE,
   findById,
   findByViewId,
   getAll,
@@ -191,4 +209,5 @@ module.exports = {
   create,
   updateProfile,
   updateActiveStatus,
+  markAsBot,
 };
