@@ -12791,7 +12791,7 @@ function registerSocketServer(httpServer) {
           },
         }).catch(() => {});
 
-        // Human layout finish hint (UX): after persist, small candidate budget. Rules unchanged.
+        // Human finish hint stays on ACK (Flutter finish suggestion). Keep scan budget small.
         if (!autoBestGroup) {
           finishPlan = tryBuildFinishPlanFromSubmittedGroups(playerDistribution.cards, wildJoker, {
             submittedGroups: updatedPickGroups,
@@ -12818,7 +12818,6 @@ function registerSocketServer(httpServer) {
             ...buildGroupingResponseData(grouping),
           },
         };
-        // ACK first with the exact client payload; persist idempotent copy before unlock.
         callback(pickAck);
         await turnActionIdempotency.storeAck(pickResultKey, { ...pickAck, idempotent_replay: true });
 
@@ -14030,7 +14029,7 @@ function registerSocketServer(httpServer) {
           throw new Error('card_uid is required for finish');
         }
 
-        const session = await gameplayService.getSessionState(sessionId);
+        const session = await gameplayService.loadTurnActionSession(sessionId);
         if (!session) {
           throw new Error('Session not found');
         }
@@ -14092,17 +14091,19 @@ function registerSocketServer(httpServer) {
         // Validity is evaluated when the finisher submits in the declarer-only
         // declare window (`player:declare:response`). Invalid hands must still
         // be allowed to finish so wrong-show / pack rules can apply.
-        logGame(
-          sessionId,
-          'Finish grouping classification',
-          (preview?.groups || []).map((group) => ({
-            card_uids: (group?.cards || []).map((card) => card?.card_uid),
-            card_ids: (group?.cards || []).map((card) => card?.card_id),
-            type: group?.type,
-            points: group?.group_points,
-            is_valid_meld: group?.is_valid_meld,
-          }))
-        );
+        if (BOT_FINISH_DEBUG_LOG_ENABLED) {
+          logGame(
+            sessionId,
+            'Finish grouping classification',
+            (preview?.groups || []).map((group) => ({
+              card_uids: (group?.cards || []).map((card) => card?.card_uid),
+              card_ids: (group?.cards || []).map((card) => card?.card_id),
+              type: group?.type,
+              points: group?.group_points,
+              is_valid_meld: group?.is_valid_meld,
+            }))
+          );
+        }
 
         const playerIndex = distribution.players.findIndex((pd) => pd.user_id === socket.user.id);
         const updatedPlayerDistribution = {
@@ -14174,7 +14175,7 @@ function registerSocketServer(httpServer) {
         if (!state) {
           // Late / desynced submit: window already finalized (timeout or all players done).
           // Do not fail hard — return settled state so client can show result seamlessly.
-          const settled = await gameplayService.getSessionState(sessionId);
+          const settled = await gameplayService.loadTurnActionSession(sessionId);
           const settledResult = settled?.metadata?.result || null;
           const declarationMeta = settled?.metadata?.declaration || null;
           if (settledResult || declarationMeta?.finalized_at || settled?.status === 'completed' || settled?.status === 'ready') {
@@ -14197,7 +14198,7 @@ function registerSocketServer(httpServer) {
           throw new Error('No active declaration window');
         }
 
-        const session = await gameplayService.getSessionState(sessionId);
+        const session = await gameplayService.loadTurnActionSession(sessionId);
         if (!session) {
           throw new Error('Session not found');
         }
@@ -14734,10 +14735,8 @@ function registerSocketServer(httpServer) {
             pending_count: openResult?.pending_count ?? pendingCount,
           });
           scheduleBotDeclarationResponses(sessionId);
-          if ((openResult?.pending_count || 0) === 0) {
-            logGame(sessionId, 'Declarer submitted and no pending players remain — finalizing declaration immediately');
-            await finalizeDeclarationWindow(sessionId, 'all_submitted');
-          }
+          const shouldFinalizeNow = (openResult?.pending_count || 0) === 0;
+          // ACK before settlement — finalize can take seconds under concurrent finishes.
           callback({
             success: true,
             data: {
@@ -14749,6 +14748,14 @@ function registerSocketServer(httpServer) {
               ...buildGroupingResponseData(preview),
             },
           });
+          if (shouldFinalizeNow) {
+            logGame(sessionId, 'Declarer submitted and no pending players remain — finalizing declaration async');
+            setImmediate(() => {
+              finalizeDeclarationWindow(sessionId, 'all_submitted').catch((err) => {
+                errorGame(sessionId, `Async declaration finalize failed: ${err.message}`);
+              });
+            });
+          }
           return;
         }
 
@@ -14764,11 +14771,7 @@ function registerSocketServer(httpServer) {
           distribution,
         });
 
-        if (pendingCount === 0) {
-          logGame(sessionId, `All players responded — finalizing declaration immediately`);
-          await finalizeDeclarationWindow(sessionId, 'all_submitted');
-        }
-
+        const shouldFinalize = pendingCount === 0;
         callback({
           success: true,
           data: {
@@ -14778,6 +14781,14 @@ function registerSocketServer(httpServer) {
             ...buildGroupingResponseData(preview),
           },
         });
+        if (shouldFinalize) {
+          logGame(sessionId, 'All players responded — finalizing declaration async');
+          setImmediate(() => {
+            finalizeDeclarationWindow(sessionId, 'all_submitted').catch((err) => {
+              errorGame(sessionId, `Async declaration finalize failed: ${err.message}`);
+            });
+          });
+        }
       } catch (err) {
         console.warn(`[GAME] player:declare:response failed uid=${socket.user.id}:`, err.message);
         callback({ success: false, message: err.message });

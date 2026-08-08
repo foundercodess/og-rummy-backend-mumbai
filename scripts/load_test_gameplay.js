@@ -4,40 +4,49 @@
 /**
  * Fully scripted gameplay stress test — no human players.
  *
- * Spawns N parallel 2-seat tables. Both seats are JWT clients from
+ * Spawns N parallel tables (2–6 seats). Seats are JWT clients from
  * load_tokens.jsonl that auto pick/discard until game:result (or timeout → drop).
  *
  * Writes detailed per-table JSONL + summary JSON (errors, stolen games, root causes).
  *
  * Prep (fund wallets for entry fees):
  *   node scripts/load_test_prepare_users.js --allow-remote-db --count 200 --fund 10000 --out load_tokens.jsonl
+ *   # 6P parallel run (separate users — do not reuse active 2P tokens):
+ *   node scripts/load_test_prepare_users.js --allow-remote-db --start 1001 --count 600 --fund 10000 --out load_tokens_6p.jsonl
  *
- * Example:
+ * Example (2P):
  *   node scripts/load_test_gameplay.js \
  *     --url http://og-rummy-alb-791534744.ap-south-1.elb.amazonaws.com \
  *     --tokens load_tokens.jsonl \
- *     --game-id 3 \
- *     --contest-id 198 \
- *     --tables 200 \
- *     --concurrency 80 \
+ *     --game-id 3 --contest-id 198 \
+ *     --tables 200 --max-players 2 \
+ *     --concurrency 80 --max-game-seconds 300 \
+ *     --report-dir ./load_reports --report-prefix alb_200
+ *
+ * Example (6P Points — contest 199 is 6-seat twin of 198):
+ *   node scripts/load_test_gameplay.js \
+ *     --url http://og-rummy-alb-791534744.ap-south-1.elb.amazonaws.com \
+ *     --tokens load_tokens_6p.jsonl \
+ *     --game-id 3 --contest-id 199 \
+ *     --tables 50 --max-players 6 \
+ *     --concurrency 20 --hold-seconds 6 --target-active-tables 50 \
  *     --max-game-seconds 300 \
- *     --report-dir ./load_reports \
- *     --report-prefix alb_200
+ *     --report-dir ./load_reports --report-prefix load_pts_6p_50
  *
  * Flags:
  *   --url                API base URL
  *   --tokens             JSONL from prepare script
  *   --game-id            Required
- *   --contest-id         Required
+ *   --contest-id         Required (use contests.6 id for --max-players 6)
  *   --tables             Parallel tables (default 10)
  *   --concurrency        Tables started at once (default 5). Keep ≤100 on current ALB.
- *   --max-players        Seats per table (default 2; only 2 supported)
+ *   --max-players        Seats per table (2–6, default 2)
  *   --max-game-seconds   Force drop if no result (default 300)
  *   --pick-delay-ms      Pause after turn start before pick (default 250)
  *   --discard-delay-ms   Pause before discard (default 350)
  *   --action-retries     Retries for pick/discard on transient errors (default 5)
  *   --create-retries     Retries for POST /sessions on timeout (default 4)
- *   --mode               dual (2 scripts) | vs-bot (1 script + server bot fill)
+ *   --mode               dual (all seats scripted) | vs-bot (1 script + server bot fill)
  *   --target-active-tables  Ramp/hold mode: simultaneous active table target
  *   --hold-seconds       Hold full target before allowing finishes (default 120)
  *   --report-dir         Directory for JSONL + summary (default ./load_reports)
@@ -104,13 +113,27 @@ if (!Number.isFinite(gameId) || gameId <= 0 || !Number.isFinite(contestId) || co
   console.error('Required: --game-id and --contest-id (active contest with entry fee your wallets can pay)');
   process.exit(1);
 }
-if (maxPlayers !== 2) {
-  console.error('Only --max-players 2 is supported in this script');
+if (maxPlayers < 2 || maxPlayers > 6) {
+  console.error('--max-players must be between 2 and 6');
+  process.exit(1);
+}
+if (mode === 'vs-bot' && maxPlayers < 2) {
+  console.error('--mode vs-bot requires --max-players >= 2 (bots fill remaining seats)');
   process.exit(1);
 }
 if (targetActiveTables > tables) {
   console.error('--target-active-tables cannot be greater than --tables');
   process.exit(1);
+}
+
+const SEAT_LETTERS = 'ABCDEF';
+function seatLabel(tableIndex, seatIndex) {
+  const letter = SEAT_LETTERS[seatIndex] || String(seatIndex + 1);
+  return `T${tableIndex}:${letter}`;
+}
+/** dual = fill every seat with scripted clients; vs-bot = 1 scripted + server bots. */
+function seatsNeededPerTable() {
+  return mode === 'vs-bot' ? 1 : maxPlayers;
 }
 
 function loadTokens(file, limit) {
@@ -552,7 +575,7 @@ function detectStolen(shared, seatUserIds) {
     ?? NaN,
   );
   if (hasResult && Number.isFinite(winner) && seatUserIds.length && !seatUserIds.includes(winner)) {
-    // Opponent/bot win is normal in vs-bot; only flag dual when winner is outside both seats.
+    // Opponent/bot win is normal in vs-bot; flag dual when winner is outside scripted seats.
     if (mode === 'dual') {
       return {
         stolen: true,
@@ -917,16 +940,20 @@ async function runOneTable(tableIndex, seatsTokens, lifecycle = {}) {
   const startedAt = Date.now();
   const shared = emptyShared();
 
-  const seatsNeeded = mode === 'vs-bot' ? 1 : 2;
+  const seatsNeeded = seatsNeededPerTable();
   const clients = [];
   for (let i = 0; i < seatsNeeded; i += 1) {
-    const c = await connectClient(seatsTokens[i], `T${tableIndex}:${i === 0 ? 'A' : 'B'}`);
+    const label = seatLabel(tableIndex, i);
+    const c = await connectClient(seatsTokens[i], label);
     if (!c.ok) {
       pushDetailedError(shared, {
-        seat: `T${tableIndex}:${i === 0 ? 'A' : 'B'}`,
+        seat: label,
         event: 'connect',
         message: c.error || 'connect_failed',
       });
+      for (const prior of clients) {
+        try { prior.socket.close(); } catch (_) { /* ignore */ }
+      }
       const stolen = detectStolen(shared, []);
       return buildTableResult({
         ok: false,
@@ -1332,12 +1359,16 @@ function writeReports(results, meta) {
 }
 
 (async () => {
-  const seatsPerTable = mode === 'vs-bot' ? 1 : 2;
+  const seatsPerTable = seatsNeededPerTable();
   const effectiveTables = rampControl.enabled ? targetActiveTables : tables;
   const needTokens = effectiveTables * seatsPerTable;
   const tokens = loadTokens(tokensPath, needTokens);
   if (tokens.length < needTokens) {
-    console.error(`Need ${needTokens} tokens for ${effectiveTables} tables (mode=${mode}), found ${tokens.length}`);
+    console.error(
+      `Need ${needTokens} tokens for ${effectiveTables} tables `
+      + `(mode=${mode}, max_players=${maxPlayers}, seats_per_table=${seatsPerTable}), `
+      + `found ${tokens.length}`,
+    );
     process.exit(1);
   }
 
@@ -1345,6 +1376,8 @@ function writeReports(results, meta) {
     url: baseUrl,
     mode,
     tables,
+    maxPlayers,
+    seatsPerTable,
     concurrency,
     gameId,
     contestId,
@@ -1393,6 +1426,8 @@ function writeReports(results, meta) {
     mode,
     game_id: gameId,
     contest_id: contestId,
+    max_players: maxPlayers,
+    seats_per_table: seatsPerTable,
     concurrency,
     max_game_seconds: maxGameSeconds,
     ramp_hold_mode: rampControl.enabled,
