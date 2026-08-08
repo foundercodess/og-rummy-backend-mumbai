@@ -15,6 +15,10 @@ const { cacheGetJson, cacheSetJson, cacheDel } = require('./redis.service');
 
 const LIVE_PREFIX = 'live:sess:';
 const DEFAULT_TTL_MS = 6 * 60 * 60 * 1000; // 6h — covers long pool tables; cleaned on complete
+const LIVE_SNAPSHOT_WARN_BYTES = Math.max(
+  50_000,
+  Number(process.env.LIVE_SNAPSHOT_WARN_BYTES) || 200_000,
+);
 
 const stats = {
   hit: 0,
@@ -25,6 +29,24 @@ const stats = {
   syncPersist: 0,
 };
 let statsLoggerStarted = false;
+const largeSnapshotWarnAtMs = new Map();
+
+function warnIfLargeSnapshot(sessionId, snapshot) {
+  if (!snapshot) return;
+  const now = Date.now();
+  const last = largeSnapshotWarnAtMs.get(sessionId) || 0;
+  // Avoid double-stringify cost on every pick/discard write.
+  if (now - last < 60_000) return;
+  try {
+    const bytes = Buffer.byteLength(JSON.stringify(snapshot));
+    if (bytes > LIVE_SNAPSHOT_WARN_BYTES) {
+      largeSnapshotWarnAtMs.set(sessionId, now);
+      console.warn(`[LIVE_STATE] large snapshot session=${sessionId} bytes=${bytes}`);
+    }
+  } catch (_) {
+    // ignore serialization errors
+  }
+}
 
 function isEnabled() {
   // Permanent default ON — set LIVE_SESSION_STATE_ENABLED=false only for emergency rollback.
@@ -93,12 +115,14 @@ async function set(sessionId, row) {
   const snap = toSnapshot(row);
   if (!snap) return;
   stats.write += 1;
+  warnIfLargeSnapshot(sessionId, snap);
   await cacheSetJson(liveKey(sessionId), snap, resolveTtlMs());
 }
 
 async function drop(sessionId) {
   if (!isEnabled() || sessionId == null) return;
   stats.drop += 1;
+  largeSnapshotWarnAtMs.delete(sessionId);
   await cacheDel(liveKey(sessionId));
 }
 
@@ -119,6 +143,7 @@ async function hydrateFromRow(sessionId, row) {
   const snap = toSnapshot(row);
   if (!snap.live_version) snap.live_version = 1;
   stats.write += 1;
+  warnIfLargeSnapshot(sessionId, snap);
   await cacheSetJson(liveKey(sessionId), snap, resolveTtlMs());
 }
 

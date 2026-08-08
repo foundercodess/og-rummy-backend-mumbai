@@ -247,19 +247,27 @@ const BOT_FINISH_EARLY_EXIT_UTILITY = Math.max(
   500,
   Number(process.env.BOT_FINISH_EARLY_EXIT_UTILITY) || 1650
 );
-/** Internal bot/timer loads do not need recent event history on the response. */
-const BOT_INTERNAL_SESSION_OPTS = Object.freeze({ includeEvents: false });
 /**
- * Human pick/discard/finish hot path: skip audit-event PG scan and game/contest
- * join. Turn timer / bonus come from metadata.turn (+ defaults).
+ * Cap stored discard_history.timeline (and emit payload size). Game rules use
+ * distribution.discard_pile — history is UI/audit only. Keep enough entries for
+ * pick-marking the open pile top and the discard-history panel.
  */
-const TURN_ACTION_SESSION_OPTS = Object.freeze({
-  includeEvents: false,
-  includeGameContest: false,
-});
+const DISCARD_HISTORY_MAX_ENTRIES = Math.max(
+  8,
+  Math.min(500, Number(process.env.DISCARD_HISTORY_MAX_ENTRIES) || 48),
+);
+/** Human pick ACK finish-hint scan budget (ungrouped leftovers). Rules unchanged. */
+const PICK_ACK_FINISH_PLAN_MAX_CANDIDATES = Math.max(
+  1,
+  Math.min(8, Number(process.env.PICK_ACK_FINISH_PLAN_MAX_CANDIDATES) || 2),
+);
 /** Yield so inbound socket:ping / player ACKs can run between bot CPU chunks. */
 function yieldToEventLoop() {
   return new Promise((resolve) => setImmediate(resolve));
+}
+/** Lean session row+players for bot/timer hot paths (no events/contest/prize assembly). */
+function loadBotActionSession(sessionId) {
+  return gameplayService.loadTurnActionSession(sessionId);
 }
 const SOCKET_SESSION_CHECK_TTL_MS = Math.max(1000, Number(process.env.SOCKET_SESSION_CHECK_TTL_MS) || 3000);
 const POOL_REJOIN_THRESHOLD_BY_LIMIT = {
@@ -2561,7 +2569,7 @@ function botTurnPhaseClaimKey(sessionId, turnId, phase) {
 
 async function botPhaseStillNeeded(sessionId, expectedTurnId, phase) {
   const normalizedPhase = phase === 'discard' ? 'discard' : 'pick';
-  const session = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
+  const session = await loadBotActionSession(sessionId);
   if (!session || session.status !== 'active') return false;
   const turn = session.metadata?.turn;
   if (!turn || Number(turn.turn_id) !== Number(expectedTurnId)) return false;
@@ -2845,13 +2853,19 @@ function emitGameDiscardAckToUser(io, sessionId, userId, data, extras = {}) {
   }
 }
 
+function trimDiscardHistoryTimeline(timeline = [], maxEntries = DISCARD_HISTORY_MAX_ENTRIES) {
+  if (!Array.isArray(timeline) || timeline.length <= maxEntries) return timeline;
+  return timeline.slice(timeline.length - maxEntries);
+}
+
 function normalizeDiscardHistoryState(metadata = {}, distribution = null) {
   const raw = metadata?.discard_history || {};
   const rawTimeline = Array.isArray(raw?.timeline) ? raw.timeline : [];
-  const timeline = rawTimeline
+  let timeline = rawTimeline
     .map((entry) => ({ ...entry, seq: Number(entry?.seq) || 0 }))
     .filter((entry) => entry.seq > 0)
     .sort((a, b) => a.seq - b.seq);
+  timeline = trimDiscardHistoryTimeline(timeline);
 
   let seq = Number(raw?.seq) || 0;
   if (timeline.length > 0) {
@@ -2908,7 +2922,7 @@ function appendDiscardHistoryEntry(metadata = {}, distribution = null, payload =
   const nextDiscardHistory = {
     seq: nextSeq,
     initial_discard_card: state.initial_discard_card,
-    timeline: [...state.timeline, entry],
+    timeline: trimDiscardHistoryTimeline([...state.timeline, entry]),
   };
 
   return {
@@ -2956,7 +2970,7 @@ function markDiscardHistoryPicked(metadata = {}, distribution = null, payload = 
     discardHistory: {
       seq: state.seq,
       initial_discard_card: state.initial_discard_card,
-      timeline: nextTimeline,
+      timeline: trimDiscardHistoryTimeline(nextTimeline),
     },
     latestEntry,
     changed,
@@ -8284,7 +8298,7 @@ async function tryExecuteBotDropBeforePick(
 
 async function executeBotPickAction(io, sessionId, expectedTurnId) {
   const decisionStartedAt = Date.now();
-  const session = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
+  const session = await loadBotActionSession(sessionId);
   if (!session || session.status !== 'active') return;
   const softRiggingEnabled = isBotSoftRiggingEnabled(session);
   const aggressiveEnabled = isBotAggressionEnabled(session);
@@ -8562,7 +8576,7 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
 }
 
 async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
-  const refreshed = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
+  const refreshed = await loadBotActionSession(sessionId);
   if (!refreshed || refreshed.status !== 'active') return;
   const softRiggingEnabled = isBotSoftRiggingEnabled(refreshed);
   const aggressiveEnabled = isBotAggressionEnabled(refreshed);
@@ -9160,7 +9174,7 @@ async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
     warnGame(sessionId, `Bot forced action before timeout failed uid=${turn.user_id}: ${err.message}`);
   }
 
-  const refreshed = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
+  const refreshed = await loadBotActionSession(sessionId);
   if (!refreshed || refreshed.status !== 'active') return refreshed;
 
   const refreshedTurn = refreshed.metadata?.turn;
@@ -9177,7 +9191,7 @@ async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
       } catch (err) {
         warnGame(sessionId, `Bot forced discard before timeout failed uid=${turn.user_id}: ${err.message}`);
       }
-      const afterDiscard = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
+      const afterDiscard = await loadBotActionSession(sessionId);
       if (afterDiscard?.metadata?.turn?.turn_id !== turn.turn_id) {
         logGame(sessionId, `Turn timeout skipped — bot discarded uid=${turn.user_id}`);
         return afterDiscard;
@@ -9253,7 +9267,7 @@ function executeBotTurnAction(io, sessionId, expectedTurnId, phase = 'pick') {
             if (stillNeeded) {
               // Validation no-op / turn-not-started reschedule path: free the claim.
               await redisLockService.releaseEventIdempotency(claimKey).catch(() => {});
-              const live = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
+              const live = await loadBotActionSession(sessionId);
               const liveTurn = live?.metadata?.turn;
               if (
                 live
@@ -9348,7 +9362,7 @@ function scheduleBotTurnAction(io, sessionId, turn, phase = 'pick', options = {}
 
 async function maybeScheduleBotTurnAction(io, sessionId, turn) {
   if (!turn || Number.isNaN(Number(turn.user_id))) return;
-  const session = await gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS);
+  const session = await loadBotActionSession(sessionId);
   if (!session || session.status !== 'active') return;
   if (!isBotTurn(session, turn.user_id)) return;
   const softRiggingEnabled = isBotSoftRiggingEnabled(session);
@@ -10521,7 +10535,7 @@ function registerSocketServer(httpServer) {
     if (!payload.turn) return;
     scheduleTurnTimeout(io, sessionId, payload.turn);
 
-    gameplayService.getSessionState(sessionId, null, BOT_INTERNAL_SESSION_OPTS)
+    loadBotActionSession(sessionId)
       .then((session) => {
         if (!session || session.status !== 'active' || !session.metadata?.turn) return;
         return maybeScheduleBotTurnAction(io, sessionId, session.metadata.turn);
@@ -12695,9 +12709,10 @@ function registerSocketServer(httpServer) {
 
         let updatedPickGroups;
         let grouping;
-        let finishPlan;
+        let finishPlan = null;
 
         if (autoBestGroup) {
+          // Auto-best already uses fastFinishPlan (no multi-card scan).
           const autoResult = buildAutoBestGroupingResult(playerDistribution.cards, wildJoker, {
             groupingOptions,
             tieBreakSeed: decisionSeed,
@@ -12724,17 +12739,6 @@ function registerSocketServer(httpServer) {
             wildJoker,
             updatedPickGroups
           ));
-          // Human pick: only finish-from-submitted layout (never bot full scan on ACK path).
-          finishPlan = tryBuildFinishPlanFromSubmittedGroups(playerDistribution.cards, wildJoker, {
-            submittedGroups: updatedPickGroups,
-            groupingOptions,
-            tieBreakSeed: decisionSeed,
-            sessionId,
-            userId: socket.user.id,
-            turnId: turnIdForSeed,
-            earlyExit: true,
-            maxCandidates: 4,
-          });
         }
 
         playerDistribution.submitted_groups = updatedPickGroups;
@@ -12769,6 +12773,7 @@ function registerSocketServer(httpServer) {
           nextMetadata.discard_history = playerDiscardPickUpdate.discardHistory;
         }
 
+        // Persist move first so cluster peers see has_picked before finish-hint CPU.
         await gameSessionModel.updateSessionStatus(sessionId, session.status, {
           currentTurnUserId: session.current_turn_user_id,
           metadata: nextMetadata,
@@ -12785,6 +12790,20 @@ function registerSocketServer(httpServer) {
             card_id: pickedCard.card_id,
           },
         }).catch(() => {});
+
+        // Human layout finish hint (UX): after persist, small candidate budget. Rules unchanged.
+        if (!autoBestGroup) {
+          finishPlan = tryBuildFinishPlanFromSubmittedGroups(playerDistribution.cards, wildJoker, {
+            submittedGroups: updatedPickGroups,
+            groupingOptions,
+            tieBreakSeed: decisionSeed,
+            sessionId,
+            userId: socket.user.id,
+            turnId: turnIdForSeed,
+            earlyExit: true,
+            maxCandidates: PICK_ACK_FINISH_PLAN_MAX_CANDIDATES,
+          });
+        }
 
         const pickAck = {
           success: true,
