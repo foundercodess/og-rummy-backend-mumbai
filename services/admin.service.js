@@ -2356,6 +2356,29 @@ async function getAppUpdateConfigForAdmin() {
   };
 }
 
+async function publishLandingAppUpdateManifest({
+  platform,
+  latest,
+  url,
+  releaseNotes,
+}) {
+  const normalizedUrl = String(url || '').trim();
+  if (!platform || !normalizedUrl) return null;
+
+  return uploadService.uploadBufferWithKey({
+    buffer: Buffer.from(JSON.stringify({
+      platform,
+      latest: String(latest || '').trim(),
+      url: normalizedUrl,
+      release_notes: releaseNotes == null ? '' : String(releaseNotes).trim(),
+      updated_at: new Date().toISOString(),
+    })),
+    mimeType: 'application/json',
+    key: `apks/${platform}/latest.json`,
+    cacheControl: 'no-cache, max-age=60',
+  });
+}
+
 async function updateAppUpdateConfigForAdmin({
   platform,
   latest,
@@ -2391,6 +2414,17 @@ async function updateAppUpdateConfigForAdmin({
     metadata: metadata && typeof metadata === 'object' ? metadata : {},
     updatedBy: updatedBy == null ? null : normalizeIntegerFilter(updatedBy, 'INVALID_UPDATED_BY_ADMIN_ID'),
   });
+
+  try {
+    await publishLandingAppUpdateManifest({
+      platform: updated.platform,
+      latest: updated.latest,
+      url: updated.url,
+      releaseNotes: updated.release_notes,
+    });
+  } catch (err) {
+    console.error('Failed to publish landing app-update manifest:', err);
+  }
 
   return {
     app_update: {
@@ -2488,6 +2522,17 @@ async function uploadAppUpdateApkForAdmin({
       source: 'admin_upload_apk',
     },
   });
+
+  try {
+    await publishLandingAppUpdateManifest({
+      platform: updated.platform,
+      latest: updated.latest,
+      url: updated.url,
+      releaseNotes: updated.release_notes,
+    });
+  } catch (err) {
+    console.error('Failed to publish landing app-update manifest:', err);
+  }
 
   const activeBuilds = await appUpdateBuildModel.listBuildsByPlatform(normalizedPlatform, { includeDeleted: false });
   const { keepers, old } = classifyBuildRows(activeBuilds);

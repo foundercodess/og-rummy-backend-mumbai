@@ -51,7 +51,7 @@ async function uploadBuffer({ buffer, mimeType, folder = 'misc', userId }) {
   return { key, imageUrl };
 }
 
-async function uploadBufferWithKey({ buffer, mimeType, key }) {
+async function uploadBufferWithKey({ buffer, mimeType, key, cacheControl }) {
   if (!BUCKET || !REGION) {
     throw new Error('S3_NOT_CONFIGURED');
   }
@@ -65,6 +65,7 @@ async function uploadBufferWithKey({ buffer, mimeType, key }) {
     Key: normalizedKey,
     Body: buffer,
     ContentType: mimeType || 'application/octet-stream',
+    ...(cacheControl ? { CacheControl: cacheControl } : {}),
   });
 
   const client = getS3Client();

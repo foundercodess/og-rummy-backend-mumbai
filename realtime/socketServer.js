@@ -594,7 +594,9 @@ async function persistInvalidDeclarationPackMetadata(
  */
 function recordManualDeclareResponse(state, userId, groups = []) {
   if (!state?.responses || userId == null) return;
-  state.responses.set(userId, {
+  const uidNum = Number(userId);
+  const key = Number.isNaN(uidNum) ? userId : uidNum;
+  state.responses.set(key, {
     submitted_at: new Date().toISOString(),
     auto: false,
     groups: Array.isArray(groups) ? groups : [],
@@ -1174,7 +1176,21 @@ function buildAggregateResultsFromDealScores(session = {}, dealScores = []) {
 
   const finalized = aggregate.map((entry) => {
     const isWinner = tiedWinnerSet.has(Number(entry.user_id));
-    const playerStatus = isWinner && tiedWinnerSet.size > 1 ? 'tie' : (isWinner ? 'won' : 'lost');
+    const lastDealRow = lastDealResultsByUser.get(Number(entry.user_id));
+    const lastDealDeclareBy = Number(lastDeal?.declare_by_user_id);
+    const lastDealDeclareValid = lastDeal?.declare_valid;
+    const wasInvalidDeclarer = !Number.isNaN(lastDealDeclareBy)
+      && Number(entry.user_id) === lastDealDeclareBy
+      && lastDealDeclareValid === false;
+    // Preserve wrong-show label on the final deals scoreboard (do not remap to plain "lost").
+    const playerStatus = isWinner && tiedWinnerSet.size > 1
+      ? 'tie'
+      : (isWinner
+        ? 'won'
+        : (wasInvalidDeclarer
+          || lastDealRow?.player_status === 'invalid_declaration'
+          ? 'invalid_declaration'
+          : 'lost'));
     return {
       ...entry,
       is_winner: isWinner,
@@ -4197,7 +4213,258 @@ function buildEarlyDropExplainability(session, userId, handCards = [], distribut
 
 function getPlayerDistribution(distribution, userId) {
   const players = Array.isArray(distribution?.players) ? distribution.players : [];
-  return players.find((pd) => pd.user_id === userId) || null;
+  const uid = Number(userId);
+  if (!Number.isNaN(uid)) {
+    const byNumber = players.find((pd) => Number(pd?.user_id) === uid);
+    if (byNumber) return byNumber;
+  }
+  // Fallback for non-numeric ids (should not happen in production seats).
+  return players.find((pd) => pd?.user_id === userId) || null;
+}
+
+/**
+ * Number-safe lookup into declare response Map (keys may be number or string).
+ */
+function getDeclareResponseEntry(responses, userId) {
+  if (!responses || typeof responses.get !== 'function') return null;
+  if (responses.has(userId)) return responses.get(userId) || null;
+  const uid = Number(userId);
+  if (!Number.isNaN(uid) && responses.has(uid)) return responses.get(uid) || null;
+  const asString = String(userId);
+  if (responses.has(asString)) return responses.get(asString) || null;
+  if (typeof responses.entries === 'function') {
+    for (const [key, value] of responses.entries()) {
+      if (Number(key) === uid && !Number.isNaN(uid)) return value || null;
+    }
+  }
+  return null;
+}
+
+function hasDeclareResponseEntry(responses, userId) {
+  return getDeclareResponseEntry(responses, userId) != null;
+}
+
+/**
+ * Resolve declarer validity for finalize without false wrong-shows from desync.
+ *
+ * Rules (safe / product-preserving):
+ * 1. Prefer in-memory declare response groups when they evaluate cleanly.
+ * 2. If response is missing/empty/throws (UID drift), try distribution.submitted_groups.
+ * 3. Only when response was missing/empty/threw — rescue via buildBestGrouping if
+ *    the hand is declare-ready (covers lost bot/human finish snapshots).
+ * 4. Never rescue an explicitly submitted invalid layout with best-grouping.
+ * 5. On confirmed invalid, prefer showing the submitted/stored layout (not a
+ *    silent best-grouping that looks legal on the result screen).
+ */
+function resolveDeclarerGroupingForFinalize({
+  cards = [],
+  wildJoker = null,
+  responseGroups = null,
+  storedGroups = null,
+  sessionId = null,
+  declarerUserId = null,
+} = {}) {
+  const handCards = Array.isArray(cards) ? cards : [];
+
+  const tryEval = (groups, source) => {
+    const coerced = coerceSubmittedGroupsForHand(groups, handCards);
+    if (!coerced.length) {
+      return { grouping: null, source, threw: false, empty: true };
+    }
+    try {
+      const grouping = groupingService.evaluateSubmittedGrouping(
+        handCards,
+        wildJoker,
+        coerced
+      );
+      return { grouping, source, threw: false, empty: false };
+    } catch (err) {
+      return {
+        grouping: null,
+        source,
+        threw: true,
+        empty: false,
+        error: err,
+      };
+    }
+  };
+
+  const responseList = Array.isArray(responseGroups) ? responseGroups : [];
+  const primary = tryEval(responseList, 'response');
+  if (primary.grouping?.summary?.valid_for_declare === true) {
+    return {
+      grouping: primary.grouping,
+      valid: true,
+      source: 'response',
+      displayIsOptimisticBest: false,
+    };
+  }
+
+  // Explicit, evaluable wrong layout → real wrong-show. Do not rescue.
+  const primaryExplicitInvalid = responseList.length > 0
+    && primary.threw !== true
+    && primary.grouping != null
+    && primary.grouping?.summary?.valid_for_declare !== true;
+
+  if (primaryExplicitInvalid) {
+    return {
+      grouping: primary.grouping,
+      valid: false,
+      source: 'response_invalid',
+      displayIsOptimisticBest: false,
+    };
+  }
+
+  const allowRescue = responseList.length === 0
+    || primary.threw === true
+    || primary.empty === true
+    || primary.grouping == null;
+
+  if (allowRescue) {
+    const stored = tryEval(storedGroups, 'stored');
+    if (stored.grouping?.summary?.valid_for_declare === true) {
+      if (sessionId != null) {
+        logGame(
+          sessionId,
+          `Declarer uid=${declarerUserId} recovered valid layout from stored submitted_groups ` +
+          `(response missing/stale)`
+        );
+      }
+      return {
+        grouping: stored.grouping,
+        valid: true,
+        source: 'stored',
+        displayIsOptimisticBest: false,
+      };
+    }
+
+    try {
+      const best = groupingService.buildBestGrouping(handCards, wildJoker);
+      if (best?.summary?.valid_for_declare === true) {
+        if (sessionId != null) {
+          logGame(
+            sessionId,
+            `Declarer uid=${declarerUserId} recovered valid layout from best grouping ` +
+            `(response missing/stale; hand declare-ready)`
+          );
+        }
+        return {
+          grouping: best,
+          valid: true,
+          source: 'best_rescue',
+          displayIsOptimisticBest: false,
+        };
+      }
+    } catch (_) {
+      // fall through to invalid
+    }
+
+    if (stored.grouping) {
+      return {
+        grouping: {
+          ...stored.grouping,
+          summary: {
+            ...(stored.grouping.summary || {}),
+            valid_for_declare: false,
+          },
+        },
+        valid: false,
+        source: stored.threw ? 'stored_unresolved' : 'stored_invalid',
+        displayIsOptimisticBest: false,
+      };
+    }
+  }
+
+  if (primary.threw && sessionId != null) {
+    warnGame(
+      sessionId,
+      `Declarer grouping unresolved uid=${declarerUserId} (${primary.error?.message || 'error'}) ` +
+      `— treating as invalid declaration`
+    );
+  }
+
+  // Confirmed invalid / unrecoverable — avoid optimistic best layout for display.
+  if (primary.grouping) {
+    return {
+      grouping: primary.grouping,
+      valid: false,
+      source: 'response_invalid',
+      displayIsOptimisticBest: false,
+    };
+  }
+
+  try {
+    const best = groupingService.buildBestGrouping(handCards, wildJoker);
+    return {
+      grouping: best?.summary
+        ? { ...best, summary: { ...best.summary, valid_for_declare: false } }
+        : { summary: { valid_for_declare: false } },
+      valid: false,
+      source: 'best_forced_invalid',
+      // Caller must not present this as the player's declared layout.
+      displayIsOptimisticBest: true,
+    };
+  } catch (_) {
+    return {
+      grouping: { summary: { valid_for_declare: false } },
+      valid: false,
+      source: 'empty_invalid',
+      displayIsOptimisticBest: false,
+    };
+  }
+}
+
+/**
+ * Prefer submitted/stored layout on result screens; never throw.
+ * When allowBestFallback is false (invalid declarer), do not silently replace
+ * a failed layout with buildBestGrouping — that made wrong-shows look legal.
+ */
+function resolveResultHandGrouping(playerCards, wildJoker, groups = null, options = {}) {
+  const handCards = Array.isArray(playerCards) ? playerCards : [];
+  const allowBestFallback = options?.allowBestFallback !== false;
+  const coerced = coerceSubmittedGroupsForHand(groups, handCards);
+  if (coerced.length > 0) {
+    try {
+      return groupingService.evaluateSubmittedGrouping(handCards, wildJoker, coerced);
+    } catch (_) {
+      // Fall through.
+    }
+  }
+  if (!allowBestFallback) {
+    // Keep coerced groups visible even when melds are invalid / partial.
+    if (coerced.length > 0) {
+      try {
+        // Re-run after coerce may still throw on duplicates; build a minimal display.
+        return {
+          groups: coerced.map((group, idx) => ({
+            group_id: group.group_id || idx + 1,
+            type: 'invalid_mixed',
+            cards: (group.cards || [])
+              .map((uid) => handCards.find((c) => c?.card_uid === uid))
+              .filter(Boolean),
+            group_points: 0,
+            is_valid_meld: false,
+          })),
+          ungrouped_cards: handCards.filter(
+            (c) => !coerced.some((g) => (g.cards || []).includes(c?.card_uid))
+          ),
+          summary: {
+            valid_for_declare: false,
+            all_cards_grouped: false,
+            invalid_group_count: coerced.length,
+          },
+        };
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }
+  try {
+    return groupingService.buildBestGrouping(handCards, wildJoker);
+  } catch (_) {
+    return null;
+  }
 }
 
 function hasTurnStarted(turn) {
@@ -4273,27 +4540,6 @@ function coerceSubmittedGroupsForHand(groups, handCards) {
   });
 
   return next;
-}
-
-/**
- * Prefer manual/auto submitted layout on result screens; never throw.
- * Falls back to best grouping when layout is missing or incompatible with the hand.
- */
-function resolveResultHandGrouping(playerCards, wildJoker, groups = null) {
-  const handCards = Array.isArray(playerCards) ? playerCards : [];
-  const coerced = coerceSubmittedGroupsForHand(groups, handCards);
-  if (coerced.length > 0) {
-    try {
-      return groupingService.evaluateSubmittedGrouping(handCards, wildJoker, coerced);
-    } catch (_) {
-      // Fall through to best.
-    }
-  }
-  try {
-    return groupingService.buildBestGrouping(handCards, wildJoker);
-  } catch (_) {
-    return null;
-  }
 }
 
 function resolveSubmittedGroupsInput(rawGroups, fallbackGroups, handCards) {
@@ -4671,7 +4917,7 @@ function prefillInactivePlayersInDeclareResponses(session, distribution, players
   const wildJoker = distribution?.wild_joker || null;
   (Array.isArray(players) ? players : []).forEach((player) => {
     const userId = player?.user_id;
-    if (userId == null || responses.has(userId)) return;
+    if (userId == null || hasDeclareResponseEntry(responses, userId)) return;
     if (!isPlayerInactiveForDeclaration(session, player, distribution)) return;
     const playerDistribution = getPlayerDistribution(distribution, userId);
     const playerCards = playerDistribution?.cards || [];
@@ -4682,8 +4928,10 @@ function prefillInactivePlayersInDeclareResponses(session, distribution, players
     const storedGroups = Array.isArray(playerDistribution?.submitted_groups)
       ? coerceSubmittedGroupsForHand(playerDistribution.submitted_groups, playerCards)
       : [];
+    const uidNum = Number(userId);
+    const responseKey = Number.isNaN(uidNum) ? userId : uidNum;
     if (storedGroups.length > 0) {
-      responses.set(userId, {
+      responses.set(responseKey, {
         submitted_at: submittedAt || new Date().toISOString(),
         auto: false,
         groups: storedGroups,
@@ -4691,7 +4939,7 @@ function prefillInactivePlayersInDeclareResponses(session, distribution, players
       return;
     }
     const autoGrouping = groupingService.buildBestGrouping(playerCards, wildJoker);
-    responses.set(userId, {
+    responses.set(responseKey, {
       submitted_at: submittedAt || new Date().toISOString(),
       auto: true,
       groups: toSubmittedGroupsFromGrouping(autoGrouping),
@@ -4713,7 +4961,14 @@ function resolvePlayerStatus({
   if (isDropped) return 'dropped';
   if (isFinal !== true) return submitted ? 'submitted' : 'pending';
   const gameFinal = isGameFinal ?? true;
-  if (userId === declareByUserId && declarerValid === false) return 'invalid_declaration';
+  if (
+    declareByUserId != null
+    && userId != null
+    && Number(userId) === Number(declareByUserId)
+    && declarerValid === false
+  ) {
+    return 'invalid_declaration';
+  }
   if (isWinner) {
     if (gameFinal) return 'won';
     if (mode === 'pool' || isDealLikeMode(mode)) return 'deal_winner';
@@ -4893,12 +5148,20 @@ function buildDeclarationTablePlayers({
   return visiblePlayers.map((player) => {
     const playerDistribution = getPlayerDistribution(distribution, player.user_id);
     const playerCards = playerDistribution?.cards || [];
-    const playerResponse = state?.responses?.get(player.user_id) || null;
+    const playerResponse = getDeclareResponseEntry(state?.responses, player.user_id);
     const submitted = Boolean(playerResponse);
     const submissionMode = submitted ? (playerResponse.auto ? 'auto' : 'manual') : null;
-    const result = resultByUserId.get(player.user_id) || null;
-    const settlementEntry = settlementByUserId.get(player.user_id) || null;
-    const isWinner = result?.is_winner ?? (isFinal ? player.user_id === winnerUserId : null);
+    const result = resultByUserId.get(player.user_id)
+      || resultByUserId.get(Number(player.user_id))
+      || null;
+    const settlementEntry = settlementByUserId.get(player.user_id)
+      || settlementByUserId.get(Number(player.user_id))
+      || null;
+    const isWinner = result?.is_winner ?? (
+      isFinal
+        ? Number(player.user_id) === Number(winnerUserId)
+        : null
+    );
     const isDropped = isPlayerDropped(player, playerDistribution, result);
     const isInactiveForDeclare = isPlayerInactiveForDeclaration(session, player, distribution);
     const playerStatus = resolvePlayerStatus({
@@ -4970,6 +5233,13 @@ function buildDeclarationTablePlayers({
     let bestGrouping = null;
     let bestScore = null;
 
+    const isInvalidDeclarerSeat = (
+      declarerValid === false
+      && state?.declareByUserId != null
+      && Number(player.user_id) === Number(state.declareByUserId)
+    ) || resolvedPlayerStatus === 'invalid_declaration'
+      || result?.player_status === 'invalid_declaration';
+
     if (isFinal) {
       cards = playerCards;
       const responseGroups = playerResponse?.groups || null;
@@ -4978,10 +5248,12 @@ function buildDeclarationTablePlayers({
         : null;
       // Manual declare/response first; stored finish/declare layout next; best last.
       // Never throw — leave/finalize used to get stuck on stale card UIDs.
+      // Invalid declarer: never replace failed layout with optimistic best grouping.
       grouping = resolveResultHandGrouping(
         playerCards,
         wildJoker,
-        responseGroups || storedGroups
+        responseGroups || storedGroups,
+        { allowBestFallback: !isInvalidDeclarerSeat }
       );
     } else if (submitted) {
       cards = playerCards;
@@ -5054,7 +5326,9 @@ function buildDeclarationTablePlayers({
       score_model: scoreModel,
       grouped_points: result?.grouped_points ?? grouping?.summary?.grouped_points ?? null,
       ungrouped_points: result?.ungrouped_points ?? grouping?.summary?.ungrouped_points ?? null,
-      valid_for_declare: result?.valid_for_declare ?? (grouping?.summary?.valid_for_declare ?? null),
+      valid_for_declare: isInvalidDeclarerSeat
+        ? false
+        : (result?.valid_for_declare ?? (grouping?.summary?.valid_for_declare ?? null)),
       invalid_group_count: result?.invalid_group_count ?? (grouping?.summary?.invalid_group_count ?? null),
       all_cards_grouped: result?.all_cards_grouped ?? (grouping?.summary?.all_cards_grouped ?? null),
       won_amount: resolvedWonAmount,
@@ -5193,10 +5467,10 @@ function buildDeclarationStatePayload({
   const activeDistribution = distribution || session.metadata?.distribution || null;
   const pendingUserIds = players
     .map((player) => player.user_id)
-    .filter((userId) => !state.responses.has(userId));
+    .filter((userId) => !hasDeclareResponseEntry(state.responses, userId));
   const submittedUserIds = players
     .map((player) => player.user_id)
-    .filter((userId) => state.responses.has(userId));
+    .filter((userId) => hasDeclareResponseEntry(state.responses, userId));
   const dealContext = buildDealContextFields(session);
   const resultShapeFields = buildResultShapeFieldsForDeclareState({
     session,
@@ -10703,7 +10977,7 @@ function registerSocketServer(httpServer) {
         if (!liveState || liveState.visibilityStage !== DECLARATION_VISIBILITY_AWAITING_DECLARER) {
           return;
         }
-        if (liveState.responses.has(liveState.declareByUserId)) {
+        if (hasDeclareResponseEntry(liveState.responses, liveState.declareByUserId)) {
           await openDeclarationWindowForAll(
             await gameplayService.getSessionState(sessionId),
             liveState,
@@ -10821,33 +11095,28 @@ function registerSocketServer(httpServer) {
 
       const declarerDistribution = getPlayerDistribution(distribution, declarerUserId);
       const declarerCards = declarerDistribution?.cards || [];
-      const declarerSubmittedGroups = state.responses.get(declarerUserId)?.groups || [];
-      // Never let a stale/mismatched submitted layout (card no longer in hand) throw
-      // and abort the whole finalize. If it cannot be resolved against the current
-      // hand, treat it as an invalid declaration (declarer cannot win on cards they
-      // do not hold) — same product outcome, but the deal still settles for everyone.
-      let declarerGrouping;
-      try {
-        declarerGrouping = groupingService.evaluateSubmittedGrouping(
-          declarerCards,
-          wildJoker,
-          declarerSubmittedGroups
-        );
-      } catch (declErr) {
-        warnGame(
-          sessionId,
-          `Declarer grouping unresolved uid=${declarerUserId} (${declErr.message}) — treating as invalid declaration`
-        );
-        const declarerBest = groupingService.buildBestGrouping(declarerCards, wildJoker);
-        declarerGrouping = declarerBest?.summary
-          ? { ...declarerBest, summary: { ...declarerBest.summary, valid_for_declare: false } }
-          : { summary: { valid_for_declare: false } };
-      }
-      const declarerValid = declarerGrouping?.summary?.valid_for_declare === true;
+      const declarerResponse = getDeclareResponseEntry(state.responses, declarerUserId);
+      const declarerSubmittedGroups = declarerResponse?.groups || [];
+      const declarerStoredGroups = Array.isArray(declarerDistribution?.submitted_groups)
+        ? declarerDistribution.submitted_groups
+        : [];
+      const declarerResolved = resolveDeclarerGroupingForFinalize({
+        cards: declarerCards,
+        wildJoker,
+        responseGroups: declarerSubmittedGroups,
+        storedGroups: declarerStoredGroups,
+        sessionId,
+        declarerUserId,
+      });
+      const declarerGrouping = declarerResolved.grouping
+        || { summary: { valid_for_declare: false } };
+      const declarerValid = declarerResolved.valid === true
+        && declarerGrouping?.summary?.valid_for_declare === true;
 
       logGame(
         sessionId,
         `Declaration by uid=${declarerUserId} — valid=${declarerValid}  ` +
+        `source=${declarerResolved.source || 'unknown'}  ` +
         `pureSeq=${declarerGrouping?.summary?.pure_sequence_count || 0}  ` +
         `seq=${declarerGrouping?.summary?.sequence_count || 0}  ` +
         `ungrouped=${declarerGrouping?.summary?.ungrouped_points || 0}pts`
@@ -10858,12 +11127,22 @@ function registerSocketServer(httpServer) {
       const results = roundPlayers.map((player) => {
         const playerDistribution = getPlayerDistribution(distribution, player.user_id);
         const playerCards = playerDistribution?.cards || [];
-        const playerResponse = state.responses.get(player.user_id);
+        const playerResponse = getDeclareResponseEntry(state.responses, player.user_id);
         // A single seat's stale submitted layout must never crash the whole finalize
         // (which was leaving tables frozen). Fall back to best grouping for just that
         // seat; every other seat still settles normally.
         let scoring;
-        if (playerResponse && playerResponse.auto !== true) {
+        const isDeclarerSeat = Number(player.user_id) === Number(declarerUserId);
+        if (isDeclarerSeat) {
+          // Keep declarer score aligned with the same validity decision used for winner.
+          const pointsFromDeclarer = declarerValid
+            ? 0
+            : MAX_ROUND_LOSS_POINTS;
+          scoring = {
+            grouping: declarerGrouping,
+            points: pointsFromDeclarer,
+          };
+        } else if (playerResponse && playerResponse.auto !== true) {
           try {
             scoring = scoreFromSubmittedGrouping(playerCards, wildJoker, playerResponse.groups || []);
           } catch (scoreErr) {
@@ -10909,10 +11188,10 @@ function registerSocketServer(httpServer) {
             sessionId,
             `Skipping pool re-score for packed uid=${player.user_id} (already settled this deal @ ${points}pts)`
           );
-        } else if (player.user_id === declarerUserId && !declarerValid) {
+        } else if (isDeclarerSeat && !declarerValid) {
           points = MAX_ROUND_LOSS_POINTS;
           logGame(sessionId, `Applying 80pt penalty to invalid declarer uid=${player.user_id}`);
-        } else if (!isDropped && !isTimeoutEliminated) {
+        } else if (!isDropped && !isTimeoutEliminated && !isDeclarerSeat) {
           const halfPenalty = resolveFirstRoundNoChanceDeclarePenalty(
             points,
             playerDistribution
@@ -10926,11 +11205,11 @@ function registerSocketServer(httpServer) {
           }
         }
 
-        if (!state.responses.has(player.user_id)) {
+        if (!hasDeclareResponseEntry(state.responses, player.user_id)) {
           autoDeclaredUserIds.push(player.user_id);
           logGame(sessionId, `uid=${player.user_id} did not respond — auto-scored ${points}pts (seat=${player.seat_no})`);
         } else {
-          logGame(sessionId, `uid=${player.user_id} scored ${points}pts mode=${state.responses.get(player.user_id)?.auto ? 'auto' : 'manual'} seat=${player.seat_no}`);
+          logGame(sessionId, `uid=${player.user_id} scored ${points}pts mode=${getDeclareResponseEntry(state.responses, player.user_id)?.auto ? 'auto' : 'manual'} seat=${player.seat_no}`);
         }
 
         return {
@@ -10939,16 +11218,18 @@ function registerSocketServer(httpServer) {
           points,
           round_points: points,
           pool_score_already_applied: poolScoreAlreadyApplied,
-          grouped_points: scoring.grouping.summary.grouped_points,
-          ungrouped_points: scoring.grouping.summary.ungrouped_points,
-          valid_for_declare: scoring.grouping.summary.valid_for_declare,
-          invalid_group_count: Number(scoring.grouping.summary.invalid_group_count) || 0,
-          all_cards_grouped: scoring.grouping.summary.all_cards_grouped !== false,
-          submission_mode: state.responses.has(player.user_id)
-            ? (state.responses.get(player.user_id)?.auto ? 'auto' : 'manual')
+          grouped_points: scoring.grouping?.summary?.grouped_points ?? null,
+          ungrouped_points: scoring.grouping?.summary?.ungrouped_points ?? null,
+          valid_for_declare: isDeclarerSeat
+            ? declarerValid
+            : (scoring.grouping?.summary?.valid_for_declare ?? null),
+          invalid_group_count: Number(scoring.grouping?.summary?.invalid_group_count) || 0,
+          all_cards_grouped: scoring.grouping?.summary?.all_cards_grouped !== false,
+          submission_mode: hasDeclareResponseEntry(state.responses, player.user_id)
+            ? (getDeclareResponseEntry(state.responses, player.user_id)?.auto ? 'auto' : 'manual')
             : 'auto',
-          submission_status: state.responses.has(player.user_id)
-            ? (state.responses.get(player.user_id)?.auto ? 'auto' : 'manual')
+          submission_status: hasDeclareResponseEntry(state.responses, player.user_id)
+            ? (getDeclareResponseEntry(state.responses, player.user_id)?.auto ? 'auto' : 'manual')
             : 'not_submitted',
           dropped: isDropped || isTimeoutEliminated,
           packed_in_current_deal: alreadyScoredThisDeal,
@@ -10981,7 +11262,7 @@ function registerSocketServer(httpServer) {
 
       const preliminaryFinalized = results.map((item) => ({
         ...item,
-        is_winner: item.user_id === winnerUserId,
+        is_winner: Number(item.user_id) === Number(winnerUserId),
       }));
 
       let isGameFinalForStatus = true;
@@ -11558,8 +11839,10 @@ function registerSocketServer(httpServer) {
       : allPlayers;
 
     const responses = new Map();
+    const declarerIdNum = Number(declareByUserId);
+    const declarerKey = Number.isNaN(declarerIdNum) ? declareByUserId : declarerIdNum;
     if (prefillDeclarerResponse) {
-      responses.set(declareByUserId, {
+      responses.set(declarerKey, {
         submitted_at: startedAt.toISOString(),
         auto: false,
         groups: declareGroups,
@@ -11576,7 +11859,7 @@ function registerSocketServer(httpServer) {
     activeDeclareBySession.set(sessionId, {
       sessionId,
       sequence,
-      declareByUserId,
+      declareByUserId: declarerKey,
       participantUserIds: players.map((player) => player.user_id),
       visibilityStage: openForAll
         ? DECLARATION_VISIBILITY_OPEN_FOR_ALL
@@ -11591,7 +11874,7 @@ function registerSocketServer(httpServer) {
 
     const pendingUserIds = players
       .map((p) => p.user_id)
-      .filter((userId) => !responses.has(userId));
+      .filter((userId) => !hasDeclareResponseEntry(responses, userId));
 
     const nextMetadata = {
       ...(session.metadata || {}),
@@ -11713,7 +11996,7 @@ function registerSocketServer(httpServer) {
             return;
           }
 
-          if (!liveState.responses.has(liveState.declareByUserId)) {
+          if (!hasDeclareResponseEntry(liveState.responses, liveState.declareByUserId)) {
             const liveSession = await gameplayService.getSessionState(sessionId);
             if (!liveSession) return;
 
@@ -11824,7 +12107,7 @@ function registerSocketServer(httpServer) {
       startedAtIso
     );
     const pendingUserIds = participantUserIds
-      .filter((userId) => !state.responses.has(userId));
+      .filter((userId) => !hasDeclareResponseEntry(state.responses, userId));
     const nextMetadata = {
       ...(session.metadata || {}),
       ...(nextDistribution ? { distribution: nextDistribution } : {}),
@@ -11926,7 +12209,7 @@ function registerSocketServer(httpServer) {
             }
             const playerDistribution = getPlayerDistribution(distribution, player.user_id);
             if (isPlayerDropped(player, playerDistribution)) return false;
-            return !state.responses.has(player.user_id);
+            return !hasDeclareResponseEntry(state.responses, player.user_id);
           })
           .map((player) => Number(player.user_id))
           .filter((userId) => !Number.isNaN(userId));
@@ -11937,7 +12220,7 @@ function registerSocketServer(httpServer) {
             const current = activeDeclareBySession.get(sessionId);
             if (!current) return;
             if (current.visibilityStage !== DECLARATION_VISIBILITY_OPEN_FOR_ALL) return;
-            if (current.responses.has(userId)) return;
+            if (hasDeclareResponseEntry(current.responses, userId)) return;
 
             try {
               const freshSession = await gameplayService.getSessionState(sessionId);
@@ -14347,8 +14630,8 @@ function registerSocketServer(httpServer) {
           throw new Error('Declaration window will open for all players after finisher submits');
         }
 
-        if (state.responses.has(socket.user.id)) {
-          const existingGroups = state.responses.get(socket.user.id)?.groups || [];
+        if (hasDeclareResponseEntry(state.responses, socket.user.id)) {
+          const existingGroups = getDeclareResponseEntry(state.responses, socket.user.id)?.groups || [];
           const preview = groupingService.evaluateSubmittedGrouping(
             playerDistribution.cards || [],
             wildJoker,
@@ -14837,7 +15120,9 @@ function registerSocketServer(httpServer) {
           return;
         }
 
-        state.responses.set(socket.user.id, {
+        const responderIdNum = Number(socket.user.id);
+        const responderKey = Number.isNaN(responderIdNum) ? socket.user.id : responderIdNum;
+        state.responses.set(responderKey, {
           submitted_at: new Date().toISOString(),
           auto: false,
           groups: submittedGroups,

@@ -231,6 +231,376 @@ async function getWeeklySeries() {
   };
 }
 
+const ANALYTICS_MAX_DAYS = 90;
+
+function utcDateOnly(d) {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+
+function formatUtcYmd(d) {
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Build inclusive UTC day buckets from fromDate → toDate (Date objects).
+ */
+function buildDayBuckets(fromDate, toDate) {
+  const start = utcDateOnly(fromDate);
+  const end = utcDateOnly(toDate);
+  const dayKeys = [];
+  const labels = [];
+  const cursor = new Date(start);
+  while (cursor <= end) {
+    const key = formatUtcYmd(cursor);
+    dayKeys.push(key);
+    labels.push(
+      cursor.toLocaleDateString('en-GB', {
+        day: '2-digit',
+        month: 'short',
+        timeZone: 'UTC',
+      })
+    );
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return { labels, dayKeys, fromKey: dayKeys[0], toKey: dayKeys[dayKeys.length - 1] };
+}
+
+/**
+ * Parse analytics range query. Defaults to last 7 UTC days (inclusive of today).
+ * @returns {{ fromDate: Date, toDate: Date, dayCount: number } | { error: string }}
+ */
+function parseAnalyticsRange({ from = null, to = null, days = null } = {}) {
+  const today = utcDateOnly(new Date());
+  let toDate = today;
+  let fromDate = null;
+
+  if (to) {
+    const parsedTo = new Date(to);
+    if (Number.isNaN(parsedTo.getTime())) return { error: 'to must be a valid date' };
+    toDate = utcDateOnly(parsedTo);
+  }
+
+  if (from) {
+    const parsedFrom = new Date(from);
+    if (Number.isNaN(parsedFrom.getTime())) return { error: 'from must be a valid date' };
+    fromDate = utcDateOnly(parsedFrom);
+  } else {
+    const span = Number(days);
+    const safeSpan = Number.isFinite(span) && span > 0 ? Math.min(Math.floor(span), ANALYTICS_MAX_DAYS) : 7;
+    fromDate = new Date(toDate);
+    fromDate.setUTCDate(fromDate.getUTCDate() - (safeSpan - 1));
+  }
+
+  if (fromDate > toDate) return { error: 'from must be on or before to' };
+
+  const dayCount = Math.floor((toDate - fromDate) / 86400000) + 1;
+  if (dayCount > ANALYTICS_MAX_DAYS) {
+    return { error: `Date range cannot exceed ${ANALYTICS_MAX_DAYS} days` };
+  }
+
+  return { fromDate, toDate, dayCount };
+}
+
+function sumSeries(arr) {
+  return round2((arr || []).reduce((acc, v) => acc + (Number(v) || 0), 0));
+}
+
+/**
+ * Date-range analytics series for admin charts.
+ * Includes gameplay, unique human players, new users, P&L, cashflow, and mode splits.
+ */
+async function getAnalyticsSeries({ from = null, to = null, days = null } = {}) {
+  const parsed = parseAnalyticsRange({ from, to, days });
+  if (parsed.error) {
+    const err = new Error(parsed.error);
+    err.code = 'INVALID_RANGE';
+    throw err;
+  }
+
+  const { fromDate, toDate, dayCount } = parsed;
+  const { labels, dayKeys, fromKey, toKey } = buildDayBuckets(fromDate, toDate);
+  const sinceIso = `${fromKey}T00:00:00.000Z`;
+  const untilIso = `${toKey}T23:59:59.999Z`;
+
+  const zeroByDay = () => Object.fromEntries(dayKeys.map((k) => [k, 0]));
+
+  const [
+    ledgerRes,
+    gamesRes,
+    playersRes,
+    newUsersRes,
+    depositsRes,
+    withdrawalsRes,
+    playsByModeRes,
+    revenueByModeRes,
+  ] = await Promise.all([
+    query(
+      `SELECT
+         (created_at AT TIME ZONE 'UTC')::date::text AS day,
+         event_type,
+         COALESCE(SUM(amount), 0)::numeric(14,2) AS total
+       FROM admin_ledger
+       WHERE created_at >= $1 AND created_at <= $2
+       GROUP BY day, event_type
+       ORDER BY day ASC`,
+      [sinceIso, untilIso]
+    ),
+    query(
+      `SELECT
+         (COALESCE(ended_at, updated_at, created_at) AT TIME ZONE 'UTC')::date::text AS day,
+         COUNT(*)::int AS plays
+       FROM game_sessions
+       WHERE status = 'completed'
+         AND COALESCE(ended_at, updated_at, created_at) >= $1
+         AND COALESCE(ended_at, updated_at, created_at) <= $2
+         AND COALESCE((metadata->>'practice_mode')::boolean, false) = false
+         AND COALESCE((metadata->>'practice_bot_only')::boolean, false) = false
+       GROUP BY day
+       ORDER BY day ASC`,
+      [sinceIso, untilIso]
+    ),
+    query(
+      `SELECT
+         (COALESCE(gs.ended_at, gs.updated_at, gs.created_at) AT TIME ZONE 'UTC')::date::text AS day,
+         COUNT(DISTINCT gsp.user_id)::int AS players
+       FROM game_sessions gs
+       INNER JOIN game_session_players gsp ON gsp.game_session_id = gs.id
+       INNER JOIN users u ON u.id = gsp.user_id
+       WHERE gs.status = 'completed'
+         AND COALESCE(gs.ended_at, gs.updated_at, gs.created_at) >= $1
+         AND COALESCE(gs.ended_at, gs.updated_at, gs.created_at) <= $2
+         AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
+         AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
+         AND COALESCE(u.is_bot, false) = false
+       GROUP BY day
+       ORDER BY day ASC`,
+      [sinceIso, untilIso]
+    ),
+    query(
+      `SELECT
+         (created_at AT TIME ZONE 'UTC')::date::text AS day,
+         COUNT(*)::int AS count
+       FROM users
+       WHERE COALESCE(is_bot, false) = false
+         AND created_at >= $1
+         AND created_at <= $2
+       GROUP BY day
+       ORDER BY day ASC`,
+      [sinceIso, untilIso]
+    ),
+    query(
+      `SELECT
+         (COALESCE(completed_at, updated_at, requested_at) AT TIME ZONE 'UTC')::date::text AS day,
+         COUNT(*)::int AS count,
+         COALESCE(SUM(amount), 0)::numeric(14,2) AS amount
+       FROM recharge_transactions
+       WHERE status = 'payment_success'
+         AND COALESCE(completed_at, updated_at, requested_at) >= $1
+         AND COALESCE(completed_at, updated_at, requested_at) <= $2
+       GROUP BY day
+       ORDER BY day ASC`,
+      [sinceIso, untilIso]
+    ),
+    query(
+      `SELECT
+         (COALESCE(completed_at, updated_at, requested_at) AT TIME ZONE 'UTC')::date::text AS day,
+         COUNT(*)::int AS count,
+         COALESCE(SUM(amount), 0)::numeric(14,2) AS amount
+       FROM withdrawal_transactions
+       WHERE status = 'successful'
+         AND COALESCE(completed_at, updated_at, requested_at) >= $1
+         AND COALESCE(completed_at, updated_at, requested_at) <= $2
+       GROUP BY day
+       ORDER BY day ASC`,
+      [sinceIso, untilIso]
+    ),
+    query(
+      `SELECT
+         LOWER(COALESCE(NULLIF(TRIM(metadata->>'mode'), ''), 'unknown')) AS mode,
+         COUNT(*)::int AS plays
+       FROM game_sessions
+       WHERE status = 'completed'
+         AND COALESCE(ended_at, updated_at, created_at) >= $1
+         AND COALESCE(ended_at, updated_at, created_at) <= $2
+         AND COALESCE((metadata->>'practice_mode')::boolean, false) = false
+         AND COALESCE((metadata->>'practice_bot_only')::boolean, false) = false
+       GROUP BY mode
+       ORDER BY plays DESC`,
+      [sinceIso, untilIso]
+    ),
+    query(
+      `SELECT
+         LOWER(COALESCE(NULLIF(TRIM(metadata->>'mode'), ''), 'unknown')) AS mode,
+         event_type,
+         COALESCE(SUM(amount), 0)::numeric(14,2) AS total
+       FROM admin_ledger
+       WHERE created_at >= $1 AND created_at <= $2
+       GROUP BY mode, event_type
+       ORDER BY mode ASC`,
+      [sinceIso, untilIso]
+    ),
+  ]);
+
+  const commissionByDay = zeroByDay();
+  const botWinByDay = zeroByDay();
+  const botLossByDay = zeroByDay();
+  const playsByDay = zeroByDay();
+  const playersByDay = zeroByDay();
+  const newUsersByDay = zeroByDay();
+  const depositAmtByDay = zeroByDay();
+  const depositCntByDay = zeroByDay();
+  const withdrawAmtByDay = zeroByDay();
+  const withdrawCntByDay = zeroByDay();
+
+  for (const row of ledgerRes.rows || []) {
+    const day = String(row.day || '');
+    if (!(day in commissionByDay)) continue;
+    const amount = round2(Number(row.total));
+    if (row.event_type === 'commission') commissionByDay[day] = amount;
+    if (row.event_type === 'bot_win_credit') botWinByDay[day] = amount;
+    if (row.event_type === 'bot_loss_debit') botLossByDay[day] = amount;
+  }
+  for (const row of gamesRes.rows || []) {
+    const day = String(row.day || '');
+    if (day in playsByDay) playsByDay[day] = Number(row.plays) || 0;
+  }
+  for (const row of playersRes.rows || []) {
+    const day = String(row.day || '');
+    if (day in playersByDay) playersByDay[day] = Number(row.players) || 0;
+  }
+  for (const row of newUsersRes.rows || []) {
+    const day = String(row.day || '');
+    if (day in newUsersByDay) newUsersByDay[day] = Number(row.count) || 0;
+  }
+  for (const row of depositsRes.rows || []) {
+    const day = String(row.day || '');
+    if (!(day in depositAmtByDay)) continue;
+    depositAmtByDay[day] = round2(Number(row.amount));
+    depositCntByDay[day] = Number(row.count) || 0;
+  }
+  for (const row of withdrawalsRes.rows || []) {
+    const day = String(row.day || '');
+    if (!(day in withdrawAmtByDay)) continue;
+    withdrawAmtByDay[day] = round2(Number(row.amount));
+    withdrawCntByDay[day] = Number(row.count) || 0;
+  }
+
+  const series = {
+    gameplay: dayKeys.map((k) => playsByDay[k]),
+    unique_players: dayKeys.map((k) => playersByDay[k]),
+    new_users: dayKeys.map((k) => newUsersByDay[k]),
+    commission: dayKeys.map((k) => commissionByDay[k]),
+    bot_winnings: dayKeys.map((k) => botWinByDay[k]),
+    bot_losses: dayKeys.map((k) => botLossByDay[k]),
+    bot_pnl: dayKeys.map((k) => round2(botWinByDay[k] - botLossByDay[k])),
+    net_profit: dayKeys.map((k) =>
+      round2(commissionByDay[k] + botWinByDay[k] - botLossByDay[k])
+    ),
+    deposits_amount: dayKeys.map((k) => depositAmtByDay[k]),
+    deposits_count: dayKeys.map((k) => depositCntByDay[k]),
+    withdrawals_amount: dayKeys.map((k) => withdrawAmtByDay[k]),
+    withdrawals_count: dayKeys.map((k) => withdrawCntByDay[k]),
+  };
+
+  const modeMap = new Map();
+  for (const row of playsByModeRes.rows || []) {
+    const mode = String(row.mode || 'unknown');
+    if (!modeMap.has(mode)) {
+      modeMap.set(mode, {
+        mode,
+        plays: 0,
+        commission: 0,
+        bot_wins: 0,
+        bot_losses: 0,
+        bot_pnl: 0,
+        net_profit: 0,
+      });
+    }
+    modeMap.get(mode).plays = Number(row.plays) || 0;
+  }
+  for (const row of revenueByModeRes.rows || []) {
+    const mode = String(row.mode || 'unknown');
+    if (!modeMap.has(mode)) {
+      modeMap.set(mode, {
+        mode,
+        plays: 0,
+        commission: 0,
+        bot_wins: 0,
+        bot_losses: 0,
+        bot_pnl: 0,
+        net_profit: 0,
+      });
+    }
+    const entry = modeMap.get(mode);
+    const amount = round2(Number(row.total));
+    if (row.event_type === 'commission') entry.commission = amount;
+    if (row.event_type === 'bot_win_credit') entry.bot_wins = amount;
+    if (row.event_type === 'bot_loss_debit') entry.bot_losses = amount;
+  }
+  const byMode = [...modeMap.values()].map((m) => {
+    const botPnl = round2(m.bot_wins - m.bot_losses);
+    return {
+      ...m,
+      bot_pnl: botPnl,
+      net_profit: round2(m.commission + botPnl),
+    };
+  });
+  byMode.sort((a, b) => b.plays - a.plays || b.net_profit - a.net_profit);
+
+  const summary = {
+    games_played: series.gameplay.reduce((a, b) => a + b, 0),
+    unique_players: series.unique_players.reduce((a, b) => Math.max(a, b), 0),
+    unique_players_note: 'Peak daily unique human players in range (not de-duplicated across days)',
+    new_users: series.new_users.reduce((a, b) => a + b, 0),
+    commission: sumSeries(series.commission),
+    bot_winnings: sumSeries(series.bot_winnings),
+    bot_losses: sumSeries(series.bot_losses),
+    bot_pnl: sumSeries(series.bot_pnl),
+    net_profit: sumSeries(series.net_profit),
+    deposits_amount: sumSeries(series.deposits_amount),
+    deposits_count: series.deposits_count.reduce((a, b) => a + b, 0),
+    withdrawals_amount: sumSeries(series.withdrawals_amount),
+    withdrawals_count: series.withdrawals_count.reduce((a, b) => a + b, 0),
+    net_cash_in: round2(sumSeries(series.deposits_amount) - sumSeries(series.withdrawals_amount)),
+  };
+
+  // True unique humans across the whole range (better summary metric).
+  try {
+    const uniqRes = await query(
+      `SELECT COUNT(DISTINCT gsp.user_id)::int AS players
+       FROM game_sessions gs
+       INNER JOIN game_session_players gsp ON gsp.game_session_id = gs.id
+       INNER JOIN users u ON u.id = gsp.user_id
+       WHERE gs.status = 'completed'
+         AND COALESCE(gs.ended_at, gs.updated_at, gs.created_at) >= $1
+         AND COALESCE(gs.ended_at, gs.updated_at, gs.created_at) <= $2
+         AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
+         AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
+         AND COALESCE(u.is_bot, false) = false`,
+      [sinceIso, untilIso]
+    );
+    summary.unique_players = Number(uniqRes.rows[0]?.players) || 0;
+    summary.unique_players_note = 'Distinct human players who completed a non-practice game in range';
+  } catch {
+    // keep peak-daily fallback
+  }
+
+  return {
+    currency: 'INR',
+    range: {
+      from: fromKey,
+      to: toKey,
+      days: dayCount,
+      timezone: 'UTC',
+    },
+    labels,
+    days: dayKeys,
+    series,
+    summary,
+    by_mode: byMode,
+  };
+}
+
 async function getUserCounts() {
   const res = await query(
     `SELECT
@@ -245,6 +615,25 @@ async function getUserCounts() {
     total_users: Number(row.total_users) || 0,
     active_users: Number(row.active_users) || 0,
     newly_onboarded_7d: Number(row.newly_onboarded_7d) || 0,
+  };
+}
+
+/** KYC queue counts for dashboard action tiles. pending = status 'submitted'. */
+async function getKycCounts() {
+  const res = await query(
+    `SELECT
+       COUNT(*)::int AS total,
+       COUNT(*) FILTER (WHERE status = 'submitted')::int AS pending,
+       COUNT(*) FILTER (WHERE status = 'approved')::int AS approved,
+       COUNT(*) FILTER (WHERE status = 'rejected')::int AS rejected
+     FROM kyc`
+  );
+  const row = res.rows[0] || {};
+  return {
+    total: Number(row.total) || 0,
+    pending: Number(row.pending) || 0,
+    approved: Number(row.approved) || 0,
+    rejected: Number(row.rejected) || 0,
   };
 }
 
@@ -327,15 +716,17 @@ async function getDashboardPayload() {
   startOfUtcDay.setUTCHours(0, 0, 0, 0);
   const todayIso = startOfUtcDay.toISOString();
 
-  const [liveStats, totals, userCounts, weekly, today, cashFlowAll, cashFlowToday] = await Promise.all([
-    getLivePlayStats(),
-    sumLedgerByEvent(),
-    getUserCounts(),
-    getWeeklySeries(),
-    sumLedgerByEvent({ since: todayIso }),
-    getCashFlowStats(),
-    getCashFlowStats({ since: todayIso }),
-  ]);
+  const [liveStats, totals, userCounts, weekly, today, cashFlowAll, cashFlowToday, kycCounts] =
+    await Promise.all([
+      getLivePlayStats(),
+      sumLedgerByEvent(),
+      getUserCounts(),
+      getWeeklySeries(),
+      sumLedgerByEvent({ since: todayIso }),
+      getCashFlowStats(),
+      getCashFlowStats({ since: todayIso }),
+      getKycCounts(),
+    ]);
 
   const allTime = deriveProfitFields(totals);
   const todayFields = deriveProfitFields(today);
@@ -347,6 +738,7 @@ async function getDashboardPayload() {
       active: userCounts.active_users,
       newly_onboarded_7d: userCounts.newly_onboarded_7d,
     },
+    kyc: kycCounts,
     revenue: {
       total_commission: allTime.commission,
       total_bot_winnings: allTime.bot_wins,
@@ -493,6 +885,7 @@ async function listLedgerEntries({
 module.exports = {
   round2,
   LEDGER_EVENT_TYPES,
+  ANALYTICS_MAX_DAYS,
   recordCommission,
   recordBotWinCredit,
   recordBotLossDebit,
@@ -502,7 +895,10 @@ module.exports = {
   sumLedgerByEvent,
   getDashboardPayload,
   getWeeklySeries,
+  getAnalyticsSeries,
+  parseAnalyticsRange,
   getUserCounts,
+  getKycCounts,
   getCashFlowStats,
   listLedgerEntries,
   deriveProfitFields,

@@ -4,6 +4,7 @@ const withdrawalService = require('../services/withdrawal.service');
 const walletService = require('../services/wallet.service');
 const adminTelemetryService = require('../services/adminTelemetry.service');
 const adminLedgerService = require('../services/adminLedger.service');
+const adminRbacService = require('../services/adminRbac.service');
 const staleSessionCleanupScheduler = require('../services/staleSessionCleanup.scheduler');
 
 // APK upload gate: multipart field `upload_pin` must match one of these 4-digit PINs (change on deploy as needed).
@@ -1482,6 +1483,105 @@ async function getDashboard(req, res) {
   }
 }
 
+/**
+ * GET /admin/analytics?from=&to=&days=
+ * Returns date-range chart series. Sections are redacted by RBAC metrics perms.
+ */
+async function getAnalytics(req, res) {
+  try {
+    const { from, to, days } = req.query || {};
+    const payload = await adminLedgerService.getAnalyticsSeries({ from, to, days });
+
+    const perms = new Set(req.admin?.permissions || []);
+    const canBasic = adminRbacService.hasPermission(perms, 'dashboard.metrics.basic');
+    const canBots = adminRbacService.hasPermission(perms, 'dashboard.metrics.bots');
+    const canEarnings = adminRbacService.hasPermission(perms, 'dashboard.metrics.earnings');
+    const canCashflow = adminRbacService.hasPermission(perms, 'cashflow.read');
+
+    const series = { ...(payload.series || {}) };
+    const summary = { ...(payload.summary || {}) };
+    let byMode = Array.isArray(payload.by_mode) ? [...payload.by_mode] : [];
+
+    if (!canBasic) {
+      delete series.gameplay;
+      delete series.unique_players;
+      delete series.new_users;
+      delete summary.games_played;
+      delete summary.unique_players;
+      delete summary.unique_players_note;
+      delete summary.new_users;
+      byMode = byMode.map(({ mode, plays }) => ({ mode, plays }));
+    }
+
+    if (!canEarnings) {
+      delete series.commission;
+      delete series.bot_winnings;
+      delete series.bot_losses;
+      delete series.bot_pnl;
+      delete series.net_profit;
+      delete summary.commission;
+      delete summary.bot_winnings;
+      delete summary.bot_losses;
+      delete summary.bot_pnl;
+      delete summary.net_profit;
+      byMode = byMode.map((row) => {
+        const next = { mode: row.mode };
+        if (canBasic && row.plays != null) next.plays = row.plays;
+        return next;
+      });
+    } else if (!canBots) {
+      // Earnings without bot detail: keep commission + net, hide bot breakdown.
+      delete series.bot_winnings;
+      delete series.bot_losses;
+      delete series.bot_pnl;
+      delete summary.bot_winnings;
+      delete summary.bot_losses;
+      delete summary.bot_pnl;
+      byMode = byMode.map((row) => {
+        const next = { mode: row.mode, commission: row.commission, net_profit: row.net_profit };
+        if (canBasic && row.plays != null) next.plays = row.plays;
+        return next;
+      });
+    }
+
+    if (!canCashflow) {
+      delete series.deposits_amount;
+      delete series.deposits_count;
+      delete series.withdrawals_amount;
+      delete series.withdrawals_count;
+      delete summary.deposits_amount;
+      delete summary.deposits_count;
+      delete summary.withdrawals_amount;
+      delete summary.withdrawals_count;
+      delete summary.net_cash_in;
+    }
+
+    return res.json({
+      success: true,
+      message: 'Analytics loaded',
+      currency: payload.currency,
+      range: payload.range,
+      labels: payload.labels,
+      days: payload.days,
+      series,
+      summary,
+      by_mode: byMode,
+      access: {
+        basic: canBasic,
+        bots: canBots,
+        earnings: canEarnings,
+        cashflow: canCashflow,
+      },
+    });
+  } catch (err) {
+    if (err?.code === 'INVALID_RANGE') {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    console.error('getAnalytics error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to load analytics' });
+  }
+}
+
 async function listAdminLedger(req, res) {
   try {
     const limit = parseInt(req.query.limit, 10);
@@ -1623,6 +1723,7 @@ module.exports = {
   createSupport,
   createWithdrawOption,
   getDashboard,
+  getAnalytics,
   listAdminLedger,
   getAppUpdateConfig,
   listAppUpdateVersions,

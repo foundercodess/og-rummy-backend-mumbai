@@ -12,6 +12,9 @@ const anyP = (...codes) => [requireAdmin, requireAnyPermission(...codes)];
 // Admin dashboard (revenue ledger sums + playing-now count)
 router.get('/dashboard', ...P('dashboard.read'), adminController.getDashboard);
 
+// Charts / analytics with date-range series (sections redacted by metrics perms)
+router.get('/analytics', ...anyP('analytics.read', 'dashboard.read'), adminController.getAnalytics);
+
 // Admin platform ledger history (commission / bot win credits / bot loss debits)
 router.get('/ledger', ...P('ledger.read'), adminController.listAdminLedger);
 
