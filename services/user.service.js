@@ -15,7 +15,7 @@ function formatProfile(user) {
   };
 }
 
-/** Admin-facing profile shape – includes joining date and live play flags. */
+/** Admin-facing profile shape – includes joining date and live play / activity flags. */
 function formatAdminProfile(user) {
   return {
     id: user.id,
@@ -26,10 +26,15 @@ function formatAdminProfile(user) {
     is_verified: user.is_verified ?? false,
     active: user.active !== false,
     created_at: user.created_at,
+    onboard_at: user.onboard_at || user.created_at || null,
+    updated_at: user.updated_at || null,
     is_playing: user.is_playing === true,
-    stale_status: user.stale_status || 'none',
     session_status: user.session_status || null,
     player_status: user.player_status || null,
+    last_gameplay_at: user.last_gameplay_at || null,
+    last_socket_at: user.last_socket_at || null,
+    last_activity_at: user.last_activity_at || user.last_socket_at || null,
+    last_successful_withdrawal_at: user.last_successful_withdrawal_at || null,
   };
 }
 
@@ -101,8 +106,13 @@ async function updateProfile(userId, { name, avatar }) {
   };
 }
 
-async function listUsers({ page = 1, limit = 20, last7days = false } = {}) {
-  const { users, total } = await userModel.getAllPaginated({ page, limit, last7days });
+async function listUsers({ page = 1, limit = 20, last7days = false, inactiveGameplayDays = null } = {}) {
+  const { users, total } = await userModel.getAllPaginated({
+    page,
+    limit,
+    last7days,
+    inactiveGameplayDays,
+  });
   return {
     users: users.map(formatAdminProfile),
     pagination: {

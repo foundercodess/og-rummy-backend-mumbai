@@ -1,6 +1,7 @@
 const authService = require('../services/auth.service');
 const loginAttemptModel = require('../models/loginAttempt.model');
 const userModel = require('../models/user.model');
+const adminRbacService = require('../services/adminRbac.service');
 
 /**
  * Require valid Bearer JWT and active session (one-session-per-user).
@@ -74,6 +75,89 @@ function requireRole(allowedRoles = []) {
   };
 }
 
-const requireAdmin = requireRole(['admin', 'super_admin']);
+/**
+ * Any authenticated admin (permissions loaded from DB via role_id).
+ * Sets req.auth + req.admin (full RBAC context).
+ */
+async function requireAdmin(req, res, next) {
+  try {
+    const authHeader = req.get('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ success: false, message: 'Authorization required.' });
+    }
 
-module.exports = { requireAuth, requireRole, requireAdmin };
+    const token = authHeader.slice(7).trim();
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'Invalid or missing token.' });
+    }
+
+    const payload = authService.verifyToken(token);
+    if (!payload || !payload.adminId) {
+      return res.status(401).json({ success: false, message: 'Invalid or expired token.' });
+    }
+
+    const admin = await adminRbacService.getAdminAuthContext(payload.adminId);
+    if (!admin || !admin.active) {
+      return res.status(401).json({ success: false, message: 'Admin not found or inactive.' });
+    }
+    if (!admin.role || admin.role.active === false) {
+      return res.status(403).json({ success: false, message: 'Admin role is inactive.' });
+    }
+
+    req.auth = {
+      adminId: admin.id,
+      role: admin.role.code,
+      roleId: admin.role.id,
+      level: admin.role.level,
+    };
+    req.admin = admin;
+    return next();
+  } catch (err) {
+    console.error('requireAdmin error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to authorize admin.' });
+  }
+}
+
+function requirePermission(...codes) {
+  const required = codes.flat().filter(Boolean);
+  return (req, res, next) => {
+    if (!req.admin) {
+      return res.status(401).json({ success: false, message: 'Authorization required.' });
+    }
+    const set = new Set(req.admin.permissions || []);
+    const missing = required.filter((code) => !adminRbacService.hasPermission(set, code));
+    if (missing.length) {
+      return res.status(403).json({
+        success: false,
+        message: 'Forbidden: missing permission.',
+        missing,
+      });
+    }
+    return next();
+  };
+}
+
+function requireAnyPermission(...codes) {
+  const required = codes.flat().filter(Boolean);
+  return (req, res, next) => {
+    if (!req.admin) {
+      return res.status(401).json({ success: false, message: 'Authorization required.' });
+    }
+    if (!adminRbacService.hasAnyPermission(req.admin.permissions || [], required)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Forbidden: missing permission.',
+        required,
+      });
+    }
+    return next();
+  };
+}
+
+module.exports = {
+  requireAuth,
+  requireRole,
+  requireAdmin,
+  requirePermission,
+  requireAnyPermission,
+};

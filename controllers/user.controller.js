@@ -56,8 +56,14 @@ async function listUsers(req, res) {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const last7days = req.query.last7days === 'true';
+    const inactiveRaw = req.query.inactive_gameplay_days ?? req.query.inactiveGameplayDays;
+    const inactiveParsed = inactiveRaw === undefined || inactiveRaw === null || inactiveRaw === ''
+      ? null
+      : Number(inactiveRaw);
+    const inactiveGameplayDays =
+      Number.isFinite(inactiveParsed) && inactiveParsed > 0 ? Math.floor(inactiveParsed) : null;
 
-    const result = await userService.listUsers({ page, limit, last7days });
+    const result = await userService.listUsers({ page, limit, last7days, inactiveGameplayDays });
     res.json({ success: true, message: 'Users fetched successfully', ...result });
   } catch (err) {
     console.error('listUsers error:', err);

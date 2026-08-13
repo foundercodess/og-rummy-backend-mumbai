@@ -16,20 +16,75 @@ async function getAll() {
 }
 
 /**
- * Paginated admin user list with live play + stale lobby flags.
- * Stale = seated in waiting/ready non-practice lobby with no activity for staleAfterHours (default 2h).
+ * Paginated admin user list with live play + activity timestamps.
+ * - onboard_at: registration time (users.created_at)
+ * - last_gameplay_at: last real-money table join or completed session
+ * - last_activity_at: last socket connection (users.last_socket_at)
+ * - last_successful_withdrawal_at: latest successful withdrawal completed time
+ * - inactiveGameplayDays: users with no real-money play within N days (null/never = included)
  */
-async function getAllPaginated({ page = 1, limit = 20, last7days = false, staleAfterHours = 2 } = {}) {
+async function getAllPaginated({
+  page = 1,
+  limit = 20,
+  last7days = false,
+  inactiveGameplayDays = null,
+} = {}) {
   const offset = (page - 1) * limit;
-  const staleHours = Number.isInteger(Number(staleAfterHours)) && Number(staleAfterHours) > 0
-    ? Number(staleAfterHours)
-    : 2;
-  const condition = last7days
-    ? `WHERE ${HUMAN_USERS_WHERE} AND u.created_at >= NOW() - INTERVAL '7 days'`
-    : `WHERE ${HUMAN_USERS_WHERE}`;
+  const inactiveDays = Number(inactiveGameplayDays);
+  const useInactiveFilter = Number.isFinite(inactiveDays) && inactiveDays > 0;
 
-  const countResult = await query(`SELECT COUNT(*) FROM users u ${condition}`);
-  const total = parseInt(countResult.rows[0].count, 10);
+  const conditions = [HUMAN_USERS_WHERE];
+  if (last7days) {
+    conditions.push(`u.created_at >= NOW() - INTERVAL '7 days'`);
+  }
+  if (useInactiveFilter) {
+    // No real-money play/join in the last N days (includes never played).
+    conditions.push(`(
+      gameplay.last_gameplay_at IS NULL
+      OR gameplay.last_gameplay_at < NOW() - ($3::int * INTERVAL '1 day')
+    )`);
+  }
+  const condition = `WHERE ${conditions.join(' AND ')}`;
+
+  const gameplayLateral = `
+     LEFT JOIN LATERAL (
+       SELECT GREATEST(
+         (
+           SELECT MAX(gsp.joined_at)
+           FROM game_session_players gsp
+           INNER JOIN game_sessions gs ON gs.id = gsp.game_session_id
+           WHERE gsp.user_id = u.id
+             AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
+             AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
+             AND COALESCE((gsp.metadata->>'is_bot')::boolean, false) = false
+         ),
+         (
+           SELECT MAX(COALESCE(gs.ended_at, gs.updated_at, gs.created_at))
+           FROM game_session_players gsp
+           INNER JOIN game_sessions gs ON gs.id = gsp.game_session_id
+           WHERE gsp.user_id = u.id
+             AND gs.status = 'completed'
+             AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
+             AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
+             AND COALESCE((gsp.metadata->>'is_bot')::boolean, false) = false
+         )
+       ) AS last_gameplay_at
+     ) gameplay ON true`;
+
+  let total;
+  if (useInactiveFilter) {
+    const countCondition = condition.replace('$3::int', '$1::int');
+    const countResult = await query(
+      `SELECT COUNT(*) FROM users u ${gameplayLateral} ${countCondition}`,
+      [inactiveDays]
+    );
+    total = parseInt(countResult.rows[0].count, 10);
+  } else {
+    const countResult = await query(`SELECT COUNT(*) FROM users u ${condition}`);
+    total = parseInt(countResult.rows[0].count, 10);
+  }
+
+  const listParams = useInactiveFilter ? [limit, offset, inactiveDays] : [limit, offset];
 
   const result = await query(
     `SELECT
@@ -41,25 +96,19 @@ async function getAllPaginated({ page = 1, limit = 20, last7days = false, staleA
        u.is_verified,
        u.active,
        u.created_at,
+       u.created_at AS onboard_at,
        u.updated_at,
+       u.last_socket_at,
        COALESCE(play.is_playing, false) AS is_playing,
        play.session_status,
        play.player_status,
-       play.session_updated_at,
-       CASE
-         WHEN play.session_id IS NULL THEN 'none'
-         WHEN play.session_status IN ('waiting', 'ready')
-           AND play.session_updated_at < NOW() - ($3::int * INTERVAL '1 hour')
-           THEN 'stale'
-         WHEN play.player_status = 'disconnected' THEN 'disconnected'
-         ELSE 'ok'
-       END AS stale_status
+       gameplay.last_gameplay_at,
+       u.last_socket_at AS last_activity_at,
+       wd.last_successful_withdrawal_at
      FROM users u
      LEFT JOIN LATERAL (
        SELECT
-         gs.id AS session_id,
          gs.status AS session_status,
-         gs.updated_at AS session_updated_at,
          gsp.status AS player_status,
          true AS is_playing
        FROM game_session_players gsp
@@ -75,10 +124,17 @@ async function getAllPaginated({ page = 1, limit = 20, last7days = false, staleA
          gs.updated_at DESC
        LIMIT 1
      ) play ON true
+     ${gameplayLateral}
+     LEFT JOIN LATERAL (
+       SELECT MAX(COALESCE(wt.completed_at, wt.updated_at, wt.created_at)) AS last_successful_withdrawal_at
+       FROM withdrawal_transactions wt
+       WHERE wt.user_id = u.id
+         AND wt.status = 'successful'
+     ) wd ON true
      ${condition}
      ORDER BY u.created_at DESC
      LIMIT $1 OFFSET $2`,
-    [limit, offset, staleHours]
+    listParams
   );
 
   return { users: result.rows, total };
@@ -196,6 +252,20 @@ async function markAsBot(userId) {
   return result.rows[0] || null;
 }
 
+/** Fire-and-forget friendly: mark last realtime socket connection time. */
+async function touchLastSocketAt(userId) {
+  const uid = Number(userId);
+  if (!Number.isInteger(uid) || uid <= 0) return null;
+  const result = await query(
+    `UPDATE users
+     SET last_socket_at = NOW()
+     WHERE id = $1
+     RETURNING id, last_socket_at`,
+    [uid]
+  );
+  return result.rows[0] || null;
+}
+
 module.exports = {
   HUMAN_USERS_WHERE,
   findById,
@@ -210,4 +280,5 @@ module.exports = {
   updateProfile,
   updateActiveStatus,
   markAsBot,
+  touchLastSocketAt,
 };

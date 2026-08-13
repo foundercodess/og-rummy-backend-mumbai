@@ -962,7 +962,10 @@ async function listRechargesForAdmin({
     `SELECT
        COALESCE(SUM(rt.amount), 0)::numeric(14,2) AS requested_total,
        COALESCE(SUM(CASE WHEN rt.status = 'payment_success' THEN rt.amount ELSE 0 END), 0)::numeric(14,2) AS success_total,
+       COALESCE(SUM(CASE WHEN rt.status IN ('init', 'not_paid') THEN rt.amount ELSE 0 END), 0)::numeric(14,2) AS pending_total,
+       COALESCE(SUM(CASE WHEN rt.status = 'failed' THEN rt.amount ELSE 0 END), 0)::numeric(14,2) AS failed_total,
        COUNT(*) FILTER (WHERE rt.status = 'payment_success')::int AS success_count,
+       COUNT(*) FILTER (WHERE rt.status IN ('init', 'not_paid'))::int AS pending_count,
        COUNT(*) FILTER (WHERE rt.status = 'failed')::int AS failed_count,
        COUNT(*) FILTER (WHERE rt.status = 'init')::int AS init_count,
        COUNT(*) FILTER (WHERE rt.status = 'not_paid')::int AS not_paid_count
@@ -1053,10 +1056,25 @@ async function listRechargesForAdmin({
     summary: {
       requested_total: toNumberOrNull(summaryRow.requested_total) || 0,
       success_total: toNumberOrNull(summaryRow.success_total) || 0,
+      pending_total: toNumberOrNull(summaryRow.pending_total) || 0,
+      failed_total: toNumberOrNull(summaryRow.failed_total) || 0,
       success_count: Number(summaryRow.success_count || 0),
+      pending_count: Number(summaryRow.pending_count || 0),
       failed_count: Number(summaryRow.failed_count || 0),
       init_count: Number(summaryRow.init_count || 0),
       not_paid_count: Number(summaryRow.not_paid_count || 0),
+      completed: {
+        count: Number(summaryRow.success_count || 0),
+        amount: toNumberOrNull(summaryRow.success_total) || 0,
+      },
+      pending: {
+        count: Number(summaryRow.pending_count || 0),
+        amount: toNumberOrNull(summaryRow.pending_total) || 0,
+      },
+      failed: {
+        count: Number(summaryRow.failed_count || 0),
+        amount: toNumberOrNull(summaryRow.failed_total) || 0,
+      },
     },
   };
 }
@@ -1278,11 +1296,15 @@ async function listWithdrawalsForAdmin({
     `SELECT
        COALESCE(SUM(wt.amount), 0)::numeric(14,2) AS requested_total,
        COALESCE(SUM(CASE WHEN wt.status = 'successful' THEN wt.amount ELSE 0 END), 0)::numeric(14,2) AS success_total,
+       COALESCE(SUM(CASE WHEN wt.status IN ('init', 'pending', 'processing') THEN wt.amount ELSE 0 END), 0)::numeric(14,2) AS pending_total,
+       COALESCE(SUM(CASE WHEN wt.status IN ('failed', 'rejected') THEN wt.amount ELSE 0 END), 0)::numeric(14,2) AS failed_total,
        COUNT(*) FILTER (WHERE wt.status = 'successful')::int AS success_count,
+       COUNT(*) FILTER (WHERE wt.status IN ('init', 'pending', 'processing'))::int AS open_count,
        COUNT(*) FILTER (WHERE wt.status = 'processing')::int AS processing_count,
        COUNT(*) FILTER (WHERE wt.status = 'pending')::int AS pending_count,
        COUNT(*) FILTER (WHERE wt.status = 'failed')::int AS failed_count,
-       COUNT(*) FILTER (WHERE wt.status = 'rejected')::int AS rejected_count
+       COUNT(*) FILTER (WHERE wt.status = 'rejected')::int AS rejected_count,
+       COUNT(*) FILTER (WHERE wt.status IN ('failed', 'rejected'))::int AS failed_or_rejected_count
      ${fromJoin}`,
     params
   );
@@ -1372,11 +1394,26 @@ async function listWithdrawalsForAdmin({
     summary: {
       requested_total: toNumberOrNull(summaryRow.requested_total) || 0,
       success_total: toNumberOrNull(summaryRow.success_total) || 0,
+      pending_total: toNumberOrNull(summaryRow.pending_total) || 0,
+      failed_total: toNumberOrNull(summaryRow.failed_total) || 0,
       success_count: Number(summaryRow.success_count || 0),
       processing_count: Number(summaryRow.processing_count || 0),
       pending_count: Number(summaryRow.pending_count || 0),
+      open_count: Number(summaryRow.open_count || 0),
       failed_count: Number(summaryRow.failed_count || 0),
       rejected_count: Number(summaryRow.rejected_count || 0),
+      completed: {
+        count: Number(summaryRow.success_count || 0),
+        amount: toNumberOrNull(summaryRow.success_total) || 0,
+      },
+      pending: {
+        count: Number(summaryRow.open_count || 0),
+        amount: toNumberOrNull(summaryRow.pending_total) || 0,
+      },
+      failed: {
+        count: Number(summaryRow.failed_or_rejected_count || 0),
+        amount: toNumberOrNull(summaryRow.failed_total) || 0,
+      },
     },
   };
 }
@@ -1969,7 +2006,9 @@ async function updateUserKycStatus({ userId, status, rejectionNote }) {
 
 /**
  * Per-game win/loss summary for a user (completed non-practice sessions).
- * Win/loss inferred from settlement metadata.result.results[].is_winner / won_amount.
+ * Win/loss from metadata.result.results[].is_winner / won_amount.
+ * Pool/deals/spin losers often have won_amount=0 (only winner is in settlement.per_player),
+ * so Total Lost falls back to game_entry_debit for that session (then contest entry).
  */
 async function getUserGameProfile(userId) {
   const uid = Number(userId);
@@ -1996,13 +2035,24 @@ async function getUserGameProfile(userId) {
        COALESCE(SUM(
          CASE
            WHEN COALESCE((player_result.item->>'is_winner')::boolean, false) = false
-           THEN ABS(COALESCE(NULLIF(player_result.item->>'won_amount', '')::numeric, 0))
+           THEN CASE
+             -- Points/deals settlements store loss in won_amount (often negative).
+             WHEN NULLIF(player_result.item->>'won_amount', '') IS NOT NULL
+               AND ABS(COALESCE(NULLIF(player_result.item->>'won_amount', '')::numeric, 0)) > 0
+             THEN ABS(NULLIF(player_result.item->>'won_amount', '')::numeric)
+             -- Pool/spin often omit losers from settlement; use entry fees paid.
+             ELSE GREATEST(
+               COALESCE(entry_fees.paid, 0),
+               COALESCE(NULLIF(c.entry, '')::numeric, 0)
+             )
+           END
            ELSE 0
          END
        ), 0)::numeric(14,2) AS total_lost
      FROM game_session_players gsp
      INNER JOIN game_sessions gs ON gs.id = gsp.game_session_id
      LEFT JOIN games g ON g.id = gs.game_id
+     LEFT JOIN contests c ON c.id = gs.contest_id
      LEFT JOIN LATERAL (
        SELECT item
        FROM jsonb_array_elements(
@@ -2016,6 +2066,14 @@ async function getUserGameProfile(userId) {
          AND (item->>'user_id')::int = gsp.user_id
        LIMIT 1
      ) player_result ON true
+     LEFT JOIN LATERAL (
+       SELECT COALESCE(SUM(ABS(wt.amount)), 0)::numeric AS paid
+       FROM wallet_transactions wt
+       WHERE wt.user_id = gsp.user_id
+         AND wt.reference_type = 'game_session'
+         AND wt.reference_id = gs.id
+         AND wt.transaction_type = 'game_entry_debit'
+     ) entry_fees ON true
      WHERE gsp.user_id = $1
        AND gs.status = 'completed'
        AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
@@ -2045,6 +2103,117 @@ async function getUserGameProfile(userId) {
   });
 }
 
+async function getUserCashFlowSummary(userId) {
+  const uid = Number(userId);
+  if (!Number.isInteger(uid) || uid <= 0) {
+    return {
+      add_cash: { completed_count: 0, completed_amount: 0, pending_count: 0, pending_amount: 0, failed_count: 0, failed_amount: 0 },
+      withdrawals: { completed_count: 0, completed_amount: 0, pending_count: 0, pending_amount: 0, failed_count: 0, failed_amount: 0 },
+    };
+  }
+
+  const [rechargeRes, withdrawalRes] = await Promise.all([
+    query(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'payment_success')::int AS completed_count,
+         COALESCE(SUM(CASE WHEN status = 'payment_success' THEN amount ELSE 0 END), 0)::numeric(14,2) AS completed_amount,
+         COUNT(*) FILTER (WHERE status IN ('init', 'not_paid'))::int AS pending_count,
+         COALESCE(SUM(CASE WHEN status IN ('init', 'not_paid') THEN amount ELSE 0 END), 0)::numeric(14,2) AS pending_amount,
+         COUNT(*) FILTER (WHERE status = 'failed')::int AS failed_count,
+         COALESCE(SUM(CASE WHEN status = 'failed' THEN amount ELSE 0 END), 0)::numeric(14,2) AS failed_amount
+       FROM recharge_transactions
+       WHERE user_id = $1`,
+      [uid]
+    ),
+    query(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'successful')::int AS completed_count,
+         COALESCE(SUM(CASE WHEN status = 'successful' THEN amount ELSE 0 END), 0)::numeric(14,2) AS completed_amount,
+         COUNT(*) FILTER (WHERE status IN ('init', 'pending', 'processing'))::int AS pending_count,
+         COALESCE(SUM(CASE WHEN status IN ('init', 'pending', 'processing') THEN amount ELSE 0 END), 0)::numeric(14,2) AS pending_amount,
+         COUNT(*) FILTER (WHERE status IN ('failed', 'rejected'))::int AS failed_count,
+         COALESCE(SUM(CASE WHEN status IN ('failed', 'rejected') THEN amount ELSE 0 END), 0)::numeric(14,2) AS failed_amount
+       FROM withdrawal_transactions
+       WHERE user_id = $1`,
+      [uid]
+    ),
+  ]);
+
+  const mapRow = (row = {}) => ({
+    completed_count: Number(row.completed_count) || 0,
+    completed_amount: Number(Number(row.completed_amount || 0).toFixed(2)),
+    pending_count: Number(row.pending_count) || 0,
+    pending_amount: Number(Number(row.pending_amount || 0).toFixed(2)),
+    failed_count: Number(row.failed_count) || 0,
+    failed_amount: Number(Number(row.failed_amount || 0).toFixed(2)),
+  });
+
+  return {
+    add_cash: mapRow(rechargeRes.rows[0]),
+    withdrawals: mapRow(withdrawalRes.rows[0]),
+  };
+}
+
+async function getUserActivityTimestamps(userId) {
+  const uid = Number(userId);
+  if (!Number.isInteger(uid) || uid <= 0) {
+    return {
+      onboard_at: null,
+      last_gameplay_at: null,
+      last_socket_at: null,
+      last_activity_at: null,
+      last_successful_withdrawal_at: null,
+    };
+  }
+
+  const result = await query(
+    `SELECT
+       u.created_at AS onboard_at,
+       u.last_socket_at,
+       (
+         SELECT GREATEST(
+           (
+             SELECT MAX(gsp.joined_at)
+             FROM game_session_players gsp
+             INNER JOIN game_sessions gs ON gs.id = gsp.game_session_id
+             WHERE gsp.user_id = u.id
+               AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
+               AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
+               AND COALESCE((gsp.metadata->>'is_bot')::boolean, false) = false
+           ),
+           (
+             SELECT MAX(COALESCE(gs.ended_at, gs.updated_at, gs.created_at))
+             FROM game_session_players gsp
+             INNER JOIN game_sessions gs ON gs.id = gsp.game_session_id
+             WHERE gsp.user_id = u.id
+               AND gs.status = 'completed'
+               AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
+               AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
+               AND COALESCE((gsp.metadata->>'is_bot')::boolean, false) = false
+           )
+         )
+       ) AS last_gameplay_at,
+       (
+         SELECT MAX(COALESCE(wt.completed_at, wt.updated_at, wt.created_at))
+         FROM withdrawal_transactions wt
+         WHERE wt.user_id = u.id
+           AND wt.status = 'successful'
+       ) AS last_successful_withdrawal_at
+     FROM users u
+     WHERE u.id = $1`,
+    [uid]
+  );
+
+  const row = result.rows[0] || {};
+  return {
+    onboard_at: row.onboard_at || null,
+    last_gameplay_at: row.last_gameplay_at || null,
+    last_socket_at: row.last_socket_at || null,
+    last_activity_at: row.last_socket_at || null,
+    last_successful_withdrawal_at: row.last_successful_withdrawal_at || null,
+  };
+}
+
 async function getUserDetailsById(userId) {
   const user = await userModel.findById(userId);
   if (!user) {
@@ -2053,10 +2222,12 @@ async function getUserDetailsById(userId) {
     throw err;
   }
 
-  const [kyc, wallet, gameProfile] = await Promise.all([
+  const [kyc, wallet, gameProfile, cashFlow, activity] = await Promise.all([
     kycModel.findByUserId(userId),
     walletModel.getOrCreateByUserId(userId),
     getUserGameProfile(userId),
+    getUserCashFlowSummary(userId),
+    getUserActivityTimestamps(userId),
   ]);
 
   return {
@@ -2069,11 +2240,17 @@ async function getUserDetailsById(userId) {
       is_verified: user.is_verified ?? false,
       active: user.active !== false,
       created_at: user.created_at,
+      onboard_at: activity.onboard_at || user.created_at,
       updated_at: user.updated_at,
+      last_gameplay_at: activity.last_gameplay_at,
+      last_socket_at: activity.last_socket_at,
+      last_activity_at: activity.last_activity_at,
+      last_successful_withdrawal_at: activity.last_successful_withdrawal_at,
     },
     kyc_details: kyc ? kycModel.formatForResponse(kyc) : null,
     wallet,
     game_profile: gameProfile,
+    cash_flow: cashFlow,
   };
 }
 
@@ -2902,6 +3079,213 @@ async function updateAddCashComplaintStatusForAdmin({ complaintId, status, admin
   return { complaint: row };
 }
 
+/**
+ * Per-game + per-contest session aggregates for the Games admin section.
+ * Definitions align with livePlayStats / games history:
+ * - live = waiting | ready | active
+ * - completed = status completed
+ * - today = UTC calendar day on COALESCE(ended_at, updated_at, created_at)
+ * - excludes practice / practice_bot_only sessions
+ */
+async function getGameSessionStatsForAdmin() {
+  const [result, livePlayersResult] = await Promise.all([
+    query(
+      `SELECT
+         g.id AS game_id,
+         g.name AS game_name,
+         g.active AS game_active,
+         g.sort_order AS game_sort_order,
+         g.side_banner,
+         g.dashboard_banner,
+         c.id AS contest_id,
+         c.player_count,
+         c.entry,
+         c.point_value,
+         c.win_upto,
+         c.active AS contest_active,
+         c.sort_order AS contest_sort_order,
+         COUNT(gs.id)::int AS total_sessions,
+         COUNT(*) FILTER (WHERE gs.status = 'completed')::int AS completed,
+         COUNT(*) FILTER (WHERE gs.status IN ('waiting', 'ready', 'active'))::int AS live,
+         COUNT(*) FILTER (WHERE gs.status = 'waiting')::int AS waiting,
+         COUNT(*) FILTER (WHERE gs.status = 'ready')::int AS ready,
+         COUNT(*) FILTER (WHERE gs.status = 'active')::int AS in_play,
+         COUNT(*) FILTER (WHERE gs.status = 'cancelled')::int AS cancelled,
+         COUNT(*) FILTER (
+           WHERE gs.status = 'completed'
+             AND (COALESCE(gs.ended_at, gs.updated_at, gs.created_at) AT TIME ZONE 'UTC')::date
+                 = (NOW() AT TIME ZONE 'UTC')::date
+         )::int AS today_completed
+       FROM games g
+       LEFT JOIN contests c ON c.game_id = g.id
+       LEFT JOIN game_sessions gs
+         ON gs.contest_id = c.id
+        AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
+        AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
+       GROUP BY
+         g.id, g.name, g.active, g.sort_order, g.side_banner, g.dashboard_banner,
+         c.id, c.player_count, c.entry, c.point_value, c.win_upto, c.active, c.sort_order
+       ORDER BY g.sort_order ASC NULLS LAST, g.id ASC, c.player_count ASC NULLS LAST, c.sort_order ASC NULLS LAST, c.id ASC`
+    ),
+    query(
+      `SELECT
+         gs.game_id,
+         COUNT(DISTINCT CASE
+           WHEN COALESCE((gsp.metadata->>'is_bot')::boolean, false) = false
+           THEN gsp.user_id
+         END)::int AS live_humans,
+         COUNT(DISTINCT CASE
+           WHEN COALESCE((gsp.metadata->>'is_bot')::boolean, false) = true
+           THEN gsp.user_id
+         END)::int AS live_bots,
+         COUNT(DISTINCT gsp.user_id)::int AS live_players
+       FROM game_sessions gs
+       INNER JOIN game_session_players gsp
+         ON gsp.game_session_id = gs.id
+        AND gsp.status IN ('joined', 'disconnected')
+       WHERE gs.status IN ('waiting', 'ready', 'active')
+         AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
+         AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
+       GROUP BY gs.game_id`
+    ),
+  ]);
+
+  const livePlayersByGame = new Map();
+  for (const row of livePlayersResult.rows || []) {
+    const gameId = Number(row.game_id);
+    if (!Number.isFinite(gameId)) continue;
+    livePlayersByGame.set(gameId, {
+      total: Number(row.live_players) || 0,
+      humans: Number(row.live_humans) || 0,
+      bots: Number(row.live_bots) || 0,
+    });
+  }
+
+  const gamesMap = new Map();
+
+  for (const row of result.rows || []) {
+    const gameId = Number(row.game_id);
+    if (!gamesMap.has(gameId)) {
+      const livePlayers = livePlayersByGame.get(gameId) || { total: 0, humans: 0, bots: 0 };
+      gamesMap.set(gameId, {
+        id: gameId,
+        name: row.game_name,
+        active: row.game_active !== false,
+        side_banner: row.side_banner || null,
+        dashboard_banner: row.dashboard_banner || null,
+        sessions: {
+          total: 0,
+          total_completed: 0,
+          today_completed: 0,
+          live: 0,
+          waiting: 0,
+          ready: 0,
+          active: 0,
+          cancelled: 0,
+        },
+        players: {
+          /** All seats currently at live tables (humans + bots). */
+          count: livePlayers.total,
+          /** Human players currently at live tables. */
+          live_count: livePlayers.humans,
+          bots: livePlayers.bots,
+        },
+        contests: [],
+      });
+    }
+
+    const game = gamesMap.get(gameId);
+    const contestId = row.contest_id == null ? null : Number(row.contest_id);
+    if (!Number.isFinite(contestId)) continue;
+
+    const contestSessions = {
+      total: Number(row.total_sessions) || 0,
+      completed: Number(row.completed) || 0,
+      today_completed: Number(row.today_completed) || 0,
+      live: Number(row.live) || 0,
+      waiting: Number(row.waiting) || 0,
+      ready: Number(row.ready) || 0,
+      active: Number(row.in_play) || 0,
+      cancelled: Number(row.cancelled) || 0,
+    };
+
+    game.contests.push({
+      id: contestId,
+      player_count: Number(row.player_count) || null,
+      entry: row.entry != null ? Number(row.entry) : null,
+      point_value: row.point_value != null ? Number(row.point_value) : null,
+      win_upto: row.win_upto != null ? Number(row.win_upto) : null,
+      active: row.contest_active !== false,
+      sessions: contestSessions,
+    });
+
+    game.sessions.total += contestSessions.total;
+    game.sessions.total_completed += contestSessions.completed;
+    game.sessions.today_completed += contestSessions.today_completed;
+    game.sessions.live += contestSessions.live;
+    game.sessions.waiting += contestSessions.waiting;
+    game.sessions.ready += contestSessions.ready;
+    game.sessions.active += contestSessions.active;
+    game.sessions.cancelled += contestSessions.cancelled;
+  }
+
+  // Ensure games with live players but no contest rows still appear (unlikely).
+  for (const [gameId, livePlayers] of livePlayersByGame.entries()) {
+    if (gamesMap.has(gameId)) continue;
+    gamesMap.set(gameId, {
+      id: gameId,
+      name: `Game #${gameId}`,
+      active: true,
+      side_banner: null,
+      dashboard_banner: null,
+      sessions: {
+        total: 0,
+        total_completed: 0,
+        today_completed: 0,
+        live: 0,
+        waiting: 0,
+        ready: 0,
+        active: 0,
+        cancelled: 0,
+      },
+      players: {
+        count: livePlayers.total,
+        live_count: livePlayers.humans,
+        bots: livePlayers.bots,
+      },
+      contests: [],
+    });
+  }
+
+  const games = Array.from(gamesMap.values());
+  const totals = games.reduce(
+    (acc, game) => {
+      acc.total_completed += game.sessions.total_completed;
+      acc.today_completed += game.sessions.today_completed;
+      acc.live += game.sessions.live;
+      acc.total_sessions += game.sessions.total;
+      acc.players_count += Number(game.players?.count) || 0;
+      acc.live_players += Number(game.players?.live_count) || 0;
+      return acc;
+    },
+    {
+      total_completed: 0,
+      today_completed: 0,
+      live: 0,
+      total_sessions: 0,
+      players_count: 0,
+      live_players: 0,
+    }
+  );
+
+  return {
+    timezone: 'UTC',
+    as_of: new Date().toISOString(),
+    totals,
+    games,
+  };
+}
+
 module.exports = {
   createAddCashOptionForAdmin,
   createAvatarForAdmin,
@@ -2915,6 +3299,7 @@ module.exports = {
   listWithdrawalsForAdmin,
   getWithdrawalDetailsForAdmin,
   getGameHistoryDetailsForAdmin,
+  getGameSessionStatsForAdmin,
   getUserDetailsById,
   getAppUpdateConfigForAdmin,
   listAppUpdateVersionsForAdmin,

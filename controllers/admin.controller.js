@@ -231,6 +231,20 @@ async function getGameHistoryDetails(req, res) {
   }
 }
 
+async function getGameSessionStats(req, res) {
+  try {
+    const result = await adminService.getGameSessionStatsForAdmin();
+    return res.json({
+      success: true,
+      message: 'Game session stats loaded',
+      ...result,
+    });
+  } catch (err) {
+    console.error('getGameSessionStats error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to load game session stats' });
+  }
+}
+
 async function listGameTelemetry(req, res) {
   try {
     const result = await adminTelemetryService.listTelemetryForAdmin(req.query || {});
@@ -1472,7 +1486,13 @@ async function listAdminLedger(req, res) {
   try {
     const limit = parseInt(req.query.limit, 10);
     const offset = parseInt(req.query.offset, 10);
-    const { event_type: eventType, from: fromRaw, to: toRaw } = req.query || {};
+    const {
+      event_type: eventType,
+      mode,
+      session_id: sessionId,
+      from: fromRaw,
+      to: toRaw,
+    } = req.query || {};
 
     let fromDate = null;
     let toDate = null;
@@ -1491,10 +1511,19 @@ async function listAdminLedger(req, res) {
       toDate = d.toISOString();
     }
 
+    if (eventType && !adminLedgerService.LEDGER_EVENT_TYPES.includes(String(eventType))) {
+      return res.status(400).json({
+        success: false,
+        message: `event_type must be one of: ${adminLedgerService.LEDGER_EVENT_TYPES.join(', ')}`,
+      });
+    }
+
     const result = await adminLedgerService.listLedgerEntries({
       limit,
       offset,
       eventType,
+      mode,
+      sessionId,
       fromDate,
       toDate,
     });
@@ -1526,6 +1555,64 @@ async function updateAddCashComplaintStatus(req, res) {
     if (err.code === 'INVALID_SUPPORT_STATUS_UPDATE') return res.status(400).json({ success: false, message: 'status must be open, in_review, resolved, or rejected' });
     if (err.code === 'ADD_CASH_COMPLAINT_NOT_FOUND') return res.status(404).json({ success: false, message: 'Add cash complaint not found' });
     return res.status(500).json({ success: false, message: 'Failed to update add cash complaint' });
+  }
+}
+
+async function enqueueInactiveGameplayReminder(req, res) {
+  try {
+    const pushCampaignService = require('../services/pushCampaign.service');
+    const body = req.body || {};
+    const inactiveDays = Number(body.inactive_days ?? body.inactiveDays ?? 3);
+    const result = await pushCampaignService.enqueueInactiveGameplayReminder({
+      inactiveDays,
+      title: body.title,
+      body: body.body || body.message,
+      createdByAdminId: req.auth?.adminId || req.admin?.id || null,
+    });
+    return res.status(202).json({
+      success: true,
+      message: 'Reminder campaign queued. FCM multicast will run in the background worker.',
+      ...result,
+    });
+  } catch (err) {
+    console.error('enqueueInactiveGameplayReminder error:', err);
+    if (err.code === 'INVALID_INACTIVE_DAYS') {
+      return res.status(400).json({ success: false, message: 'inactive_days must be between 1 and 90' });
+    }
+    if (err.code === 'FCM_NOT_CONFIGURED') {
+      return res.status(503).json({ success: false, message: 'FCM is not configured on the server' });
+    }
+    if (err.code === 'NO_ELIGIBLE_USERS') {
+      return res.status(400).json({
+        success: false,
+        message: 'No inactive users with push tokens found for that window',
+      });
+    }
+    if (err.code === 'CAMPAIGN_ALREADY_RUNNING') {
+      return res.status(409).json({
+        success: false,
+        message: 'A reminder campaign for this window is already queued or running',
+        campaign: err.campaign || null,
+      });
+    }
+    if (err.code === 'PUSH_QUEUE_UNAVAILABLE') {
+      return res.status(503).json({ success: false, message: 'Push queue unavailable (Redis)' });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to queue reminder campaign' });
+  }
+}
+
+async function getPushCampaign(req, res) {
+  try {
+    const pushCampaignService = require('../services/pushCampaign.service');
+    const campaign = await pushCampaignService.getCampaign(req.params.campaignId);
+    if (!campaign) {
+      return res.status(404).json({ success: false, message: 'Campaign not found' });
+    }
+    return res.json({ success: true, campaign });
+  } catch (err) {
+    console.error('getPushCampaign error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to load campaign' });
   }
 }
 
@@ -1563,6 +1650,7 @@ module.exports = {
   updateBotInjectionSettings,
   updateSupport,
   listGamesHistory,
+  getGameSessionStats,
   triggerStaleSessionCleanup,
   listRecharges,
   listWalletTransactions,
@@ -1582,4 +1670,6 @@ module.exports = {
   updateWithdrawOptionActive,
   updateUserActiveStatus,
   updateUserKycStatus,
+  enqueueInactiveGameplayReminder,
+  getPushCampaign,
 };

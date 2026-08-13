@@ -6,7 +6,7 @@ async function findByEmail(email) {
   if (!normalized) return null;
 
   const result = await query(
-    `SELECT id, email, password_hash, password_salt, role, active, created_at, updated_at
+    `SELECT id, email, password_hash, password_salt, role, role_id, active, created_at, updated_at
      FROM admins
      WHERE LOWER(TRIM(email)) = $1`,
     [normalized]
@@ -17,7 +17,7 @@ async function findByEmail(email) {
 
 async function findById(id) {
   const result = await query(
-    `SELECT id, email, role, active, created_at, updated_at
+    `SELECT id, email, role, role_id, active, created_at, updated_at
      FROM admins
      WHERE id = $1`,
     [id]

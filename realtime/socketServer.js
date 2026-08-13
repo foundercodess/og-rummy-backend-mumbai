@@ -5474,6 +5474,22 @@ async function settleGameResult(sessionId, finalizedResults, winnerUserId, point
         });
         remainingBotCap = roundCurrency(remainingBotCap - cappedAmount);
       }
+      for (const entry of perPlayer) {
+        if (entry.is_winner) continue;
+        if (!adminLedgerService.isUserBotFromMap(botFlagMap, entry.user_id)) continue;
+        const lossAmt = roundCurrency(Math.abs(Number(entry.amount) || 0));
+        if (!(lossAmt > 0)) continue;
+        logGame(
+          sessionId,
+          `BOT_ADMIN_DEBIT mode=points uid=${entry.user_id} loss=₹${lossAmt}`
+        );
+        await adminLedgerService.recordBotLossDebit(client, {
+          sessionId,
+          userId: entry.user_id,
+          amount: lossAmt,
+          mode: 'points',
+        });
+      }
       await client.query('RELEASE SAVEPOINT admin_ledger_points');
     } catch (ledgerErr) {
       await client.query('ROLLBACK TO SAVEPOINT admin_ledger_points');
@@ -5583,11 +5599,27 @@ async function settlePoolPotResult(session = {}, winnerUserId = null) {
     }
 
     const loserUserIds = resolveNonWinningJoinedUserIds(session, winnerUserId);
+    const loserPerPlayer = [];
     for (const uid of loserUserIds) {
-      if (isBotTurn(session, uid)) continue;
+      if (isBotTurn(session, uid)) {
+        const safeEntryFee = roundCurrency(Number.isFinite(entryFee) ? entryFee : 0);
+        if (safeEntryFee > 0) {
+          loserPerPlayer.push({
+            user_id: uid,
+            amount: -safeEntryFee,
+            is_winner: false,
+          });
+        }
+        continue;
+      }
       let basis = await resolveEntryFeesPaidForSession(client, uid, sessionId);
       if (!(basis > 0)) basis = roundCurrency(Number.isFinite(entryFee) ? entryFee : 0);
       if (!(basis > 0)) continue;
+      loserPerPlayer.push({
+        user_id: uid,
+        amount: -basis,
+        is_winner: false,
+      });
       await releasePendingBonusAfterPlay(client, {
         userId: uid,
         sessionId,
@@ -5621,6 +5653,23 @@ async function settlePoolPotResult(session = {}, winnerUserId = null) {
           mode: 'pool',
         });
         }
+      } else {
+        const safeEntryFee = roundCurrency(Number.isFinite(entryFee) ? entryFee : 0);
+        const losingBotIds = resolveNonWinningJoinedUserIds(session, winnerUserId)
+          .filter((uid) => isBotTurn(session, uid));
+        for (const botUid of losingBotIds) {
+          if (!(safeEntryFee > 0)) continue;
+          logGame(
+            sessionId,
+            `BOT_ADMIN_DEBIT mode=pool uid=${botUid} loss=₹${safeEntryFee}`
+          );
+          await adminLedgerService.recordBotLossDebit(client, {
+            sessionId,
+            userId: botUid,
+            amount: safeEntryFee,
+            mode: 'pool',
+          });
+        }
       }
       await client.query('RELEASE SAVEPOINT admin_ledger_pool');
     } catch (ledgerErr) {
@@ -5646,6 +5695,7 @@ async function settlePoolPotResult(session = {}, winnerUserId = null) {
           amount: winnerAmount,
           is_winner: true,
         },
+        ...loserPerPlayer,
       ],
     };
   } catch (err) {
@@ -5680,8 +5730,12 @@ async function settlePoolSplitResult(session = {}, splitRows = [], offerId = nul
     const realHumanPoolCap = await resolveHumanEntryPoolForSession(client, session);
     let remainingBotCap = roundCurrency(realHumanPoolCap);
 
+    const entryFeeForSplit = roundCurrency(Number(session?.contest?.entry) || 0);
+    const paidBotUserIds = new Set();
+
     for (const row of payableRows) {
       if (isBotTurn(session, row.user_id)) {
+        paidBotUserIds.add(Number(row.user_id));
         const cappedBotAmount = roundCurrency(Math.min(Number(row.amount) || 0, Math.max(0, remainingBotCap)));
         if (cappedBotAmount > 0) {
           logGame(
@@ -5729,6 +5783,28 @@ async function settlePoolSplitResult(session = {}, splitRows = [], offerId = nul
           }),
         ]
       );
+    }
+
+    // Bots that received no split payout lost their stake (entry).
+    if (entryFeeForSplit > 0) {
+      const players = Array.isArray(session?.players) ? session.players : [];
+      for (const player of players) {
+        const botUid = Number(player?.user_id);
+        if (Number.isNaN(botUid)) continue;
+        if (!isBotTurn(session, botUid)) continue;
+        if (paidBotUserIds.has(botUid)) continue;
+        if (!['joined', 'disconnected', 'eliminated', 'left'].includes(player?.status)) continue;
+        logGame(
+          sessionId,
+          `BOT_ADMIN_DEBIT mode=pool_split uid=${botUid} loss=₹${entryFeeForSplit}`
+        );
+        await adminLedgerService.recordBotLossDebit(client, {
+          sessionId,
+          userId: botUid,
+          amount: entryFeeForSplit,
+          mode: 'pool',
+        });
+      }
     }
 
     await client.query('COMMIT');
@@ -5818,7 +5894,7 @@ async function settleDealsPotResult(session = {}, finalizedResults = [], winnerU
         seat_no: row.seat_no,
         points: row.points,
         is_winner: false,
-        amount: 0,
+        amount: -roundCurrency(Number.isFinite(entryFee) ? entryFee : 0),
         transaction_type: 'game_loss_debit',
       };
     }
@@ -5926,6 +6002,21 @@ async function settleDealsPotResult(session = {}, finalizedResults = [], winnerU
           mode: 'deals_2',
         });
         remainingBotCap = roundCurrency(remainingBotCap - cappedBotAmount);
+      }
+      for (const entry of perPlayer) {
+        if (entry.is_winner) continue;
+        if (!isBotTurn(session, entry.user_id)) continue;
+        if (!(entryFee > 0)) continue;
+        logGame(
+          sessionId,
+          `BOT_ADMIN_DEBIT mode=deals uid=${entry.user_id} loss=₹${entryFee}`
+        );
+        await adminLedgerService.recordBotLossDebit(client, {
+          sessionId,
+          userId: entry.user_id,
+          amount: entryFee,
+          mode: 'deals_2',
+        });
       }
       await client.query('RELEASE SAVEPOINT admin_ledger_deals');
     } catch (ledgerErr) {
@@ -6035,11 +6126,26 @@ async function settleSpinGoResult(session = {}, winnerUserId = null) {
 
     const spinLoserIds = resolveNonWinningJoinedUserIds(session, winnerUserId);
     const safeEntryFee = Number.isFinite(entryFee) ? roundCurrency(entryFee) : 0;
+    const spinLoserPerPlayer = [];
     for (const uid of spinLoserIds) {
-      if (isBotTurn(session, uid)) continue;
+      if (isBotTurn(session, uid)) {
+        if (safeEntryFee > 0) {
+          spinLoserPerPlayer.push({
+            user_id: uid,
+            amount: -safeEntryFee,
+            is_winner: false,
+          });
+        }
+        continue;
+      }
       let basis = await resolveEntryFeesPaidForSession(client, uid, sessionId);
       if (!(basis > 0)) basis = safeEntryFee;
       if (!(basis > 0)) continue;
+      spinLoserPerPlayer.push({
+        user_id: uid,
+        amount: -basis,
+        is_winner: false,
+      });
       await releasePendingBonusAfterPlay(client, {
         userId: uid,
         sessionId,
@@ -6068,6 +6174,22 @@ async function settleSpinGoResult(session = {}, winnerUserId = null) {
           mode: 'spin_go',
         });
         }
+      } else {
+        const botLossAmount = safeEntryFee > 0 ? safeEntryFee : 0;
+        const losingBotIds = spinLoserIds.filter((uid) => isBotTurn(session, uid));
+        for (const botUid of losingBotIds) {
+          if (!(botLossAmount > 0)) continue;
+          logGame(
+            sessionId,
+            `BOT_ADMIN_DEBIT mode=spin_go uid=${botUid} loss=₹${botLossAmount}`
+          );
+          await adminLedgerService.recordBotLossDebit(client, {
+            sessionId,
+            userId: botUid,
+            amount: botLossAmount,
+            mode: 'spin_go',
+          });
+        }
       }
       await client.query('RELEASE SAVEPOINT admin_ledger_spin');
     } catch (ledgerErr) {
@@ -6089,6 +6211,7 @@ async function settleSpinGoResult(session = {}, winnerUserId = null) {
           amount: prizeAmount,
           is_winner: true,
         },
+        ...spinLoserPerPlayer,
       ],
     };
   } catch (err) {
@@ -11879,6 +12002,9 @@ function registerSocketServer(httpServer) {
     socket.data.user_id = Number(socket.user.id);
     socketRegistry.addSocket(socket.user.id, socket.id);
     console.log(`[SOCKET] Connected uid=${socket.user.id} socketId=${socket.id}`);
+    userModel.touchLastSocketAt(socket.user.id).catch((err) => {
+      console.error(`[SOCKET] Failed to touch last_socket_at uid=${socket.user.id}:`, err.message);
+    });
     socket.emit('connection:ready', {
       socket_id: socket.id,
       user: socket.user,

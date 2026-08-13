@@ -170,6 +170,17 @@ startStaleSessionCleanupCron();
 startWithdrawalPayoutSyncCron();
 startRechargePayinSyncCron();
 
+// BullMQ worker: admin FCM multicast campaigns (inactive reminders, etc.)
+try {
+  const { startPushCampaignWorker } = require('./queues/pushCampaign.queue');
+  const pushCampaignService = require('./services/pushCampaign.service');
+  startPushCampaignWorker(async (data) =>
+    pushCampaignService.processInactiveReminderCampaign(data)
+  );
+} catch (err) {
+  console.error('[push-queue] failed to start worker:', err.message);
+}
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });

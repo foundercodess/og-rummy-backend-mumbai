@@ -295,7 +295,7 @@ async function adminLogin(email, password) {
   const admin = await adminModel.findByEmail(email);
   if (!admin || !admin.active) {
     throw new Error('INVALID_ADMIN_CREDENTIALS');
-  } 
+  }
 
   const computed = hashPassword(password, admin.password_salt);
   const matches = safeEqualHex(admin.password_hash, computed);
@@ -303,8 +303,28 @@ async function adminLogin(email, password) {
     throw new Error('INVALID_ADMIN_CREDENTIALS');
   }
 
+  const adminRbacService = require('./adminRbac.service');
+  let ctx;
+  try {
+    ctx = await adminRbacService.getAdminAuthContext(admin.id);
+  } catch (err) {
+    console.error('adminLogin RBAC context error:', err);
+    throw new Error('ADMIN_RBAC_UNAVAILABLE');
+  }
+  if (!ctx || !ctx.active) {
+    throw new Error('INVALID_ADMIN_CREDENTIALS');
+  }
+  if (!ctx.role?.active) {
+    throw new Error('ADMIN_ROLE_INACTIVE');
+  }
+
   const token = jwt.sign(
-    { adminId: admin.id, role: admin.role || 'admin' },
+    {
+      adminId: ctx.id,
+      role: ctx.role.code,
+      roleId: ctx.role.id,
+      level: ctx.role.level,
+    },
     JWT_SECRET,
     { expiresIn: JWT_EXPIRES_IN }
   );
@@ -315,9 +335,14 @@ async function adminLogin(email, password) {
 
   return {
     admin: {
-      id: admin.id,
-      email: admin.email,
-      role: admin.role,
+      id: ctx.id,
+      email: ctx.email,
+      role: ctx.role.code,
+      role_id: ctx.role.id,
+      role_name: ctx.role.name,
+      level: ctx.role.level,
+      is_root: ctx.is_root === true,
+      permissions: ctx.permissions,
     },
     token,
     expiresIn: expiresInSeconds,

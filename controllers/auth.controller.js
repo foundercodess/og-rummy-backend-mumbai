@@ -193,19 +193,37 @@ async function adminLogin(req, res) {
     if (err.message === 'INVALID_ADMIN_CREDENTIALS') {
       return res.status(401).json({ success: false, message: 'Invalid email or password' });
     }
+    if (err.message === 'ADMIN_ROLE_INACTIVE') {
+      return res.status(403).json({ success: false, message: 'Admin role is inactive. Contact an owner.' });
+    }
+    if (err.message === 'ADMIN_RBAC_UNAVAILABLE') {
+      return res.status(503).json({
+        success: false,
+        message: 'Admin access setup incomplete. Run RBAC migration and restart API.',
+      });
+    }
     return res.status(500).json({ success: false, message: 'Failed to login admin' });
   }
 }
 
 async function adminMe(req, res) {
   try {
-    const auth = req.auth || {};
+    const admin = req.admin;
+    if (!admin) {
+      return res.status(401).json({ success: false, message: 'Unauthorized' });
+    }
     return res.json({
       success: true,
       message: 'Admin authenticated',
       admin: {
-        id: auth.adminId,
-        role: auth.role,
+        id: admin.id,
+        email: admin.email,
+        role: admin.role?.code,
+        role_id: admin.role?.id,
+        role_name: admin.role?.name,
+        level: admin.role?.level,
+        is_root: admin.is_root === true,
+        permissions: admin.permissions || [],
       },
     });
   } catch (err) {
