@@ -7460,15 +7460,40 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
 async function emitPendingRejoinGame(io, socket, reason = 'connect') {
   if (!socket?.user?.id) return null;
 
-  const session = typeof gameplayService.getPendingRejoinSession === 'function'
-    ? await gameplayService.getPendingRejoinSession(socket.user.id)
-    : null;
-  const isPresentInSessionRoom = session && io
-    ? isUserPresentInSessionRoom(io, session.id, socket.user.id)
-    : null;
-  const payload = buildRejoinPendingGamePayload(session, socket.user.id, reason, {
-    isPresentInSessionRoom,
-  });
+  const pendingSessions = typeof gameplayService.getPendingRejoinSessions === 'function'
+    ? await gameplayService.getPendingRejoinSessions(socket.user.id)
+    : (
+      typeof gameplayService.getPendingRejoinSession === 'function'
+        ? [await gameplayService.getPendingRejoinSession(socket.user.id)].filter(Boolean)
+        : []
+    );
+
+  const sessionPayloads = [];
+  for (const session of pendingSessions) {
+    if (!session) continue;
+    const isPresentInSessionRoom = io
+      ? isUserPresentInSessionRoom(io, session.id, socket.user.id)
+      : null;
+    const one = buildRejoinPendingGamePayload(session, socket.user.id, reason, {
+      isPresentInSessionRoom,
+    });
+    if (one?.has_pending_game && one.session) {
+      sessionPayloads.push(one.session);
+    }
+  }
+
+  const payload = {
+    server_time: new Date().toISOString(),
+    event: 'rejoin_pending_game',
+    reason,
+    has_pending_game: sessionPayloads.length > 0,
+    // Primary session kept for older clients (single-banner UX).
+    session: sessionPayloads[0] || null,
+    sessions: sessionPayloads,
+    max_concurrent_tables: typeof gameplayService.resolveMaxConcurrentTables === 'function'
+      ? gameplayService.resolveMaxConcurrentTables()
+      : 3,
+  };
   socket.emit('rejoin_pending_game', payload);
   return payload;
 }
@@ -8020,6 +8045,17 @@ async function attachSocketToSession(io, socket, session, options = {}) {
   return { liveSession, presence };
 }
 
+function leaveSessionRoom(socket, sessionId = null) {
+  if (sessionId == null) return;
+  const id = Number(sessionId);
+  if (Number.isNaN(id)) return;
+  socket.leave(sessionRoom(id));
+}
+
+/**
+ * Leave every game-session room except keepSessionId (legacy single-table detach).
+ * Prefer leaveSessionRoom(sourceId) for multi-table so parallel tables stay attached.
+ */
 function leaveOtherSessionRooms(socket, keepSessionId = null) {
   const keepId = keepSessionId == null ? null : Number(keepSessionId);
   const sessionIds = getSessionIdsFromSocket(socket);
@@ -8257,7 +8293,7 @@ async function maybeStartRematchFastDeal(io, targetSessionId, options = {}) {
                 presenceReason: 'reserved_rematch_unfillable_fallback',
                 startPregameIfReady: false,
               });
-              leaveOtherSessionRooms(sock, liveSession.id);
+              leaveSessionRoom(sock, finalSession?.id);
               syncSocketToSessionPhase(sock, liveSession, 'reserved_rematch_unfillable_fallback');
             } catch (attachErr) {
               warnGame(fallbackSession.id, `Fallback attach failed uid=${userId} socket=${socketId}: ${attachErr.message}`);
@@ -8552,7 +8588,7 @@ async function runAutoRematchFromSource(io, sourceSessionId) {
           presenceReason: 'auto_table_back',
           startPregameIfReady: true,
         });
-        leaveOtherSessionRooms(sock, liveSession.id);
+        leaveSessionRoom(sock, sourceSession.id);
         syncSocketToSessionPhase(sock, liveSession, 'auto_table_back');
       } catch (attachErr) {
         warnGame(sourceSession.id, `Auto rematch attach failed uid=${userId} socket=${socketId}: ${attachErr.message}`);
@@ -12565,8 +12601,7 @@ function registerSocketServer(httpServer) {
           });
         }
 
-        leaveOtherSessionRooms(socket, session.id);
-
+        // Multi-table: do not detach other live game-session rooms on refresh.
         const startPregameIfReady = status === 'ready';
         const { liveSession } = await attachSocketToSession(io, socket, session, {
           presenceReason: 'session_refresh',
@@ -13744,7 +13779,8 @@ function registerSocketServer(httpServer) {
           // Detach from the source room before finalize so this socket does not
           // receive game:result (opponent still does). Client then boots into
           // the new matchmaking session instead of the result overlay.
-          leaveOtherSessionRooms(socket, null);
+          // Multi-table: leave only the source room — keep parallel tables.
+          leaveSessionRoom(socket, sourceSession.id);
           outcome = await finalizeActiveTwoPlayerExit(
             io,
             sourceSession.id,
@@ -13773,7 +13809,7 @@ function registerSocketServer(httpServer) {
           presenceReason: 'drop_and_switch',
           startPregameIfReady: true,
         });
-        leaveOtherSessionRooms(socket, liveSession.id);
+        leaveSessionRoom(socket, sourceSession.id);
         const phaseSync = syncSocketToSessionPhase(socket, liveSession, 'drop_and_switch');
 
         callback({
@@ -13829,7 +13865,9 @@ function registerSocketServer(httpServer) {
           // regardless of auto-rematch mode gating.
           startPregameIfReady: true,
         });
-        leaveOtherSessionRooms(socket, liveSession.id);
+        if (sourceSession?.id) {
+          leaveSessionRoom(socket, sourceSession.id);
+        }
         const phaseSync = syncSocketToSessionPhase(socket, liveSession, 'table_play_now');
 
         callback({
@@ -13955,7 +13993,7 @@ function registerSocketServer(httpServer) {
           // Manual back-to-table must trigger pregame once all seats are filled.
           startPregameIfReady: true,
         });
-        leaveOtherSessionRooms(socket, liveSession.id);
+        leaveSessionRoom(socket, sourceSession.id);
         const phaseSync = syncSocketToSessionPhase(
           socket,
           liveSession,
@@ -14021,7 +14059,8 @@ function registerSocketServer(httpServer) {
         if (isActiveTwoPlayerExit) {
           // Detach exiting player first so they do not receive game:result from
           // finalize — intentional leave should return to lobby, not the result UI.
-          leaveOtherSessionRooms(socket, null);
+          // Multi-table: leave only this table's room.
+          leaveSessionRoom(socket, sourceSession.id);
           try {
             const outcome = await finalizeActiveTwoPlayerExit(
               io,
@@ -14124,10 +14163,8 @@ function registerSocketServer(httpServer) {
           // leaveOtherSessionRooms(socket, null);
           emitSessionStatePayload(io, updatedSourceSession);
         }
-        // Detach from room before emitting pending so presence checks see them away.
-        // if (isActiveTwoPlayerExit || isSixPlayerSoftExit || isActiveSession) {
-          leaveOtherSessionRooms(socket, null);
-        // }
+        // Detach from this table's room only — keep parallel multi-table rooms.
+        leaveSessionRoom(socket, sourceSession.id);
         await emitPendingRejoinGameForUser(
           io,
           socket.user.id,

@@ -14,6 +14,36 @@ function createSessionCode() {
 }
 
 const DEFAULT_REJOIN_PENDING_MAX_AGE_MINUTES = 15;
+const DEFAULT_MAX_CONCURRENT_TABLES = 3;
+
+function resolveMaxConcurrentTables() {
+  const envValue = Number(process.env.MAX_CONCURRENT_TABLES);
+  if (Number.isFinite(envValue) && envValue > 0) {
+    return Math.min(Math.floor(envValue), 10);
+  }
+  return DEFAULT_MAX_CONCURRENT_TABLES;
+}
+
+/**
+ * Reject joining/creating another table when the user already has N concurrent seats.
+ * Reconnect to an existing seat should pass excludeSessionId / skip via existingPlayer check.
+ */
+async function assertUnderConcurrentTableCap(userId, options = {}) {
+  if (options.skipCap === true) return;
+  const max = resolveMaxConcurrentTables();
+  const count = await gameSessionModel.countConcurrentTablesForUser(userId, {
+    excludeSessionId: options.excludeSessionId,
+  });
+  if (count >= max) {
+    const error = new Error(`You can play up to ${max} tables at a time`);
+    error.code = 'MAX_CONCURRENT_TABLES';
+    error.details = {
+      max_concurrent_tables: max,
+      current_tables: count,
+    };
+    throw error;
+  }
+}
 
 function resolveRejoinPendingMaxAgeMinutes(override) {
   if (override != null && override !== '') {
@@ -625,14 +655,26 @@ async function createSession({ gameId, contestId, hostUserId, maxPlayers, metada
   // Validate host has enough balance before any seat allocation.
   await checkSufficientBalance(hostUserId, contest);
 
+  const skipConcurrentCap = metadata?.skip_matchmaking === true
+    || metadata?.load_test_gameplay === true
+    || metadata?.load_test === true
+    || metadata?.skip_concurrent_table_cap === true;
+  // Cap applies when creating a fresh seat (open-pool join is checked inside joinSession).
+  if (!skipConcurrentCap) {
+    await assertUnderConcurrentTableCap(hostUserId);
+  }
+
   let session = null;
   const isPracticeGame = isPracticeGameName(game?.name);
   const normalizedContestPlayerCount = toNumberOrNull(contest.player_count) || 2;
   const normalizedRequestedMaxPlayers = toNumberOrNull(maxPlayers);
+  const requestedMax = Number.isFinite(normalizedRequestedMaxPlayers)
+    ? Math.floor(normalizedRequestedMaxPlayers)
+    : null;
   const sessionMaxPlayers = isPracticeGame
     ? normalizedContestPlayerCount
-    : (Number.isInteger(normalizedRequestedMaxPlayers) && normalizedRequestedMaxPlayers >= 2
-    ? normalizedRequestedMaxPlayers
+    : (requestedMax != null && requestedMax >= 2
+    ? requestedMax
     : normalizedContestPlayerCount);
   const sessionMetadata = buildSessionModeMetadata({ metadata, game });
   if (isPracticeGame) {
@@ -653,6 +695,7 @@ async function createSession({ gameId, contestId, hostUserId, maxPlayers, metada
       gameId,
       contestId,
       maxPlayers: sessionMaxPlayers,
+      excludeUserId: hostUserId,
     });
 
   if (openSession) {
@@ -738,8 +781,17 @@ async function joinSession({ sessionIdOrCode, userId, skipBalanceCheck = false }
 
   const existingPlayer = await gameSessionModel.findPlayer(session.id, userId);
   if (existingPlayer) {
-    // Player is reconnecting — no balance re-check needed.
+    // Player is reconnecting — no balance re-check / concurrent-cap needed.
     return getSessionState(session.id);
+  }
+
+  // New seat: enforce multi-table cap (bots / load-test can skip).
+  const skipConcurrentCap = skipBalanceCheck === true
+    || session.metadata?.load_test_gameplay === true
+    || session.metadata?.load_test === true
+    || session.metadata?.skip_concurrent_table_cap === true;
+  if (!skipConcurrentCap) {
+    await assertUnderConcurrentTableCap(userId, { excludeSessionId: session.id });
   }
 
   // Balance check: deposit + released_bonus + withdrawable must cover entry (see checkSufficientBalance).
@@ -998,13 +1050,46 @@ async function loadTurnActionSession(sessionId) {
 }
 
 async function getPendingRejoinSession(userId, options = {}) {
+  const sessions = await getPendingRejoinSessions(userId, { ...options, limit: 1 });
+  return sessions[0] || null;
+}
+
+/**
+ * Up to N pending / rejoinable sessions for multi-table restore.
+ * Does not hide a pending table when the user is connected on another table.
+ */
+async function getPendingRejoinSessions(userId, options = {}) {
   const maxAgeMinutes = resolveRejoinPendingMaxAgeMinutes(options.maxAgeMinutes);
-  let session = await gameSessionModel.findLatestRejoinableSessionForUser(userId, { maxAgeMinutes });
-  if (!session) {
-    session = await gameSessionModel.findLatestActiveSessionForUser(userId, { maxAgeMinutes });
+  const limit = Math.max(1, Math.min(10, Number(options.limit) || resolveMaxConcurrentTables()));
+  let rows = await gameSessionModel.listRejoinableSessionsForUser(userId, {
+    maxAgeMinutes,
+    limit,
+  });
+  if (!rows.length) {
+    const fallback = await gameSessionModel.findLatestActiveSessionForUser(userId, { maxAgeMinutes });
+    if (fallback) rows = [fallback];
   }
-  if (!session) return null;
-  return getSessionState(session.id);
+  const states = [];
+  for (const row of rows) {
+    const state = await getSessionState(row.id);
+    if (state) states.push(state);
+  }
+  return states;
+}
+
+async function listActiveSessionsForUser(userId, options = {}) {
+  const limit = Math.max(1, Math.min(10, Number(options.limit) || resolveMaxConcurrentTables()));
+  const rows = await gameSessionModel.listConcurrentSessionsForUser(userId, { limit });
+  const states = [];
+  for (const row of rows) {
+    const state = await getSessionState(row.id);
+    if (state) states.push(state);
+  }
+  return {
+    max_concurrent_tables: resolveMaxConcurrentTables(),
+    count: states.length,
+    sessions: states,
+  };
 }
 
 async function createOrJoinContinuationSession({ sourceSessionId, userId }) {
@@ -1604,7 +1689,11 @@ module.exports = {
   getSessionState,
   loadTurnActionSession,
   getPendingRejoinSession,
+  getPendingRejoinSessions,
+  listActiveSessionsForUser,
   resolveRejoinPendingMaxAgeMinutes,
+  resolveMaxConcurrentTables,
+  assertUnderConcurrentTableCap,
   createOrJoinContinuationSession,
   leaveTableContinuation,
   recordExplicitTableLeave,

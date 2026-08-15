@@ -64,7 +64,8 @@ async function findSessionByCode(sessionCode) {
   return row;
 }
 
-async function findOpenWaitingSession({ gameId, contestId, maxPlayers }) {
+async function findOpenWaitingSession({ gameId, contestId, maxPlayers, excludeUserId = null }) {
+  const excludeUid = excludeUserId != null ? Number(excludeUserId) : null;
   const result = await query(
     `SELECT gs.*
      FROM game_sessions gs
@@ -80,9 +81,18 @@ async function findOpenWaitingSession({ gameId, contestId, maxPlayers }) {
        AND gs.status = 'waiting'
        AND COALESCE((gs.metadata->>'rematch_reserved')::boolean, false) = false
        AND p.joined_count < gs.max_players
+       AND (
+         $4::int IS NULL
+         OR NOT EXISTS (
+           SELECT 1
+           FROM game_session_players self
+           WHERE self.game_session_id = gs.id
+             AND self.user_id = $4::int
+         )
+       )
      ORDER BY gs.created_at ASC
      LIMIT 1`,
-    [gameId, contestId, maxPlayers]
+    [gameId, contestId, maxPlayers, Number.isFinite(excludeUid) ? excludeUid : null]
   );
 
   return result.rows[0] || null;
@@ -104,13 +114,56 @@ async function findReservedContinuationSession(sourceSessionId) {
   return result.rows[0] || null;
 }
 
-async function findLatestRejoinableSessionForUser(userId, options = {}) {
-  const maxAgeMinutes = Math.max(1, Number(options.maxAgeMinutes) || 15);
+/**
+ * Concurrent multi-table seats for a user (waiting / ready / active).
+ * Excludes hard-left / opted-out seats. Used for the max-3 cap and active list.
+ */
+async function countConcurrentTablesForUser(userId, options = {}) {
+  const excludeSessionId = options.excludeSessionId != null
+    ? Number(options.excludeSessionId)
+    : null;
+  const result = await query(
+    `SELECT COUNT(*)::int AS count
+     FROM game_sessions gs
+     JOIN game_session_players gsp ON gsp.game_session_id = gs.id
+     WHERE gsp.user_id = $1
+       AND gs.status IN ('waiting', 'ready', 'active')
+       AND gsp.status IN ('joined', 'disconnected', 'eliminated')
+       AND COALESCE((gsp.metadata->>'pending_rejoin_opt_out')::boolean, false) = false
+       AND COALESCE((gsp.metadata->>'auto_rematch_opt_out')::boolean, false) = false
+       AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
+       AND NOT COALESCE(gs.metadata->'post_result_left_user_ids', '[]'::jsonb)
+         @> jsonb_build_array($1::int)
+       AND ($2::int IS NULL OR gs.id <> $2::int)`,
+    [userId, Number.isFinite(excludeSessionId) ? excludeSessionId : null]
+  );
+  return Number(result.rows[0]?.count || 0);
+}
+
+async function listConcurrentSessionsForUser(userId, options = {}) {
+  const limit = Math.max(1, Math.min(10, Number(options.limit) || 3));
   const result = await query(
     `SELECT gs.*
      FROM game_sessions gs
      JOIN game_session_players gsp ON gsp.game_session_id = gs.id
      WHERE gsp.user_id = $1
+       AND gs.status IN ('waiting', 'ready', 'active')
+       AND gsp.status IN ('joined', 'disconnected', 'eliminated')
+       AND COALESCE((gsp.metadata->>'pending_rejoin_opt_out')::boolean, false) = false
+       AND COALESCE((gsp.metadata->>'auto_rematch_opt_out')::boolean, false) = false
+       AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
+       AND NOT COALESCE(gs.metadata->'post_result_left_user_ids', '[]'::jsonb)
+         @> jsonb_build_array($1::int)
+     ORDER BY
+       gs.updated_at DESC,
+       gs.id DESC
+     LIMIT $2`,
+    [userId, limit]
+  );
+  return result.rows;
+}
+
+const REJOINABLE_SESSION_WHERE = `
        AND gs.updated_at >= (NOW() - make_interval(mins => $2::int))
        AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
        AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
@@ -154,34 +207,34 @@ async function findLatestRejoinableSessionForUser(userId, options = {}) {
            )
          )
        )
-       AND NOT EXISTS (
-         SELECT 1
-         FROM game_sessions gs2
-         JOIN game_session_players gsp2 ON gsp2.game_session_id = gs2.id
-         WHERE gsp2.user_id = $1
-           AND gs2.id <> gs.id
-           AND gs2.status IN ('waiting', 'ready', 'active')
-           AND COALESCE((gs2.metadata->>'practice_mode')::boolean, false) = false
-           AND COALESCE((gs2.metadata->>'practice_bot_only')::boolean, false) = false
-           AND gsp2.status IN ('joined', 'disconnected')
-           AND COALESCE((gsp2.metadata->>'is_dropped')::boolean, false) = false
-           AND COALESCE((gsp2.metadata->>'table_left')::boolean, false) = false
-           AND COALESCE(gsp2.metadata->>'drop_status', '') <> 'dropped'
-           AND COALESCE(gsp2.metadata->>'elimination_reason', '') NOT IN ('dropped', 'timeout')
-           AND (
-             gsp2.status = 'joined'
-             AND COALESCE(gsp2.metadata->>'connection_status', 'connected') <> 'disconnected'
-             AND COALESCE((gsp2.metadata->>'is_connected')::boolean, true) = true
-           )
-       )
+`;
+
+async function findLatestRejoinableSessionForUser(userId, options = {}) {
+  const rows = await listRejoinableSessionsForUser(userId, { ...options, limit: 1 });
+  return rows[0] || null;
+}
+
+/**
+ * Multi-table pending rejoin: up to N sessions.
+ * Does NOT suppress a pending table because the user is live on another table.
+ */
+async function listRejoinableSessionsForUser(userId, options = {}) {
+  const maxAgeMinutes = Math.max(1, Number(options.maxAgeMinutes) || 15);
+  const limit = Math.max(1, Math.min(10, Number(options.limit) || 3));
+  const result = await query(
+    `SELECT gs.*
+     FROM game_sessions gs
+     JOIN game_session_players gsp ON gsp.game_session_id = gs.id
+     WHERE gsp.user_id = $1
+       ${REJOINABLE_SESSION_WHERE}
      ORDER BY
        gs.updated_at DESC,
        gs.id DESC
-     LIMIT 1`,
-    [userId, maxAgeMinutes]
+     LIMIT $3`,
+    [userId, maxAgeMinutes, limit]
   );
 
-  return result.rows[0] || null;
+  return result.rows;
 }
 
 async function findLatestActiveSessionForUser(userId, options = {}) {
@@ -525,7 +578,10 @@ module.exports = {
   findOpenWaitingSession,
   findReservedContinuationSession,
   findLatestRejoinableSessionForUser,
+  listRejoinableSessionsForUser,
   findLatestActiveSessionForUser,
+  countConcurrentTablesForUser,
+  listConcurrentSessionsForUser,
   listStaleWaitingSessions,
   listSessionPlayers,
   addPlayer,
