@@ -1,5 +1,6 @@
 const walletService = require('../services/wallet.service');
 const giftauraPgService = require('../services/giftauraPg.service');
+const userModel = require('../models/user.model');
 
 function renderPaymentCallbackPage({ success, message, orderId }) {
   const title = success ? 'Payment Successful' : 'Payment Failed';
@@ -386,6 +387,33 @@ async function listTransactionDetails(req, res) {
   }
 }
 
+async function fundLoadTestWallet(req, res) {
+  try {
+    const minAmount = Math.max(1, Number(req.body?.amount || process.env.LOAD_TEST_WALLET_FUND || 10000) || 10000);
+    const user = await userModel.findById(req.user.id);
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'User not found' });
+    }
+    const prefix = String(process.env.LOAD_TEST_PHONE_PREFIX || '97000');
+    const phone = String(user.phone || '').replace(/\D/g, '');
+    if (!phone.startsWith(prefix)) {
+      return res.status(403).json({ success: false, message: 'Load-test fund is only allowed for scripted phones' });
+    }
+
+    const result = await walletService.ensureLoadTestFunds(req.user.id, minAmount);
+    return res.json({
+      success: true,
+      message: result.funded ? 'Wallet funded for load test' : 'Wallet already at minimum',
+      funded: result.funded,
+      credited: result.credited || 0,
+      wallet: result.wallet,
+    });
+  } catch (err) {
+    console.error('fundLoadTestWallet error:', err);
+    return res.status(500).json({ success: false, message: err.message || 'Failed to fund wallet' });
+  }
+}
+
 module.exports = {
   createAddCash,
   paymentCallback,
@@ -395,5 +423,6 @@ module.exports = {
   listUserTransactions,
   listPendingBonusTransactions,
   listTransactionDetails,
+  fundLoadTestWallet,
 };
 

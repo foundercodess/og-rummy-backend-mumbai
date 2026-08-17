@@ -1,4 +1,15 @@
 const telemetryService = require('../services/telemetry.service');
+const { beginHotpath, recordHotpath } = require('./runtimeObservability');
+
+const HOTPATH_EVENTS = new Set([
+  'player:pick',
+  'player:discard',
+  'player:autogroup',
+  'player:finish',
+  'player:declare:response',
+  'session:join',
+  'player:ready',
+]);
 
 function resolveSessionIdFromPayload(payload = {}) {
   const raw = payload.session_id ?? payload.sessionId ?? null;
@@ -33,11 +44,13 @@ function enrichAckResponse(ack, traceId, handlerMs, clientRttMs = null) {
 }
 
 function wrapSocketListener(socket, eventName, listener) {
-  if (!telemetryService.isTelemetryEnabled()) return listener;
   if (telemetryService.TELEMETRY_SKIPPED_EVENTS.has(eventName)) return listener;
+  const persistTelemetry = telemetryService.isTelemetryEnabled();
+  const trackHotpath = HOTPATH_EVENTS.has(eventName);
+  if (!persistTelemetry && !trackHotpath) return listener;
 
   return async function telemetryWrapped(...args) {
-    const startedAtMs = Date.now();
+    const startedAtMs = trackHotpath ? beginHotpath(eventName) : Date.now();
     const serverReceivedAt = new Date().toISOString();
     const payload = args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])
       ? args[0]
@@ -56,6 +69,13 @@ function wrapSocketListener(socket, eventName, listener) {
     const recordOnce = (extra = {}) => {
       if (recorded) return;
       recorded = true;
+      if (trackHotpath) {
+        recordHotpath(eventName, startedAtMs, {
+          ok: extra.success !== false,
+          session_id: sessionId,
+        });
+      }
+      if (!persistTelemetry) return;
       telemetryService.recordInboundAck({
         game_session_id: sessionId,
         user_id: socket?.user?.id ?? null,
@@ -117,7 +137,6 @@ function wrapSocketListener(socket, eventName, listener) {
 }
 
 function instrumentSocket(socket) {
-  if (!telemetryService.isTelemetryEnabled()) return;
   if (socket.__telemetryInstrumented) return;
   socket.__telemetryInstrumented = true;
 

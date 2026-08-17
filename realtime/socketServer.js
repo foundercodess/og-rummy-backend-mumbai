@@ -12754,17 +12754,6 @@ function registerSocketServer(httpServer) {
             phase_updated_at: new Date().toISOString(),
           },
         });
-        console.log('player:autogroup:success', {
-          ...buildGroupingResponseData(evaluatedGrouping),
-          finish_card_suggestion: finishPlan?.finishCard || null,
-          finish_plan: finishPlan
-            ? {
-              finish_card: finishPlan.finishCard,
-              submitted_groups: finishPlan.submittedGroups,
-              valid_for_declare_after_finish: finishPlan?.preview?.summary?.valid_for_declare === true,
-            }
-            : null,
-        });
         callback({
           success: true,
           data: {

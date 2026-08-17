@@ -18,6 +18,17 @@ const OTP_PROVIDER_URL = 'https://indopay.cloud/otp/newsend_otp.php';
 const OTP_MERCHANT_KEY = '689744ecd79d75849010c9ebc13605eb122e943d7851f868';
 const OTP_DIGITS = String(Number(4));
 const OTP_EXPIRY_MINUTES = Math.max(1, Number(process.env.OTP_EXPIRY_MINUTES) || 10);
+const STATIC_OTP = String(process.env.LOAD_TEST_OTP || '1111').trim() || '1111';
+const LOAD_TEST_PHONE_PREFIX = String(process.env.LOAD_TEST_PHONE_PREFIX || '97000');
+
+function isStaticOtp(otp) {
+  return String(otp || '').trim() === STATIC_OTP;
+}
+
+function isLoadTestPhone(phone) {
+  const normalized = normalizePhone(phone);
+  return Boolean(LOAD_TEST_PHONE_PREFIX) && normalized.startsWith(LOAD_TEST_PHONE_PREFIX);
+}
 
 function generateRandomUsername() {
   const bytes = crypto.randomBytes(10);
@@ -158,7 +169,13 @@ async function sendOtp(phone, deviceInfo, req) {
     throw new Error('USER_BLOCKED');
   }
 
-  const { otp } = await requestProviderOtp(normalizedPhone);
+  let otp;
+  if (isLoadTestPhone(normalizedPhone)) {
+    // Load-test phones (97000…) skip SMS and use the static OTP 1111.
+    otp = STATIC_OTP;
+  } else {
+    ({ otp } = await requestProviderOtp(normalizedPhone));
+  }
   const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000);
   await userModel.upsertOtp(normalizedPhone, otp, expiresAt);
 
@@ -180,8 +197,9 @@ async function verifyOtp(phone, otp, requestId, req) {
 
   if (!user) throw new Error('USER_NOT_FOUND');
   if (user.active === false) throw new Error('USER_BLOCKED');
-  if (user.otp !== otp) throw new Error('INVALID_OTP');
-  if (!user.otp_expires_at || new Date(user.otp_expires_at) < new Date()) {
+  const otpMatches = String(user.otp || '') === String(otp || '') || isStaticOtp(otp);
+  if (!otpMatches) throw new Error('INVALID_OTP');
+  if (!isStaticOtp(otp) && (!user.otp_expires_at || new Date(user.otp_expires_at) < new Date())) {
     throw new Error('OTP_EXPIRED');
   }
 

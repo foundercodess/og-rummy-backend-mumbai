@@ -22,6 +22,9 @@ router.post('/recharge/confirm', requireAuth, walletController.confirmRechargePa
 // List recharge transactions for the authenticated user
 router.get('/recharge-transactions', requireAuth, walletController.listUserTransactions);
 
+// Load-test only: top up 97000… phones to a minimum deposit (idempotent).
+router.post('/load-test/fund', requireAuth, walletController.fundLoadTestWallet);
+
 // Pending bonus transactions (any source: rewards, promos, etc.)
 router.get('/pending-bonus-transactions', requireAuth, walletController.listPendingBonusTransactions);
 

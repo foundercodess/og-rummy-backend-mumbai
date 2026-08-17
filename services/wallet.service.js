@@ -910,6 +910,81 @@ async function creditWalletByAdmin({
   }
 }
 
+/**
+ * Staging/load helper: raise deposit to at least `minAmount` for scripted 97000 phones.
+ * Idempotent across re-runs (GREATEST), not a public add-cash flow.
+ */
+async function ensureLoadTestFunds(userId, minAmount) {
+  const amount = Math.max(0, Number(minAmount) || 0);
+  if (!userId || amount <= 0) {
+    const err = new Error('Valid amount required');
+    err.code = 'INVALID_AMOUNT';
+    throw err;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO wallets (user_id)
+       VALUES ($1)
+       ON CONFLICT (user_id) DO NOTHING`,
+      [userId],
+    );
+    const walletRes = await client.query(
+      'SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE',
+      [userId],
+    );
+    const walletRow = walletRes.rows[0];
+    if (!walletRow) {
+      const err = new Error('Wallet not found');
+      err.code = 'WALLET_NOT_FOUND';
+      throw err;
+    }
+
+    const currentDeposit = Number(walletRow.deposit || 0);
+    const need = Math.max(0, amount - currentDeposit);
+    if (need <= 0) {
+      await client.query('COMMIT');
+      return {
+        funded: false,
+        wallet: walletModel.formatForResponse(walletRow),
+      };
+    }
+
+    const nextDeposit = currentDeposit + need;
+    const nextTotal = Number(walletRow.total_balance || 0) + need;
+    const updated = await client.query(
+      `UPDATE wallets
+       SET deposit = $2,
+           total_balance = $3,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [walletRow.id, nextDeposit, nextTotal],
+    );
+    await client.query(
+      `INSERT INTO wallet_transactions (
+         user_id, wallet_id, transaction_type, amount, source, reference_type, reference_id, metadata
+       ) VALUES (
+         $1, $2, 'deposit_credit', $3, 'admin', 'load_test_fund', NULL, $4::jsonb
+       )`,
+      [userId, walletRow.id, need, JSON.stringify({ min_amount: amount })],
+    );
+    await client.query('COMMIT');
+    return {
+      funded: true,
+      credited: need,
+      wallet: walletModel.formatForResponse(updated.rows[0]),
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   getAccountStatementFilters,
   createAddCashInit,
@@ -923,5 +998,6 @@ module.exports = {
   listPendingBonusTransactions,
   listTransactionDetails,
   creditWalletByAdmin,
+  ensureLoadTestFunds,
 };
 

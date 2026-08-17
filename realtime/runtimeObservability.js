@@ -21,6 +21,81 @@ let started = false;
 let socketStatsProvider = null;
 let lastEventLoopLagMs = 0;
 
+const HOTPATH_SLOW_MS = Math.max(20, Number(process.env.HOTPATH_SLOW_MS) || 80);
+const HOTPATH_SAMPLE_CAP = 2000;
+const hotpathStats = new Map();
+
+function getHotpathBucket(eventName) {
+  const key = String(eventName || 'unknown');
+  let bucket = hotpathStats.get(key);
+  if (!bucket) {
+    bucket = {
+      n: 0,
+      ok: 0,
+      fail: 0,
+      inFlight: 0,
+      sum: 0,
+      max: 0,
+      samples: [],
+    };
+    hotpathStats.set(key, bucket);
+  }
+  return bucket;
+}
+
+function percentileFromSamples(samples, p) {
+  if (!samples.length) return null;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * p) - 1));
+  return sorted[idx];
+}
+
+function beginHotpath(eventName) {
+  const bucket = getHotpathBucket(eventName);
+  bucket.inFlight += 1;
+  return Date.now();
+}
+
+function recordHotpath(eventName, startedAtMs, extra = {}) {
+  const bucket = getHotpathBucket(eventName);
+  bucket.inFlight = Math.max(0, bucket.inFlight - 1);
+  const ms = Math.max(0, Date.now() - Number(startedAtMs || 0));
+  const ok = extra.ok !== false;
+  bucket.n += 1;
+  bucket.sum += ms;
+  bucket.max = Math.max(bucket.max, ms);
+  if (ok) bucket.ok += 1;
+  else bucket.fail += 1;
+  bucket.samples.push(ms);
+  if (bucket.samples.length > HOTPATH_SAMPLE_CAP) bucket.samples.shift();
+
+  if (ms >= HOTPATH_SLOW_MS) {
+    const sessionId = extra.session_id != null ? extra.session_id : '';
+    console.warn(
+      `[HOTPATH_SLOW] event=${eventName} ms=${ms} ok=${ok} session=${sessionId} lag_ms=${lastEventLoopLagMs}`,
+    );
+  }
+  return ms;
+}
+
+function getHotpathSnapshot() {
+  const out = {};
+  for (const [eventName, bucket] of hotpathStats.entries()) {
+    out[eventName] = {
+      n: bucket.n,
+      ok: bucket.ok,
+      fail: bucket.fail,
+      in_flight: bucket.inFlight,
+      avg_ms: bucket.n ? Math.round(bucket.sum / bucket.n) : 0,
+      p50_ms: percentileFromSamples(bucket.samples, 0.5),
+      p95_ms: percentileFromSamples(bucket.samples, 0.95),
+      p99_ms: percentileFromSamples(bucket.samples, 0.99),
+      max_ms: bucket.max,
+    };
+  }
+  return out;
+}
+
 function setSocketStatsProvider(fn) {
   socketStatsProvider = typeof fn === 'function' ? fn : null;
 }
@@ -56,11 +131,13 @@ function startRuntimeObservability() {
     } catch (_) {
       durable = null;
     }
-    if (pool || live || sockets || durable) {
+    const hotpath = getHotpathSnapshot();
+    if (pool || live || sockets || durable || Object.keys(hotpath).length) {
       console.log(
         `[RUNTIME_METRICS] lag_ms=${lastEventLoopLagMs} ` +
           `pool=${JSON.stringify(pool)} live=${JSON.stringify(live)} ` +
-          `sockets=${JSON.stringify(sockets)} durable=${JSON.stringify(durable)}`,
+          `sockets=${JSON.stringify(sockets)} durable=${JSON.stringify(durable)} ` +
+          `hotpath=${JSON.stringify(hotpath)}`,
       );
     }
   }, METRICS_LOG_INTERVAL_MS).unref();
@@ -85,4 +162,7 @@ module.exports = {
   setSocketStatsProvider,
   getLastEventLoopLagMs,
   warnLargeLiveSnapshot,
+  beginHotpath,
+  recordHotpath,
+  getHotpathSnapshot,
 };

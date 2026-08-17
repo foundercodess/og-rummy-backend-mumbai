@@ -1,0 +1,27 @@
+# Full cycle capacity probe: send-otp + verify 1111 + bootstrap HTTP + socket hold.
+#
+#   cd og_rummy_backend
+#   LOAD_TEST_URL=http://og-rummy-alb-791534744.ap-south-1.elb.amazonaws.com \
+#     LOAD_TOKENS=./load_tokens.jsonl \
+#     npx artillery@2 run load/artillery/login-connect.yml
+#
+# This does not play rummy. Use load_test_gameplay.js --live-login for pick/discard.
+
+config:
+  target: "{{ $processEnvironment.LOAD_TEST_URL }}"
+  phases:
+    - duration: 60
+      arrivalRate: 5
+      name: warmup
+    - duration: 120
+      arrivalRate: 20
+      name: ramp
+  processor: "./processor.js"
+  timeout: 45
+  engines:
+    http: {}
+
+scenarios:
+  - name: login_bootstrap_socket_hold
+    flow:
+      - function: "fullCycleUntilSocket"

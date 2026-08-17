@@ -33,9 +33,17 @@
  *     --max-game-seconds 300 \
  *     --report-dir ./load_reports --report-prefix load_pts_6p_50
  *
+ * One command (login 1111 + fund + play + phase logs):
+ *   node scripts/run_load_cycle.js \
+ *     --url http://og-rummy-alb-791534744.ap-south-1.elb.amazonaws.com \
+ *     --tables 50 --max-players 6 --game-id 3 --contest-id 199 \
+ *     --concurrency 20 --max-game-seconds 600
+ *
  * Flags:
  *   --url                API base URL
- *   --tokens             JSONL from prepare script
+ *   --tokens             JSONL from prepare script (phones + optional JWT)
+ *   --live-login         send-otp + verify-otp 1111 + HTTP bootstrap before socket
+ *   --otp                OTP for --live-login (default 1111)
  *   --game-id            Required
  *   --contest-id         Required (use contests.6 id for --max-players 6)
  *   --tables             Parallel tables (default 10)
@@ -51,11 +59,17 @@
  *   --hold-seconds       Hold full target before allowing finishes (default 120)
  *   --report-dir         Directory for JSONL + summary (default ./load_reports)
  *   --report-prefix      Filename prefix (default gameplay)
+ *   --full-cycle         One-command: invent phones, login OTP 1111, fund wallet, play, verbose logs
+ *   --fund              Wallet min deposit for --full-cycle (default 10000)
+ *   --phone-prefix       Generated phones (default 97000)
+ *   --start              Phone index start (default 1)
+ *   --quiet              Disable per-phase [CYCLE] logs
  */
 
 const fs = require('fs');
 const path = require('path');
 const { io } = require('socket.io-client');
+const loadHttp = require('./load_test_http');
 
 function arg(name, fallback = null) {
   const idx = process.argv.indexOf(`--${name}`);
@@ -73,7 +87,9 @@ if (flag('help')) {
 }
 
 const baseUrl = String(arg('url', process.env.LOAD_TEST_URL || 'http://127.0.0.1:3000')).replace(/\/$/, '');
-const tokensPath = path.resolve(arg('tokens', ''));
+const fullCycle = flag('full-cycle');
+const tokensPathRaw = arg('tokens', '');
+const tokensPath = tokensPathRaw ? path.resolve(tokensPathRaw) : '';
 const tables = Math.max(1, Number(arg('tables', '10')) || 10);
 const concurrency = Math.max(1, Number(arg('concurrency', '5')) || 5);
 const maxPlayers = Math.max(2, Number(arg('max-players', '2')) || 2);
@@ -89,6 +105,13 @@ const contestId = Number(arg('contest-id', process.env.LOAD_TEST_CONTEST_ID));
 const mode = String(arg('mode', 'dual')).toLowerCase(); // dual | vs-bot
 const reportDir = path.resolve(arg('report-dir', './load_reports'));
 const reportPrefix = String(arg('report-prefix', 'gameplay') || 'gameplay').replace(/[^\w.-]+/g, '_');
+const liveLogin = flag('live-login') || fullCycle;
+const loginOtp = String(arg('otp', loadHttp.DEFAULT_OTP) || loadHttp.DEFAULT_OTP);
+const fundWallets = (flag('fund-wallets') || fullCycle) && !flag('no-fund');
+const verboseCycle = (flag('verbose') || fullCycle) && !flag('quiet');
+const fundAmount = Math.max(0, Number(arg('fund', process.env.LOAD_TEST_WALLET_FUND || '10000')) || 0);
+const phonePrefix = String(arg('phone-prefix', process.env.LOAD_TEST_PHONE_PREFIX || '97000'));
+const phoneStart = Math.max(1, Number(arg('start', '1')) || 1);
 const loadRuntime = {
   openSockets: 0,
   peakOpenSockets: 0,
@@ -96,6 +119,14 @@ const loadRuntime = {
   peakActiveSessions: 0,
   sessionsStarted: 0,
   tablesCompleted: 0,
+  authOk: 0,
+  authFail: 0,
+  bootstrapFail: 0,
+  fundOk: 0,
+  fundFail: 0,
+  connectFail: 0,
+  createFail: 0,
+  phaseCounts: {},
 };
 const rampControl = {
   enabled: targetActiveTables > 0,
@@ -105,8 +136,8 @@ const rampControl = {
   holdSeconds,
 };
 
-if (!tokensPath || !fs.existsSync(tokensPath)) {
-  console.error('Missing --tokens <load_tokens.jsonl>');
+if (!fullCycle && (!tokensPath || !fs.existsSync(tokensPath))) {
+  console.error('Missing --tokens <load_tokens.jsonl> (or pass --full-cycle to auto-create phones)');
   process.exit(1);
 }
 if (!Number.isFinite(gameId) || gameId <= 0 || !Number.isFinite(contestId) || contestId <= 0) {
@@ -143,12 +174,56 @@ function loadTokens(file, limit) {
     if (out.length >= limit) break;
     try {
       const row = JSON.parse(line);
-      if (row?.token && row?.user_id != null) out.push(row);
+      if (liveLogin && row?.phone) out.push(row);
+      else if (row?.token && row?.user_id != null) out.push(row);
     } catch (_) {
       // skip
     }
   }
   return out;
+}
+
+function padPhone(index) {
+  const body = String(index).padStart(Math.max(1, 10 - phonePrefix.length), '0');
+  return `${phonePrefix}${body}`.slice(0, 10);
+}
+
+function synthesizePhoneRows(count) {
+  const rows = [];
+  for (let i = 0; i < count; i += 1) {
+    rows.push({ phone: padPhone(phoneStart + i), user_id: null, token: null });
+  }
+  return rows;
+}
+
+function cycleLog(phase, extra = {}) {
+  if (!verboseCycle) return;
+  console.log('[CYCLE]', { phase, ...extra });
+}
+
+function notePhase(shared, label, phase, extra = {}) {
+  const ok = extra.ok !== false;
+  const entry = {
+    ts: new Date().toISOString(),
+    seat: label,
+    phase,
+    ok,
+    ms: Number.isFinite(extra.ms) ? extra.ms : null,
+    error: extra.error || null,
+  };
+  shared.phases.push(entry);
+  const bucket = loadRuntime.phaseCounts[phase] || { ok: 0, fail: 0 };
+  if (ok) bucket.ok += 1;
+  else bucket.fail += 1;
+  loadRuntime.phaseCounts[phase] = bucket;
+  cycleLog(phase, {
+    seat: label,
+    ok,
+    ms: entry.ms,
+    error: entry.error,
+    ...(extra.status != null ? { status: extra.status } : {}),
+  });
+  return ok;
 }
 
 function sleep(ms) {
@@ -167,6 +242,10 @@ function classifyRootCause(message, event = '') {
     return 'admit_overload';
   }
   if (m.includes('ack_timeout')) return 'server_backpressure';
+  if (m.includes('send_otp') || m.includes('verify_otp') || ev.includes('login')) return 'auth_failure';
+  if (ev.includes('bootstrap') || m.includes('profile') || m.includes('config_failed')) {
+    return 'bootstrap_failure';
+  }
   if (m.includes('connect_timeout') || m.includes('connect_error') || m.includes('websocket error')) {
     return 'connect_failure';
   }
@@ -611,6 +690,8 @@ function attachAutoPlayer(seat, sessionId, shared) {
   let lastHandGroups = [];
   let activeTurnId = null;
   let declareResponseSent = false;
+  let hasAutogrouped = false;
+  let lastGroupingAck = null;
   const handledTurnIds = new Set();
 
   const playTurn = async (turnPayload, source) => {
@@ -638,10 +719,16 @@ function attachAutoPlayer(seat, sessionId, shared) {
       if (shared.done) return;
       if (pickDelayMs) await sleep(pickDelayMs);
 
-      const auto = await emitAck(socket, 'player:autogroup', { session_id: sessionId });
-      let groups = groupsFromAck(auto);
-      let finishPlan = finishPlanFromAck(auto);
-      let latestGroupingAck = auto;
+      if (!hasAutogrouped) {
+        const auto = await emitAck(socket, 'player:autogroup', { session_id: sessionId });
+        lastGroupingAck = auto;
+        hasAutogrouped = auto.ok;
+        const autoGroups = groupsFromAck(auto);
+        if (autoGroups.length) lastHandGroups = autoGroups;
+      }
+      let groups = groupsFromAck(lastGroupingAck);
+      let finishPlan = finishPlanFromAck(lastGroupingAck);
+      let latestGroupingAck = lastGroupingAck;
       if (!groups.length && lastHandGroups.length) groups = lastHandGroups;
 
       let hasPicked = turnPayload?.has_picked === true || turnPayload?.turn?.has_picked === true;
@@ -662,6 +749,7 @@ function attachAutoPlayer(seat, sessionId, shared) {
             pickedUid = pickAck.ack?.data?.picked_card?.card_uid || null;
             finishPlan = finishPlanFromAck(pickAck);
             latestGroupingAck = pickAck;
+            lastGroupingAck = pickAck;
             const afterPickGroups = groupsFromAck(pickAck);
             if (afterPickGroups.length) {
               groups = afterPickGroups;
@@ -741,7 +829,9 @@ function attachAutoPlayer(seat, sessionId, shared) {
           extra: { source, finish_card_uid: finishPlan.finishCardUid },
         });
         // If the finish raced with another terminal event, do not send a stale discard.
-        if (isBenignRaceError(finishAck.error) || shared.done) return;
+        if (isBenignRaceError(finishAck.error) || isDeclarationWindowActiveError(finishAck.error) || shared.done) {
+          return;
+        }
       }
 
       const discardDecision = selectStrategicDiscard(latestGroupingAck, pickedUid);
@@ -896,6 +986,10 @@ function attachAutoPlayer(seat, sessionId, shared) {
     shared.resultSummary = summarizeResult(payload);
     shared.endedAt = Date.now();
     shared.endReason = payload?.reason || payload?.result_reason || 'game:result';
+    notePhase(shared, label, 'game_result', {
+      ok: true,
+      error: shared.endReason,
+    });
   });
 
   return {
@@ -933,6 +1027,94 @@ function emptyShared() {
     sessionId: null,
     forcedDrop: false,
     seatUserIds: [],
+    authMs: [],
+    bootstrapMs: [],
+    fundMs: [],
+    phases: [],
+  };
+}
+
+function isDeclarationWindowActiveError(msg) {
+  return /declaration window already active/i.test(String(msg || ''));
+}
+
+async function loginSeat(tokenRow, label, shared) {
+  const phone = tokenRow?.phone;
+  if (!phone) {
+    notePhase(shared, label, 'send_otp', { ok: false, error: 'missing_phone' });
+    return { ok: false, error: 'missing_phone', tokenRow };
+  }
+
+  const sent = await loadHttp.sendOtp(baseUrl, phone);
+  notePhase(shared, label, 'send_otp', {
+    ok: sent.ok,
+    ms: sent.ms,
+    status: sent.status,
+    error: sent.ok ? null : (sent.error || 'send_otp_failed'),
+  });
+  if (!sent.ok) {
+    loadRuntime.authFail += 1;
+    return { ok: false, error: `send_otp:${sent.error || 'failed'}`, tokenRow };
+  }
+
+  const loginAttemptId = sent.json?.login_attempt_id ?? sent.json?.data?.login_attempt_id ?? null;
+  const verified = await loadHttp.verifyOtp(baseUrl, phone, loginOtp, loginAttemptId);
+  const token = verified.json?.token || verified.json?.data?.token || null;
+  const user = verified.json?.user || verified.json?.data?.user || null;
+  notePhase(shared, label, 'verify_otp', {
+    ok: Boolean(verified.ok && token),
+    ms: verified.ms,
+    status: verified.status,
+    error: verified.ok && token ? null : (verified.error || 'verify_otp_failed'),
+  });
+  if (!verified.ok || !token) {
+    loadRuntime.authFail += 1;
+    return { ok: false, error: `verify_otp:${verified.error || 'failed'}`, tokenRow };
+  }
+
+  const bootstrap = await loadHttp.bootstrapClient(baseUrl, token);
+  notePhase(shared, label, 'bootstrap', {
+    ok: bootstrap.ok,
+    ms: bootstrap.ms,
+    status: bootstrap.status,
+    error: bootstrap.ok ? null : `${bootstrap.phase}:${bootstrap.error || 'failed'}`,
+  });
+  if (!bootstrap.ok) {
+    loadRuntime.bootstrapFail += 1;
+    return { ok: false, error: `bootstrap:${bootstrap.phase}:${bootstrap.error}`, tokenRow };
+  }
+
+  if (fundWallets && fundAmount > 0) {
+    const funded = await loadHttp.fundWallet(baseUrl, token, fundAmount);
+    const fundOk = funded.ok;
+    notePhase(shared, label, 'fund_wallet', {
+      ok: fundOk,
+      ms: funded.ms,
+      status: funded.status,
+      error: fundOk ? null : (funded.error || 'fund_failed'),
+    });
+    if (fundOk) loadRuntime.fundOk += 1;
+    else {
+      loadRuntime.fundFail += 1;
+      return { ok: false, error: `fund_wallet:${funded.error || 'failed'}`, tokenRow };
+    }
+    if (Number.isFinite(funded.ms)) shared.fundMs.push(funded.ms);
+  }
+
+  loadRuntime.authOk += 1;
+  const authMs = (sent.ms || 0) + (verified.ms || 0);
+  shared.authMs.push(authMs);
+  if (Number.isFinite(bootstrap.ms)) shared.bootstrapMs.push(bootstrap.ms);
+  return {
+    ok: true,
+    error: null,
+    tokenRow: {
+      ...tokenRow,
+      token,
+      user_id: Number(user?.id || tokenRow.user_id || 0) || tokenRow.user_id,
+      session_id: verified.json?.session_id || tokenRow.session_id,
+      phone,
+    },
   };
 }
 
@@ -944,8 +1126,31 @@ async function runOneTable(tableIndex, seatsTokens, lifecycle = {}) {
   const clients = [];
   for (let i = 0; i < seatsNeeded; i += 1) {
     const label = seatLabel(tableIndex, i);
-    const c = await connectClient(seatsTokens[i], label);
+    let seatToken = seatsTokens[i];
+    if (liveLogin) {
+      const loggedIn = await loginSeat(seatToken, label, shared);
+      if (!loggedIn.ok) {
+        const stolen = detectStolen(shared, []);
+        return buildTableResult({
+          ok: false,
+          table: tableIndex,
+          sessionId: null,
+          startedAt,
+          shared,
+          error: `login_failed:${loggedIn.error}`,
+          stolen,
+        });
+      }
+      seatToken = loggedIn.tokenRow;
+    }
+    const c = await connectClient(seatToken, label);
+    notePhase(shared, label, 'socket_connect', {
+      ok: c.ok,
+      ms: c.ms,
+      error: c.ok ? null : (c.error || 'connect_failed'),
+    });
     if (!c.ok) {
+      loadRuntime.connectFail += 1;
       pushDetailedError(shared, {
         seat: label,
         event: 'connect',
@@ -971,7 +1176,12 @@ async function runOneTable(tableIndex, seatsTokens, lifecycle = {}) {
 
   const creator = clients[0];
   const created = await createSessionWithRetry(creator.token, tableIndex, shared);
+  notePhase(shared, seatLabel(tableIndex, 0), 'create_session', {
+    ok: Boolean(created.ok && created.sessionId),
+    error: created.ok ? null : (created.error || `http_${created.status}`),
+  });
   if (!created.ok || !created.sessionId) {
+    loadRuntime.createFail += 1;
     for (const c of clients) {
       try { c.socket.close(); } catch (_) { /* ignore */ }
     }
@@ -1004,6 +1214,10 @@ async function runOneTable(tableIndex, seatsTokens, lifecycle = {}) {
 
   for (const c of clients) {
     const join = await emitAck(c.socket, 'session:join', { session_id: sessionId });
+    notePhase(shared, c.label, 'session_join', {
+      ok: join.ok,
+      error: join.ok ? null : (join.error || 'join_failed'),
+    });
     if (!join.ok) {
       pushDetailedError(shared, {
         seat: c.label,
@@ -1012,6 +1226,11 @@ async function runOneTable(tableIndex, seatsTokens, lifecycle = {}) {
       });
     }
     const ready = await emitAck(c.socket, 'player:ready', { session_id: sessionId, ready: true });
+    const readyOk = ready.ok || /managed automatically/i.test(String(ready.error || ''));
+    notePhase(shared, c.label, 'player_ready', {
+      ok: readyOk,
+      error: readyOk ? null : (ready.error || 'ready_failed'),
+    });
     if (!ready.ok) {
       const msg = String(ready.error || '');
       if (!/managed automatically/i.test(msg)) {
@@ -1059,6 +1278,10 @@ async function runOneTable(tableIndex, seatsTokens, lifecycle = {}) {
     }
     if (!shared.done) {
       shared.endReason = 'timeout_no_result';
+      notePhase(shared, `T${tableIndex}`, 'game_result', {
+        ok: false,
+        error: 'timeout_no_result',
+      });
       pushDetailedError(shared, {
         seat: `T${tableIndex}`,
         event: 'timeout',
@@ -1115,6 +1338,7 @@ function buildTableResult({ ok, table, sessionId, startedAt, shared, error, stol
     stolenRootCause: stolen?.root_cause || null,
     resultSummary: shared.resultSummary,
     seatUserIds: shared.seatUserIds || [],
+    phases: shared.phases || [],
     errorEvents: shared.errorEvents.slice(0, 80),
     rootCauseCounts: shared.rootCauseCounts,
     errors: shared.errors.slice(0, 24),
@@ -1259,6 +1483,7 @@ function writeReports(results, meta) {
     seat_user_ids: r.seatUserIds,
     result: r.resultSummary,
     error: r.error,
+    phases: r.phases,
     root_cause_counts: r.rootCauseCounts,
     errors: r.errorEvents,
   }));
@@ -1312,6 +1537,7 @@ function writeReports(results, meta) {
       .slice(0, 5)
       .map(([root_cause, count]) => ({ root_cause, count })),
     sample_errors: (r.errorEvents || []).slice(0, 5),
+    last_phases: (r.phases || []).slice(-6),
   }));
 
   const stolenSamples = results.filter((r) => r.stolen).slice(0, 20).map((r) => ({
@@ -1350,6 +1576,7 @@ function writeReports(results, meta) {
     top_errors: topErrors,
     fail_samples: failSamples,
     stolen_samples: stolenSamples,
+    phase_funnel: loadRuntime.phaseCounts,
     report_jsonl: jsonlPath,
     report_summary: summaryPath,
   };
@@ -1362,12 +1589,29 @@ function writeReports(results, meta) {
   const seatsPerTable = seatsNeededPerTable();
   const effectiveTables = rampControl.enabled ? targetActiveTables : tables;
   const needTokens = effectiveTables * seatsPerTable;
-  const tokens = loadTokens(tokensPath, needTokens);
+  let tokens = [];
+  if (tokensPath && fs.existsSync(tokensPath)) {
+    tokens = loadTokens(tokensPath, needTokens);
+  }
+  if (tokens.length < needTokens && (fullCycle || liveLogin)) {
+    const generated = synthesizePhoneRows(needTokens);
+    tokens = generated;
+    ensureReportDir(reportDir);
+    const autoPath = path.join(reportDir, `auto_phones_${phonePrefix}_${phoneStart}.jsonl`);
+    fs.writeFileSync(autoPath, `${generated.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8');
+    cycleLog('phones_generated', {
+      count: generated.length,
+      prefix: phonePrefix,
+      start: phoneStart,
+      written: autoPath,
+    });
+  }
   if (tokens.length < needTokens) {
     console.error(
-      `Need ${needTokens} tokens for ${effectiveTables} tables `
+      `Need ${needTokens} ${liveLogin ? 'phones' : 'tokens'} for ${effectiveTables} tables `
       + `(mode=${mode}, max_players=${maxPlayers}, seats_per_table=${seatsPerTable}), `
-      + `found ${tokens.length}`,
+      + `found ${tokens.length}`
+      + (liveLogin ? '. JSONL rows must include phone when using --live-login.' : ''),
     );
     process.exit(1);
   }
@@ -1387,6 +1631,11 @@ function writeReports(results, meta) {
     actionRetries,
     createRetries,
     rampHoldMode: rampControl.enabled,
+    liveLogin,
+    loginOtp: liveLogin ? loginOtp : null,
+    fullCycle,
+    fundWallets,
+    fundAmount: fundWallets ? fundAmount : 0,
     targetActiveTables: rampControl.enabled ? targetActiveTables : null,
     holdSeconds: rampControl.enabled ? holdSeconds : null,
     reportDir,
@@ -1409,6 +1658,8 @@ function writeReports(results, meta) {
       open_sockets: loadRuntime.openSockets,
       peak_open_sockets: loadRuntime.peakOpenSockets,
       tables_completed: loadRuntime.tablesCompleted,
+      auth_ok: loadRuntime.authOk,
+      auth_fail: loadRuntime.authFail,
       target_tables: effectiveTables,
     });
   }, 10000);
@@ -1439,6 +1690,17 @@ function writeReports(results, meta) {
     finished_at: new Date().toISOString(),
     peak_active_sessions: loadRuntime.peakActiveSessions,
     peak_open_sockets: loadRuntime.peakOpenSockets,
+    live_login: liveLogin,
+    full_cycle: fullCycle,
+    fund_wallets: fundWallets,
+    fund_amount: fundAmount,
+    auth_ok: loadRuntime.authOk,
+    auth_fail: loadRuntime.authFail,
+    bootstrap_fail: loadRuntime.bootstrapFail,
+    fund_ok: loadRuntime.fundOk,
+    fund_fail: loadRuntime.fundFail,
+    connect_fail: loadRuntime.connectFail,
+    create_fail: loadRuntime.createFail,
   });
 
   console.log('[LOAD_GAMEPLAY] summary', {
@@ -1470,9 +1732,20 @@ function writeReports(results, meta) {
     stolen_samples: summary.stolen_samples,
     peak_active_sessions: summary.peak_active_sessions,
     peak_open_sockets: summary.peak_open_sockets,
+    live_login: liveLogin,
+    auth_ok: loadRuntime.authOk,
+    auth_fail: loadRuntime.authFail,
+    bootstrap_fail: loadRuntime.bootstrapFail,
+    fund_ok: loadRuntime.fundOk,
+    fund_fail: loadRuntime.fundFail,
+    connect_fail: loadRuntime.connectFail,
+    create_fail: loadRuntime.createFail,
+    phase_funnel: loadRuntime.phaseCounts,
     report_jsonl: jsonlPath,
     report_summary: summaryPath,
   });
+
+  console.log('[LOAD_GAMEPLAY] phase_funnel', loadRuntime.phaseCounts);
 
   process.exit(summary.failed > effectiveTables * 0.2 ? 2 : 0);
 })().catch((err) => {
