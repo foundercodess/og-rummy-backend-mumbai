@@ -7,7 +7,7 @@ const { buildPoolSessionPrizePoolFields } = require('./poolPrizePool.service');
 const sessionCache = require('./sessionCache.service');
 const liveSessionState = require('./liveSessionState.service');
 const redisLockService = require('./redisLock.service');
-const { pool, query } = require('../db');
+const { pool, withTransaction } = require('../db');
 
 function createSessionCode() {
   return crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -762,6 +762,17 @@ async function joinSession({ sessionIdOrCode, userId, skipBalanceCheck = false }
     throw error;
   }
 
+  // Redis live/cache can return a session whose Postgres row was deleted or
+  // never committed. Joining that ghost hits FK game_session_players_game_session_id_fkey.
+  const pgExists = await gameSessionModel.sessionExistsInDb(session.id);
+  if (!pgExists) {
+    if (sessionCache.isEnabled()) await sessionCache.invalidate(session.id);
+    if (liveSessionState.isEnabled()) await liveSessionState.drop(session.id);
+    const error = new Error('Session not found');
+    error.code = 'SESSION_NOT_FOUND';
+    throw error;
+  }
+
   if (!['waiting', 'ready', 'active'].includes(session.status)) {
     const error = new Error('Session is not joinable');
     error.code = 'SESSION_NOT_JOINABLE';
@@ -871,6 +882,13 @@ async function joinSession({ sessionIdOrCode, userId, skipBalanceCheck = false }
         });
         inserted = true;
       } catch (err) {
+        if (err?.code === '23503') {
+          if (sessionCache.isEnabled()) await sessionCache.invalidate(session.id);
+          if (liveSessionState.isEnabled()) await liveSessionState.drop(session.id);
+          const error = new Error('Session not found');
+          error.code = 'SESSION_NOT_FOUND';
+          throw error;
+        }
         if (err?.code !== '23505') throw err;
         const uniqHint = `${err.constraint || ''} ${err.detail || ''}`.toLowerCase();
         if (uniqHint.includes('unique_user') || uniqHint.includes('(game_session_id, user_id)')) {
@@ -1231,16 +1249,15 @@ async function leaveTableContinuation({ sourceSessionId, userId }) {
   // Do NOT treat pool inter_deal / toss / dealing as free leave (would wipe seats).
   const isPrelockLeave = isPregameFreeLeaveEligible(sourceSession);
   if (isPrelockLeave) {
-    await query('BEGIN');
-    try {
-      await query(
+    const emptied = await withTransaction(async (client) => {
+      await client.query(
         `DELETE FROM game_session_players
          WHERE game_session_id = $1
            AND user_id = $2`,
         [sourceSession.id, userId]
       );
 
-      const remainingPlayersRes = await query(
+      const remainingPlayersRes = await client.query(
         `SELECT user_id, seat_no, status
          FROM game_session_players
          WHERE game_session_id = $1
@@ -1262,21 +1279,18 @@ async function leaveTableContinuation({ sourceSessionId, userId }) {
       delete nextMetadata.entry_locked_at_seconds_left;
 
       if (remainingPlayers.length === 0) {
-        await query(
+        await client.query(
           `DELETE FROM game_sessions
            WHERE id = $1`,
           [sourceSession.id]
         );
-        await query('COMMIT');
-        if (sessionCache.isEnabled()) await sessionCache.invalidate(sourceSession.id);
-        if (liveSessionState.isEnabled()) await liveSessionState.drop(sourceSession.id);
-        return null;
+        return true;
       }
 
       const nextHostUserId = Number(sourceSession.host_user_id) === Number(userId)
         ? Number(remainingPlayers[0].user_id)
         : Number(sourceSession.host_user_id);
-      await query(
+      await client.query(
         `UPDATE game_sessions
          SET host_user_id = $2,
              status = 'waiting',
@@ -1285,7 +1299,7 @@ async function leaveTableContinuation({ sourceSessionId, userId }) {
          WHERE id = $1`,
         [sourceSession.id, nextHostUserId, JSON.stringify(nextMetadata)]
       );
-      await query(
+      await client.query(
         `INSERT INTO game_session_events (game_session_id, user_id, event_type, payload)
          VALUES ($1, $2, 'table_left', $3::jsonb)`,
         [sourceSession.id, userId, JSON.stringify({
@@ -1294,14 +1308,13 @@ async function leaveTableContinuation({ sourceSessionId, userId }) {
           prelock_exit: true,
         })]
       );
-      await query('COMMIT');
-      if (sessionCache.isEnabled()) await sessionCache.invalidate(sourceSession.id);
-      if (liveSessionState.isEnabled()) await liveSessionState.drop(sourceSession.id);
-      return getSessionState(sourceSession.id);
-    } catch (err) {
-      await query('ROLLBACK');
-      throw err;
-    }
+      return false;
+    });
+
+    if (sessionCache.isEnabled()) await sessionCache.invalidate(sourceSession.id);
+    if (liveSessionState.isEnabled()) await liveSessionState.drop(sourceSession.id);
+    if (emptied) return null;
+    return getSessionState(sourceSession.id);
   }
 
   // 6P ongoing (e.g. pool inter_deal `ready`): soft away so disconnect-style

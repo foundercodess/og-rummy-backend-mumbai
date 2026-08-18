@@ -123,7 +123,19 @@ function compactSqlForLog(text) {
     .substring(0, 240);
 }
 
-// Optimized query function with performance monitoring
+const TXN_CONTROL_RE = /^\s*(BEGIN|START\s+TRANSACTION|COMMIT|ROLLBACK|END)\b/i;
+
+async function rollbackQuiet(client) {
+  if (!client) return;
+  try {
+    await client.query('ROLLBACK');
+  } catch (_) {
+    // Connection may already be dead; pool will discard on release(err).
+  }
+}
+
+// Single-statement helper. Never holds a transaction across release — callers
+// that need BEGIN/COMMIT must use withTransaction() so the same client is kept.
 async function query(text, params) {
   if (!pool) throw new Error('DATABASE_URL not configured');
 
@@ -135,6 +147,15 @@ async function query(text, params) {
     client = await pool.connect();
     const acquiredAt = Date.now();
     const acquireMs = acquiredAt - queuedAt;
+
+    if (TXN_CONTROL_RE.test(String(text || ''))) {
+      console.error(
+        '[DB] query() cannot run transaction control SQL (would use a random pool client). Use withTransaction().'
+      );
+      const err = new Error('query() cannot run BEGIN/COMMIT/ROLLBACK; use withTransaction()');
+      err.code = 'DB_TXN_VIA_QUERY';
+      throw err;
+    }
 
     const result = await client.query(text, params);
     const execMs = Date.now() - acquiredAt;
@@ -155,11 +176,32 @@ async function query(text, params) {
       `Query failed total=${totalMs}ms pool=${JSON.stringify(snapshotPoolMetrics())} ` +
         `sql=${compactSqlForLog(text)} error=${err.message}`
     );
+    await rollbackQuiet(client);
     throw err;
   } finally {
     if (client) {
       client.release();
     }
+  }
+}
+
+/**
+ * Run fn(client) inside a single-connection BEGIN/COMMIT.
+ * On error the transaction is rolled back before the client is returned to the pool.
+ */
+async function withTransaction(fn) {
+  if (!pool) throw new Error('DATABASE_URL not configured');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await rollbackQuiet(client);
+    throw err;
+  } finally {
+    client.release();
   }
 }
 
@@ -202,7 +244,8 @@ async function testConnection() {
 
 module.exports = { 
   pool, 
-  query, 
+  query,
+  withTransaction,
   testConnection,
   getPoolMetrics,
   getPreparedStatement 

@@ -123,6 +123,7 @@ async function maybeInjectBotsInSession(io, session, config, adapters) {
   try {
     const fresh = await gameplayService.getSessionState(session.id);
     if (!fresh || fresh.status !== 'waiting') return;
+    if (fresh.metadata?.load_test_gameplay === true || fresh.metadata?.load_test === true) return;
 
     const adapter = chooseAdapter(fresh, adapters);
     if (!adapter) {

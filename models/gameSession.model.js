@@ -292,6 +292,14 @@ async function findLatestActiveSessionForUser(userId, options = {}) {
   return result.rows[0] || null;
 }
 
+async function sessionExistsInDb(sessionId) {
+  const result = await query(
+    'SELECT 1 FROM game_sessions WHERE id = $1 LIMIT 1',
+    [sessionId]
+  );
+  return Boolean(result.rows[0]);
+}
+
 async function listStaleWaitingSessions({ olderThanSeconds = 30, limit = 25 } = {}) {
   const safeOlderThanSeconds = Math.max(1, Number(olderThanSeconds) || 30);
   const safeLimit = Math.max(1, Math.min(200, Number(limit) || 25));
@@ -308,6 +316,8 @@ async function listStaleWaitingSessions({ olderThanSeconds = 30, limit = 25 } = 
      WHERE gs.status = 'waiting'
        AND p.joined_count >= 1
        AND p.joined_count < gs.max_players
+       AND COALESCE((gs.metadata->>'load_test_gameplay')::boolean, false) = false
+       AND COALESCE((gs.metadata->>'load_test')::boolean, false) = false
        AND (
          gs.created_at <= NOW() - make_interval(secs => $1)
          OR COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = true
@@ -574,6 +584,7 @@ async function listRecentEvents(sessionId, limit = 25) {
 module.exports = {
   createSession,
   findSessionById,
+  sessionExistsInDb,
   findSessionByCode,
   findOpenWaitingSession,
   findReservedContinuationSession,
