@@ -49,10 +49,19 @@ if (process.env.DATABASE_URL) {
       rejectUnauthorized: false
     } : false,
     
-    // Single-process default 30. With multiple Node workers put PgBouncer in
+    // Single-process default 8. With multiple Node workers put PgBouncer in
     // front and lower per-process max (e.g. DB_POOL_MAX=8) so total PG
     // connections stay under RDS max_connections.
-    max: parseInt(process.env.DB_POOL_MAX, 10) || 30,
+    max: (() => {
+      const parsed = parseInt(process.env.DB_POOL_MAX, 10);
+      const poolMax = Number.isFinite(parsed) && parsed > 0 ? parsed : 8;
+      if (poolMax > 15) {
+        console.warn(
+          `[DB] High DB_POOL_MAX=${poolMax}. With multiple Node workers this can exceed RDS max_connections; prefer PgBouncer + DB_POOL_MAX<=10.`
+        );
+      }
+      return poolMax;
+    })(),
     
     // Keep connections alive to avoid reconnection overhead
     idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT) || 30000,

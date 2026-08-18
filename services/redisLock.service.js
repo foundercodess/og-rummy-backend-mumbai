@@ -89,10 +89,56 @@ function dealEmitKey(sessionId, sequence) {
     return `idem:deal:session:${sessionId}:seq:${sequence}`;
 }
 
+/**
+ * Acquire a join-seat lock and hold it alive (via periodic renewal) for the
+ * duration of `fn`. Prevents the 15-second fixed TTL from expiring while
+ * Postgres is under heavy load, which was the root cause of
+ * `duplicate key ... game_session_players_unique_seat` errors.
+ *
+ * @param {string} key      - Lock key (e.g. joinSessionLockKey(sessionId))
+ * @param {string} owner    - Unique owner token
+ * @param {number} ttlSec   - Initial TTL and renewal interval target
+ * @param {Function} fn     - Async function to run while holding the lock
+ * @returns {*} Return value of fn
+ */
+async function withJoinLock(key, owner, ttlSec, fn) {
+    // Try to acquire; retry with 50ms backoff up to ~1s.
+    let acquired = await acquireLock(key, owner, ttlSec);
+    if (!acquired) {
+        for (let i = 0; i < 20 && !acquired; i += 1) {
+            await new Promise((r) => setTimeout(r, 50));
+            acquired = await acquireLock(key, owner, ttlSec);
+        }
+    }
+    if (!acquired) {
+        const err = new Error('Session join busy — retry shortly');
+        err.code = 'SESSION_JOIN_BUSY';
+        throw err;
+    }
+
+    // Renew every (ttlSec / 2) seconds so the lock never expires under slow DB.
+    const renewEveryMs = Math.max(1000, Math.floor((ttlSec / 2) * 1000));
+    const renewTimer = setInterval(async () => {
+        const ok = await renewLock(key, owner, ttlSec).catch(() => false);
+        if (!ok) {
+            console.warn(`[join-lock] Failed to renew ${key} — owner=${owner}`);
+        }
+    }, renewEveryMs);
+    if (renewTimer.unref) renewTimer.unref();
+
+    try {
+        return await fn();
+    } finally {
+        clearInterval(renewTimer);
+        await releaseLock(key, owner).catch(() => {});
+    }
+}
+
 module.exports = {
     acquireLock,
     renewLock,
     releaseLock,
+    withJoinLock,
     claimEventIdempotency,
     releaseEventIdempotency,
     pregameLockKey,

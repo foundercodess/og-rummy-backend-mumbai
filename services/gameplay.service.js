@@ -727,11 +727,18 @@ async function createSession({ gameId, contestId, hostUserId, maxPlayers, metada
     throw new Error('Failed to create unique game session code');
   }
 
-  await gameSessionModel.addPlayer({
-    sessionId: session.id,
-    userId: hostUserId,
-    seatNo: 1,
-    metadata: { ready: false, host: true },
+  // Seat the host under the join lock so that any concurrent matchmaking joiner
+  // that lands on this brand-new session (race between findOpenWaitingSession and
+  // createSession) cannot also claim seat 1 before the host row is committed.
+  const hostLockKey = redisLockService.joinSessionLockKey(session.id);
+  const hostLockOwner = `join:${hostUserId}:${process.pid}:${Date.now()}`;
+  await redisLockService.withJoinLock(hostLockKey, hostLockOwner, 30, async () => {
+    await gameSessionModel.addPlayer({
+      sessionId: session.id,
+      userId: hostUserId,
+      seatNo: 1,
+      metadata: { ready: false, host: true },
+    });
   });
 
   await gameSessionModel.insertEvent({
@@ -807,24 +814,13 @@ async function joinSession({ sessionIdOrCode, userId, skipBalanceCheck = false }
     }
   }
 
-  // Serialize seat assignment across ALB/workers. Without this, two joiners can
-  // pick the same seat_no and hit game_session_players_unique_seat (23505).
+  // Serialize seat assignment across ALB/workers. withJoinLock holds the Redis
+  // lock alive via periodic renewal, preventing TTL expiry under slow DB load
+  // (which was the root cause of duplicate key ... game_session_players_unique_seat).
   const joinLockKey = redisLockService.joinSessionLockKey(session.id);
   const joinLockOwner = `join:${userId}:${process.pid}:${Date.now()}`;
-  let joinLockGot = await redisLockService.acquireLock(joinLockKey, joinLockOwner, 15);
-  if (!joinLockGot) {
-    for (let i = 0; i < 20 && !joinLockGot; i += 1) {
-      await new Promise((r) => setTimeout(r, 50));
-      joinLockGot = await redisLockService.acquireLock(joinLockKey, joinLockOwner, 15);
-    }
-  }
-  if (!joinLockGot) {
-    const error = new Error('Session join busy — retry shortly');
-    error.code = 'SESSION_JOIN_BUSY';
-    throw error;
-  }
 
-  try {
+  return redisLockService.withJoinLock(joinLockKey, joinLockOwner, 30, async () => {
     // Re-check inside the lock (reconnect / double-submit races).
     const lockedExistingPlayer = await gameSessionModel.findPlayer(session.id, userId);
     if (lockedExistingPlayer) {
@@ -878,10 +874,10 @@ async function joinSession({ sessionIdOrCode, userId, skipBalanceCheck = false }
         if (err?.code !== '23505') throw err;
         const uniqHint = `${err.constraint || ''} ${err.detail || ''}`.toLowerCase();
         if (uniqHint.includes('unique_user') || uniqHint.includes('(game_session_id, user_id)')) {
-          // Another request already seated this user.
+          // Another request already seated this user — idempotent success.
           return getSessionState(session.id);
         }
-        // Seat taken between list + insert (or unknown unique) — retry with a fresh seat map.
+        // Seat taken between list + insert — retry with a fresh seat map.
         continue;
       }
     }
@@ -905,9 +901,7 @@ async function joinSession({ sessionIdOrCode, userId, skipBalanceCheck = false }
     });
 
     return getSessionState(session.id);
-  } finally {
-    await redisLockService.releaseLock(joinLockKey, joinLockOwner).catch(() => {});
-  }
+  });
 }
 
 async function markPlayerReady({ sessionId, userId, ready }) {
@@ -1170,16 +1164,23 @@ async function createOrJoinContinuationSession({ sourceSessionId, userId }) {
     throw new Error('Failed to create continuation session');
   }
 
+  // Use the same join lock that joinSession() uses so that if multiple players
+  // try to join this fresh continuation simultaneously the seat assignments
+  // are still serialised and the unique_seat constraint is never violated.
+  const contLockKey = redisLockService.joinSessionLockKey(continuation.id);
+  const contLockOwner = `join:${userId}:${process.pid}:${Date.now()}`;
   const sourceSeat = sourcePlayer.seat_no || 1;
-  await gameSessionModel.addPlayer({
-    sessionId: continuation.id,
-    userId,
-    seatNo: sourceSeat,
-    metadata: {
-      ready: false,
-      host: true,
-      continuation_source_session_id: sourceSession.id,
-    },
+  await redisLockService.withJoinLock(contLockKey, contLockOwner, 30, async () => {
+    await gameSessionModel.addPlayer({
+      sessionId: continuation.id,
+      userId,
+      seatNo: sourceSeat,
+      metadata: {
+        ready: false,
+        host: true,
+        continuation_source_session_id: sourceSession.id,
+      },
+    });
   });
 
   await gameSessionModel.insertEvent({
