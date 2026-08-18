@@ -752,22 +752,13 @@ async function createSession({ gameId, contestId, hostUserId, maxPlayers, metada
 }
 
 async function joinSession({ sessionIdOrCode, userId, skipBalanceCheck = false }) {
+  // Join/create must use Postgres, not leftover Redis live keys (ID reuse after
+  // load-test / truncate leaves live:sess:{id} pointing at a completed table).
   const session = Number.isInteger(sessionIdOrCode)
-    ? await gameSessionModel.findSessionById(sessionIdOrCode)
+    ? await gameSessionModel.findSessionByIdFromDb(sessionIdOrCode)
     : await gameSessionModel.findSessionByCode(String(sessionIdOrCode));
 
   if (!session) {
-    const error = new Error('Session not found');
-    error.code = 'SESSION_NOT_FOUND';
-    throw error;
-  }
-
-  // Redis live/cache can return a session whose Postgres row was deleted or
-  // never committed. Joining that ghost hits FK game_session_players_game_session_id_fkey.
-  const pgExists = await gameSessionModel.sessionExistsInDb(session.id);
-  if (!pgExists) {
-    if (sessionCache.isEnabled()) await sessionCache.invalidate(session.id);
-    if (liveSessionState.isEnabled()) await liveSessionState.drop(session.id);
     const error = new Error('Session not found');
     error.code = 'SESSION_NOT_FOUND';
     throw error;

@@ -2,6 +2,34 @@ const { query } = require('../db');
 const sessionCache = require('../services/sessionCache.service');
 const liveSessionState = require('../services/liveSessionState.service');
 
+function isTerminalSessionStatus(status) {
+  return status === 'completed' || status === 'cancelled';
+}
+
+async function fetchSessionRowFromDb(sessionId) {
+  const result = await query('SELECT * FROM game_sessions WHERE id = $1', [sessionId]);
+  return result.rows[0] || null;
+}
+
+async function replaceLiveFromDbRow(sessionId, row) {
+  if (liveSessionState.isEnabled()) await liveSessionState.drop(sessionId);
+  if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
+  if (row && liveSessionState.isEnabled()) {
+    await liveSessionState.hydrateFromRow(sessionId, row);
+  }
+  if (row && sessionCache.isEnabled()) {
+    await sessionCache.setSessionRow(sessionId, row);
+  }
+}
+
+function liveRowIsStale(live, pgRow) {
+  if (!live) return false;
+  if (!pgRow) return true;
+  if (String(live.session_code || '') !== String(pgRow.session_code || '')) return true;
+  if (isTerminalSessionStatus(live.status) && !isTerminalSessionStatus(pgRow.status)) return true;
+  return false;
+}
+
 async function createSession({ sessionCode, gameId, contestId, hostUserId, maxPlayers, metadata = {} }) {
   const result = await query(
     `INSERT INTO game_sessions (
@@ -18,14 +46,55 @@ async function createSession({ sessionCode, gameId, contestId, hostUserId, maxPl
     [sessionCode, gameId, contestId, hostUserId, maxPlayers, JSON.stringify(metadata)]
   );
 
-  return result.rows[0] || null;
+  const row = result.rows[0] || null;
+  // Postgres IDs can be reused after a truncate/reset while Redis still holds
+  // live:sess:{id} from a previous completed load-test table. Drop before hydrate.
+  if (row) await replaceLiveFromDbRow(row.id, row);
+  return row;
+}
+
+async function findSessionByIdFromDb(sessionId) {
+  const row = await fetchSessionRowFromDb(sessionId);
+  if (!row) {
+    if (liveSessionState.isEnabled()) await liveSessionState.drop(sessionId);
+    if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
+    return null;
+  }
+  if (liveSessionState.isEnabled()) {
+    const live = await liveSessionState.get(sessionId);
+    if (liveRowIsStale(live, row)) {
+      await replaceLiveFromDbRow(sessionId, row);
+    }
+  }
+  return row;
 }
 
 async function findSessionById(sessionId) {
   // Phase 3: live Redis snapshot is authoritative for active tables when enabled.
   if (liveSessionState.isEnabled()) {
     const live = await liveSessionState.get(sessionId);
-    if (live) return live;
+    if (live) {
+      // Cheap PK fingerprint — Redis keys are live:sess:{id}. After a DB
+      // truncate/reset, Postgres can reuse that id for a different table while
+      // Redis still holds the old pick/discard snapshot. session_code is unique
+      // per create, so a mismatch must not be used for gameplay.
+      const fp = await query(
+        'SELECT session_code, status FROM game_sessions WHERE id = $1',
+        [sessionId]
+      );
+      const pg = fp.rows[0] || null;
+      if (liveRowIsStale(live, pg)) {
+        if (!pg) {
+          await liveSessionState.drop(sessionId);
+          if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
+          return null;
+        }
+        const row = await fetchSessionRowFromDb(sessionId);
+        await replaceLiveFromDbRow(sessionId, row);
+        return row;
+      }
+      return live;
+    }
   }
 
   if (sessionCache.isEnabled()) {
@@ -39,8 +108,7 @@ async function findSessionById(sessionId) {
     }
   }
 
-  const result = await query('SELECT * FROM game_sessions WHERE id = $1', [sessionId]);
-  const row = result.rows[0] || null;
+  const row = await fetchSessionRowFromDb(sessionId);
   if (row) {
     if (liveSessionState.isEnabled()) {
       await liveSessionState.hydrateFromRow(sessionId, row);
@@ -58,8 +126,12 @@ async function findSessionByCode(sessionCode) {
   if (!row) return null;
   if (liveSessionState.isEnabled()) {
     const live = await liveSessionState.get(row.id);
-    if (live) return live;
-    await liveSessionState.hydrateFromRow(row.id, row);
+    if (live && !liveRowIsStale(live, row)) return live;
+    if (liveRowIsStale(live, row)) {
+      await replaceLiveFromDbRow(row.id, row);
+    } else {
+      await liveSessionState.hydrateFromRow(row.id, row);
+    }
   }
   return row;
 }
@@ -584,6 +656,7 @@ async function listRecentEvents(sessionId, limit = 25) {
 module.exports = {
   createSession,
   findSessionById,
+  findSessionByIdFromDb,
   sessionExistsInDb,
   findSessionByCode,
   findOpenWaitingSession,
