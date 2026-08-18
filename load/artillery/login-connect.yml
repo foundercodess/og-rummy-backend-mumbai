@@ -1,11 +1,18 @@
 # Full cycle capacity probe: send-otp + verify 1111 + bootstrap HTTP + socket hold.
 #
-#   cd og_rummy_backend
+# Local smoke (backend on :3000, ~40 logins — use this file, not -e local):
+#   npx artillery@2 run load/artillery/login-connect.local.yml
+#
+# Mumbai ALB (after local is clean):
 #   LOAD_TEST_URL=http://og-rummy-alb-791534744.ap-south-1.elb.amazonaws.com \
-#     LOAD_TOKENS=./load_tokens.jsonl \
+#     LOAD_SOCKET_HOLD_MS=15000 \
 #     npx artillery@2 run load/artillery/login-connect.yml
 #
-# This does not play rummy. Use load_test_gameplay.js --live-login for pick/discard.
+# Each VU gets a unique 97000… phone. Reusing load_tokens.jsonl across Artillery
+# workers logs the same user in twice (one-session-per-user) and sockets fail.
+# Processor runs on your laptop — you do not need to deploy it for this test.
+#
+# This does not play rummy. Use run_load_cycle.js for pick/discard.
 
 config:
   target: "{{ $processEnvironment.LOAD_TEST_URL }}"
@@ -17,7 +24,8 @@ config:
       arrivalRate: 20
       name: ramp
   processor: "./processor.js"
-  timeout: 45
+  # Must exceed login + LOAD_SOCKET_HOLD_MS (default hold 15s).
+  timeout: 90
   engines:
     http: {}
 

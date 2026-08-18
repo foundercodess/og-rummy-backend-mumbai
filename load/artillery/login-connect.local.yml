@@ -1,0 +1,22 @@
+# Local smoke only — do not use -e local on login-connect.yml (Artillery keeps
+# the big warmup/ramp phases and will flood Docker).
+#
+#   npx artillery@2 run load/artillery/login-connect.local.yml
+#
+# ~40 logins vs http://127.0.0.1:3000. Processor is on the laptop.
+
+config:
+  target: http://127.0.0.1:3000
+  phases:
+    - duration: 20
+      arrivalRate: 2
+      name: local_smoke
+  processor: "./processor.js"
+  timeout: 90
+  engines:
+    http: {}
+
+scenarios:
+  - name: login_bootstrap_socket_hold
+    flow:
+      - function: "fullCycleUntilSocket"
