@@ -2516,8 +2516,11 @@ function cleanupDeclareState(sessionId) {
 
 /** True while a declaration response window is open — turn timers must not run in parallel. */
 function isDeclarationWindowActive(sessionId, metadata = {}) {
+  if (sessionId != null && activeDeclareBySession.has(sessionId)) {
+    return true;
+  }
   const sid = Number(sessionId);
-  if (!Number.isNaN(sid) && activeDeclareBySession.has(sid)) {
+  if (!Number.isNaN(sid) && sid !== sessionId && activeDeclareBySession.has(sid)) {
     return true;
   }
   return String(metadata?.phase || '').toLowerCase() === 'declaration_window';
@@ -2587,6 +2590,10 @@ async function botPhaseStillNeeded(sessionId, expectedTurnId, phase) {
   const normalizedPhase = phase === 'discard' ? 'discard' : 'pick';
   const session = await loadBotActionSession(sessionId);
   if (!session || session.status !== 'active') return false;
+  // Finish opens a declare window but keeps the same turn + has_picked.
+  // That must not be treated as "discard still needed" or the bot throws a
+  // second card (finish + discard) and the result hand drops to 12.
+  if (isDeclarationWindowActive(sessionId, session.metadata)) return false;
   const turn = session.metadata?.turn;
   if (!turn || Number(turn.turn_id) !== Number(expectedTurnId)) return false;
   if (!isBotTurn(session, turn.user_id)) return false;
@@ -8733,6 +8740,10 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
   const decisionStartedAt = Date.now();
   const session = await loadBotActionSession(sessionId);
   if (!session || session.status !== 'active') return;
+  if (isDeclarationWindowActive(sessionId, session.metadata)) {
+    logGame(sessionId, `Bot pick skipped — declaration already open turn=${expectedTurnId}`);
+    return;
+  }
   const softRiggingEnabled = isBotSoftRiggingEnabled(session);
   const aggressiveEnabled = isBotAggressionEnabled(session);
 
@@ -9011,6 +9022,10 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
 async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
   const refreshed = await loadBotActionSession(sessionId);
   if (!refreshed || refreshed.status !== 'active') return;
+  if (isDeclarationWindowActive(sessionId, refreshed.metadata)) {
+    logGame(sessionId, `Bot discard skipped — declaration already open turn=${expectedTurnId}`);
+    return;
+  }
   const softRiggingEnabled = isBotSoftRiggingEnabled(refreshed);
   const aggressiveEnabled = isBotAggressionEnabled(refreshed);
   const refreshedTurn = refreshed.metadata?.turn;
@@ -9044,6 +9059,16 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
     .some((card) => String(card?.card_uid || '') === String(refreshedTurn.picked_card_uid));
   if (!hasPickedCardInHand) {
     scheduleBotTurnAction(io, sessionId, refreshedTurn, 'pick', { softRiggingEnabled, aggressiveEnabled });
+    return;
+  }
+  // After pick the hand must be 14. A 13-card hand here means finish already
+  // removed a card — discarding again is the DQ-then-D10 double action.
+  if (refreshedPlayer.cards.length !== FINISH_PLAN_HAND_CARD_COUNT) {
+    warnGame(
+      sessionId,
+      `Bot discard aborted — hand has ${refreshedPlayer.cards.length} cards after pick ` +
+      `uid=${refreshedTurn.user_id} (finish already consumed this turn)`
+    );
     return;
   }
 
@@ -9284,6 +9309,11 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
       }
     );
     declarationRuntime.scheduleBotResponses(sessionId);
+    logGame(
+      sessionId,
+      `Bot finish complete — discard skipped for this turn uid=${refreshedTurn.user_id} ` +
+      `finish=${finishPlan.finishCard.card_uid}`
+    );
     return;
   }
 
@@ -9557,6 +9587,10 @@ function scheduleDeferredTurnTimeout(io, sessionId, turnId, fireAtMs, turnType =
  */
 async function flushBotTurnBeforeTimeout(io, sessionId, session, turn) {
   if (!isBotTurn(session, turn.user_id)) return session;
+  if (isDeclarationWindowActive(sessionId, session?.metadata)) {
+    logGame(sessionId, `Bot flush skipped — declaration window active turn=${turn?.turn_id}`);
+    return session;
+  }
 
   const softRiggingEnabled = isBotSoftRiggingEnabled(session);
   const aggressiveEnabled = isBotAggressionEnabled(session);
@@ -9797,6 +9831,7 @@ async function maybeScheduleBotTurnAction(io, sessionId, turn) {
   if (!turn || Number.isNaN(Number(turn.user_id))) return;
   const session = await loadBotActionSession(sessionId);
   if (!session || session.status !== 'active') return;
+  if (isDeclarationWindowActive(sessionId, session.metadata)) return;
   if (!isBotTurn(session, turn.user_id)) return;
   const softRiggingEnabled = isBotSoftRiggingEnabled(session);
   const aggressiveEnabled = isBotAggressionEnabled(session);
