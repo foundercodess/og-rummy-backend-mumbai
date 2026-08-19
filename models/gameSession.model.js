@@ -548,7 +548,19 @@ async function updateSessionStatus(sessionId, status, fields = {}) {
 
     // Async Postgres snapshot — Redis already has the move; ACK path stays fast.
     liveSessionState.noteAsyncPersist();
-    const capturedFields = { ...fields };
+    // Strip `distribution` from async PG writes during active gameplay turns.
+    // Distribution (~3KB card data) doesn't change mid-deal; Redis is source-of-truth.
+    // We keep distribution in PG when phase transitions (dealing/ready/inter_deal)
+    // so PG stays recoverable after Redis eviction.
+    let capturedFields = { ...fields };
+    if (capturedFields.metadata && capturedFields.metadata.distribution) {
+      const phase = capturedFields.metadata.phase;
+      const isHotTurnPhase = !phase || phase === 'active';
+      if (isHotTurnPhase) {
+        const { distribution: _dropped, ...metaWithoutDist } = capturedFields.metadata;
+        capturedFields = { ...capturedFields, metadata: metaWithoutDist };
+      }
+    }
     const capturedStatus = status;
     const capturedVersion = nextLive.live_version;
     setImmediate(() => {

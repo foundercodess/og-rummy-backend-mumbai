@@ -169,7 +169,7 @@ jobs:
           RECHARGE_PAYIN_SYNC_MIN_AGE_MINUTES: "2"
           RECHARGE_PAYIN_SYNC_BATCH_LIMIT: "50"
           SESSION_STATE_CACHE_ENABLED: "true"
-          SESSION_STATE_CACHE_TTL_MS: "3000"
+          SESSION_STATE_CACHE_TTL_MS: "30000"
           # Phase 3 permanent: Redis live state + async PG snapshot (set false only to roll back)
           LIVE_SESSION_STATE_ENABLED: "true"
           LIVE_SESSION_STATE_ASYNC_PG: "true"
@@ -178,7 +178,7 @@ jobs:
           BOT_FINISH_EVAL_BUDGET_MS: "40"
           BOT_FINISH_EVAL_MAX_CARDS: "5"
           GROUPING_FINISH_SCAN_BUDGET_MS: "35"
-          DB_POOL_MAX: "8"
+          DB_POOL_MAX: "20"
           DB_STATEMENT_TIMEOUT: "10000"
           DB_IDLE_IN_TX_TIMEOUT: "30000"
           GIFTAURA_MERCHANT_TOKEN: ${{ secrets.GIFTAURA_MERCHANT_TOKEN }}
@@ -268,7 +268,7 @@ jobs:
             BOT_FINISH_EVAL_BUDGET_MS="${BOT_FINISH_EVAL_BUDGET_MS:-40}" \
             BOT_FINISH_EVAL_MAX_CARDS="${BOT_FINISH_EVAL_MAX_CARDS:-5}" \
             GROUPING_FINISH_SCAN_BUDGET_MS="${GROUPING_FINISH_SCAN_BUDGET_MS:-35}" \
-            DB_POOL_MAX="${DB_POOL_MAX:-8}" \
+            DB_POOL_MAX="${DB_POOL_MAX:-20}" \
             DB_STATEMENT_TIMEOUT="${DB_STATEMENT_TIMEOUT:-10000}" \
             DB_IDLE_IN_TX_TIMEOUT="${DB_IDLE_IN_TX_TIMEOUT:-30000}" \
             sh "$APP_DIR/scripts/deploy-ec2.sh"
