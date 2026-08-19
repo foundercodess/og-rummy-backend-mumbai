@@ -259,7 +259,8 @@ const DISCARD_HISTORY_MAX_ENTRIES = Math.max(
 /** Human pick ACK finish-hint scan budget (ungrouped leftovers). Rules unchanged. */
 const PICK_ACK_FINISH_PLAN_MAX_CANDIDATES = Math.max(
   1,
-  Math.min(8, Number(process.env.PICK_ACK_FINISH_PLAN_MAX_CANDIDATES) || 2),
+  // Default lowered to reduce CPU spikes at high CCU.
+  Math.min(8, Number(process.env.PICK_ACK_FINISH_PLAN_MAX_CANDIDATES) || 1),
 );
 /** Yield so inbound socket:ping / player ACKs can run between bot CPU chunks. */
 function yieldToEventLoop() {
@@ -4699,11 +4700,12 @@ function buildAutoBestGroupingResult(handCards, wildJoker, options = {}) {
   const groupingOptions = options.groupingOptions || {};
   const best = groupingService.buildBestGrouping(handCards, wildJoker, groupingOptions);
   const submittedGroups = toSubmittedGroupsFromGrouping(best);
-  const grouping = groupingService.evaluateSubmittedGrouping(
-    handCards,
-    wildJoker,
-    submittedGroups
-  );
+  // Hot-path optimization: when `fastFinishPlan` is enabled (pick ACK),
+  // the `best` grouping is already fully evaluated (types + summary + display
+  // points). Re-evaluating submitted groups here is redundant and expensive.
+  const grouping = options.fastFinishPlan === true
+    ? best
+    : groupingService.evaluateSubmittedGrouping(handCards, wildJoker, submittedGroups);
 
   // Fast path for pick ACK: trust finish_card_uid from buildBestGrouping instead of
   // re-scanning every leftover (that scan was a major pick-latency source).
@@ -8918,16 +8920,9 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
     phase_updated_at: new Date().toISOString(),
   };
 
-  const botDiscardPickUpdate = source === 'discard'
-    ? markDiscardHistoryPicked(pickedMetadata, pickedMetadata.distribution, {
-      picked_card: pickedCard,
-      picked_by_user_id: turn.user_id,
-      picked_at: new Date().toISOString(),
-    })
-    : null;
-  if (botDiscardPickUpdate?.changed) {
-    pickedMetadata.discard_history = botDiscardPickUpdate.discardHistory;
-  }
+  // Discard-history picked markers are UI/audit only. Updating
+  // discard_history on every bot pick increases per-move snapshot serialization.
+  // Keep discard_history timeline updates only on discards.
 
   await gameSessionModel.updateSessionStatus(sessionId, session.status, {
     currentTurnUserId: session.current_turn_user_id,
@@ -9001,15 +8996,7 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
   });
   io.to(sessionRoom(sessionId)).emit('game:pick', pickPayload);
 
-  if (botDiscardPickUpdate?.changed) {
-    emitDiscardHistoryUpdate(io, {
-      ...session,
-      metadata: pickedMetadata,
-    }, {
-      reason: 'bot_pick_discard',
-      latest: botDiscardPickUpdate.latestEntry,
-    });
-  }
+  // discard_history picked markers are handled on discards only.
 
   scheduleBotTurnAction(io, sessionId, {
     ...turn,
@@ -13230,16 +13217,9 @@ function registerSocketServer(httpServer) {
           phase_updated_at: new Date().toISOString(),
         };
 
-        const playerDiscardPickUpdate = source === 'discard'
-          ? markDiscardHistoryPicked(nextMetadata, nextMetadata.distribution, {
-            picked_card: pickedCard,
-            picked_by_user_id: socket.user.id,
-            picked_at: new Date().toISOString(),
-          })
-          : null;
-        if (playerDiscardPickUpdate?.changed) {
-          nextMetadata.discard_history = playerDiscardPickUpdate.discardHistory;
-        }
+        // Discard-history picked markers are UI/audit only. Updating
+        // discard_history on every pick increases per-move snapshot serialization.
+        // Keep discard_history timeline updates only on discards.
 
         // Persist move first so cluster peers see has_picked before finish-hint CPU.
         await gameSessionModel.updateSessionStatus(sessionId, session.status, {
@@ -13306,15 +13286,7 @@ function registerSocketServer(httpServer) {
           discard_top: discardPile[0] || null,
         });
 
-        if (playerDiscardPickUpdate?.changed) {
-          emitDiscardHistoryUpdate(io, {
-            ...session,
-            metadata: nextMetadata,
-          }, {
-            reason: 'player_pick_discard',
-            latest: playerDiscardPickUpdate.latestEntry,
-          });
-        }
+        // discard_history update is handled on discards only.
         } finally {
           await redisLockService.releaseLock(pickLockKey, pickLockOwner);
         }
