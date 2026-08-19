@@ -2385,7 +2385,7 @@ async function transitionToNextDeal(io, session, snapshot) {
   });
 
   io.to(sessionRoom(sessionId)).emit('game:result', payload);
-  await emitSessionState(io, sessionId);
+  await emitSessionState(io, sessionId, { includeEvents: false });
 
   const nextDealParticipants = getActivePlayers(session);
   const rotatedFirstTurnUserId = resolveNextDealFirstTurnUserId(session, nextDealParticipants);
@@ -7274,8 +7274,8 @@ async function transitionToNextPoolRound(io, session, payload, roundProgress) {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function emitSessionState(io, sessionIdOrCode) {
-  const session = await gameplayService.getSessionState(sessionIdOrCode);
+async function emitSessionState(io, sessionIdOrCode, options = {}) {
+  const session = await gameplayService.getSessionState(sessionIdOrCode, null, options);
   if (!session) return null;
   io.to(sessionRoom(session.id)).emit('session:state', session);
   return session;
@@ -9318,7 +9318,7 @@ async function executeBotDiscardAction(io, sessionId, expectedTurnId) {
         distribution: nextMetadata.distribution,
       });
       scheduleTurnTimeout(io, sessionId, nextTurn);
-      await emitSessionState(io, sessionId);
+      await emitSessionState(io, sessionId, { includeEvents: false });
       return;
     }
 
@@ -11163,7 +11163,12 @@ function registerSocketServer(httpServer) {
     }
 
     try {
-      const session = await gameplayService.getSessionState(sessionId);
+      // Skip game_session_events (ORDER BY created_at DESC scan) — finalize
+      // only needs players + distribution + scores, not the event audit trail.
+      const session = await gameplayService.getSessionState(sessionId, null, {
+        includeEvents: false,
+        includeGameContest: true,
+      });
       if (!session) {
         warnGame(sessionId, 'Session not found during declaration finalize — aborting');
         cleanupDeclareState(sessionId);
@@ -11218,7 +11223,12 @@ function registerSocketServer(httpServer) {
 
       const timeoutEliminatedSet = getTimeoutEliminatedUserIdSet(session.metadata || {});
       const turnEliminatedSet = getTurnEliminatedUserIdSet(session.metadata || {});
-      const results = roundPlayers.map((player) => {
+      // Score each player with a yield between seats so that concurrent finalize
+      // calls from N tables don't block the event loop in one long synchronous burst.
+      // Each scoring call (buildBestGrouping DFS) can take 10-80ms per player.
+      const results = [];
+      for (const player of roundPlayers) {
+        await yieldToEventLoop(); // eslint-disable-line no-await-in-loop
         const playerDistribution = getPlayerDistribution(distribution, player.user_id);
         const playerCards = playerDistribution?.cards || [];
         const playerResponse = getDeclareResponseEntry(state.responses, player.user_id);
@@ -11306,7 +11316,7 @@ function registerSocketServer(httpServer) {
           logGame(sessionId, `uid=${player.user_id} scored ${points}pts mode=${getDeclareResponseEntry(state.responses, player.user_id)?.auto ? 'auto' : 'manual'} seat=${player.seat_no}`);
         }
 
-        return {
+        results.push({
           user_id: player.user_id,
           seat_no: player.seat_no,
           points,
@@ -11327,8 +11337,8 @@ function registerSocketServer(httpServer) {
             : 'not_submitted',
           dropped: isDropped || isTimeoutEliminated,
           packed_in_current_deal: alreadyScoredThisDeal,
-        };
-      });
+        });
+      }
 
       let winnerUserId = declarerUserId;
       if (!declarerValid) {
@@ -15208,7 +15218,7 @@ function registerSocketServer(httpServer) {
             distribution: nextMetadata.distribution,
           });
           scheduleTurnTimeout(io, sessionId, nextTurn);
-          await emitSessionState(io, sessionId);
+          await emitSessionState(io, sessionId, { includeEvents: false });
 
           callback({
             success: true,

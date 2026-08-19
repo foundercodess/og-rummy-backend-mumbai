@@ -21,7 +21,7 @@ function run(context, fn) {
     spans: [],
   };
   return storage.run(store, fn);
-}
+// }
 
 function getStore() {
   return storage.getStore() || null;

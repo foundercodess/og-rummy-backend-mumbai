@@ -1034,9 +1034,12 @@ async function getSessionState(sessionIdOrCode, existingPlayers = null, options 
  * score, and prize-pool assembly that never appear in pick/discard ACKs.
  */
 async function loadTurnActionSession(sessionId) {
-  const session = await gameSessionModel.findSessionById(sessionId);
+  // Run both queries in parallel — they are independent reads.
+  const [session, rows] = await Promise.all([
+    gameSessionModel.findSessionById(sessionId),
+    gameSessionModel.listSessionPlayers(sessionId),
+  ]);
   if (!session) return null;
-  const rows = await gameSessionModel.listSessionPlayers(session.id);
   const players = (rows || []).map((player) => ({
     id: player.id,
     user_id: player.user_id,
