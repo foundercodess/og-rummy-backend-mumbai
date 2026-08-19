@@ -96,8 +96,10 @@ services:
     volumes:
       - ./secrets:/app/secrets:ro
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     deploy:
       resources:
         limits:
@@ -116,12 +118,24 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d og_rummy"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
     command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 3s
     deploy:
       resources:
         limits:
