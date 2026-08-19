@@ -1,6 +1,7 @@
 'use strict';
 
 const { getPoolMetrics } = require('../db');
+const requestContext = require('../services/requestContext.service');
 const liveSessionState = require('../services/liveSessionState.service');
 const durableTimer = require('../services/durableTimer.service');
 
@@ -71,9 +72,16 @@ function recordHotpath(eventName, startedAtMs, extra = {}) {
 
   if (ms >= HOTPATH_SLOW_MS) {
     const sessionId = extra.session_id != null ? extra.session_id : '';
+    const traceId = extra.trace_id || requestContext.getStore()?.trace_id || '';
     console.warn(
-      `[HOTPATH_SLOW] event=${eventName} ms=${ms} ok=${ok} session=${sessionId} lag_ms=${lastEventLoopLagMs}`,
+      `[HOTPATH_SLOW] event=${eventName} ms=${ms} ok=${ok} session=${sessionId} ` +
+        `trace=${traceId} lag_ms=${lastEventLoopLagMs}`,
     );
+    requestContext.logSpanDump('hotpath_slow', {
+      event: eventName,
+      handler_ms: ms,
+      ok,
+    });
   }
   return ms;
 }

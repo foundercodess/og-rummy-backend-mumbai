@@ -68,6 +68,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { io } = require('socket.io-client');
 const loadHttp = require('./load_test_http');
 
@@ -330,20 +331,52 @@ function pushDetailedError(shared, {
 }
 
 function emitAck(socket, event, payload, timeoutMs = 15000) {
+  const sentAt = Date.now();
+  const enriched = {
+    ...(payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}),
+    trace_id: crypto.randomBytes(12).toString('hex'),
+    client_sent_at: new Date(sentAt).toISOString(),
+  };
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve({ ok: false, error: 'ack_timeout', event }), timeoutMs);
+    const timer = setTimeout(() => resolve({
+      ok: false,
+      error: 'ack_timeout',
+      event,
+      trace_id: enriched.trace_id,
+    }), timeoutMs);
     try {
-      socket.emit(event, payload, (ack) => {
+      socket.emit(event, enriched, (ack) => {
         clearTimeout(timer);
+        const clientRttMs = Date.now() - sentAt;
         if (ack && ack.success === false) {
-          resolve({ ok: false, error: ack.message || 'ack_failed', event, ack });
+          resolve({
+            ok: false,
+            error: ack.message || 'ack_failed',
+            event,
+            ack,
+            trace_id: enriched.trace_id,
+            client_rtt_ms: clientRttMs,
+            handler_ms: ack?.timing?.handler_ms ?? null,
+          });
           return;
         }
-        resolve({ ok: true, ack, event });
+        resolve({
+          ok: true,
+          ack,
+          event,
+          trace_id: enriched.trace_id,
+          client_rtt_ms: clientRttMs,
+          handler_ms: ack?.timing?.handler_ms ?? null,
+        });
       });
     } catch (err) {
       clearTimeout(timer);
-      resolve({ ok: false, error: err.message, event });
+      resolve({
+        ok: false,
+        error: err.message,
+        event,
+        trace_id: enriched.trace_id,
+      });
     }
   });
 }
@@ -774,7 +807,12 @@ function attachAutoPlayer(seat, sessionId, shared) {
               message: errMsg,
               turnId,
               attempt,
-              extra: { source },
+              extra: {
+              source,
+              trace_id: pickAck.trace_id || null,
+              handler_ms: pickAck.handler_ms ?? null,
+              client_rtt_ms: pickAck.client_rtt_ms ?? null,
+            },
             });
             shared.picksFail += 1;
             return;
@@ -786,7 +824,12 @@ function attachAutoPlayer(seat, sessionId, shared) {
             message: errMsg,
             turnId,
             attempt,
-            extra: { source },
+            extra: {
+              source,
+              trace_id: pickAck.trace_id || null,
+              handler_ms: pickAck.handler_ms ?? null,
+              client_rtt_ms: pickAck.client_rtt_ms ?? null,
+            },
           });
           shared.picksFail += 1;
           if (!isRetryableActionError(errMsg) || attempt >= actionRetries) break;
@@ -889,7 +932,12 @@ function attachAutoPlayer(seat, sessionId, shared) {
             message: errMsg,
             turnId,
             attempt,
-            extra: { source },
+            extra: {
+              source,
+              trace_id: discardAck.trace_id || null,
+              handler_ms: discardAck.handler_ms ?? null,
+              client_rtt_ms: discardAck.client_rtt_ms ?? null,
+            },
           });
           shared.discardsFail += 1;
           return;
@@ -901,7 +949,12 @@ function attachAutoPlayer(seat, sessionId, shared) {
           message: errMsg,
           turnId,
           attempt,
-          extra: { source },
+          extra: {
+            source,
+            trace_id: discardAck.trace_id || null,
+            handler_ms: discardAck.handler_ms ?? null,
+            client_rtt_ms: discardAck.client_rtt_ms ?? null,
+          },
         });
         shared.discardsFail += 1;
         if (!isRetryableActionError(errMsg) || attempt >= actionRetries) return;

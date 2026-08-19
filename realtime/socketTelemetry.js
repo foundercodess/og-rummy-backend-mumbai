@@ -1,4 +1,5 @@
 const telemetryService = require('../services/telemetry.service');
+const requestContext = require('../services/requestContext.service');
 const { beginHotpath, recordHotpath } = require('./runtimeObservability');
 
 const HOTPATH_EVENTS = new Set([
@@ -73,6 +74,12 @@ function wrapSocketListener(socket, eventName, listener) {
         recordHotpath(eventName, startedAtMs, {
           ok: extra.success !== false,
           session_id: sessionId,
+          trace_id: traceId,
+        });
+      }
+      if (extra.success === false) {
+        requestContext.logSpanDump('ack_failed', {
+          error: extra.error_message || 'request_failed',
         });
       }
       if (!persistTelemetry) return;
@@ -95,44 +102,51 @@ function wrapSocketListener(socket, eventName, listener) {
       });
     };
 
-    try {
-      if (!hasCallback) {
-        const result = await listener.apply(this, args);
-        recordOnce({ success: true });
-        return result;
-      }
+    return requestContext.run({
+      trace_id: traceId,
+      session_id: sessionId,
+      event_name: eventName,
+      user_id: socket?.user?.id ?? null,
+    }, async () => {
+      try {
+        if (!hasCallback) {
+          const result = await listener.apply(this, args);
+          recordOnce({ success: true });
+          return result;
+        }
 
-      const userCallback = lastArg;
-      const wrappedArgs = [
-        ...args.slice(0, -1),
-        function telemetryCallback(ack) {
-          const ackObj = ack && typeof ack === 'object' && !Array.isArray(ack)
-            ? ack
-            : { success: false, message: 'invalid_ack_payload' };
-          recordOnce({
-            success: ackObj.success !== false,
-            error_message: ackObj.success === false
-              ? String(ackObj.message || ackObj.code || 'request_failed').slice(0, 500)
-              : null,
-            response_bytes: telemetryService.estimateJsonBytes(ackObj),
-            ack_summary: telemetryService.summarizeAck(ackObj),
-          });
-          userCallback(enrichAckResponse(
-            ackObj,
-            traceId,
-            Date.now() - startedAtMs,
-            clientRttMs
-          ));
-        },
-      ];
-      return await listener.apply(this, wrappedArgs);
-    } catch (err) {
-      recordOnce({
-        success: false,
-        error_message: String(err.message || 'handler_error').slice(0, 500),
-      });
-      throw err;
-    }
+        const userCallback = lastArg;
+        const wrappedArgs = [
+          ...args.slice(0, -1),
+          function telemetryCallback(ack) {
+            const ackObj = ack && typeof ack === 'object' && !Array.isArray(ack)
+              ? ack
+              : { success: false, message: 'invalid_ack_payload' };
+            recordOnce({
+              success: ackObj.success !== false,
+              error_message: ackObj.success === false
+                ? String(ackObj.message || ackObj.code || 'request_failed').slice(0, 500)
+                : null,
+              response_bytes: telemetryService.estimateJsonBytes(ackObj),
+              ack_summary: telemetryService.summarizeAck(ackObj),
+            });
+            userCallback(enrichAckResponse(
+              ackObj,
+              traceId,
+              Date.now() - startedAtMs,
+              clientRttMs
+            ));
+          },
+        ];
+        return await listener.apply(this, wrappedArgs);
+      } catch (err) {
+        recordOnce({
+          success: false,
+          error_message: String(err.message || 'handler_error').slice(0, 500),
+        });
+        throw err;
+      }
+    });
   };
 }
 

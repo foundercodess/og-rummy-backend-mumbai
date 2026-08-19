@@ -35,6 +35,7 @@
 
 
 const { Pool } = require('pg');
+const requestContext = require('./services/requestContext.service');
 
 let pool = null;
 
@@ -134,6 +135,85 @@ async function rollbackQuiet(client) {
   }
 }
 
+function traceSuffixFromContext() {
+  const store = requestContext.getStore();
+  if (!store) return '';
+  const parts = [];
+  if (store.trace_id) parts.push(`trace=${store.trace_id}`);
+  if (store.event_name) parts.push(`event=${store.event_name}`);
+  if (store.session_id != null) parts.push(`session=${store.session_id}`);
+  return parts.length ? ` ${parts.join(' ')}` : '';
+}
+
+async function runTimedQuery(executeQuery, text, { logOnError = true } = {}) {
+  const slowQueryMs = parseInt(process.env.DB_SLOW_QUERY_MS, 10) || 100;
+  const slowAcquireMs = parseInt(process.env.DB_SLOW_ACQUIRE_MS, 10) || 50;
+  const queuedAt = Date.now();
+  let acquireMs = 0;
+
+  try {
+    const acquiredAt = Date.now();
+    acquireMs = acquiredAt - queuedAt;
+    const result = await executeQuery();
+    const execMs = Date.now() - acquiredAt;
+    const totalMs = Date.now() - queuedAt;
+
+    requestContext.recordQuerySpan({
+      sql: text,
+      acquireMs,
+      execMs,
+      totalMs,
+      ok: true,
+    });
+
+    if (totalMs > slowQueryMs || acquireMs > slowAcquireMs) {
+      const metrics = snapshotPoolMetrics();
+      console.warn(
+        `Slow query total=${totalMs}ms acquire=${acquireMs}ms exec=${execMs}ms ` +
+          `pool=${JSON.stringify(metrics)}${traceSuffixFromContext()} ` +
+          `sql=${compactSqlForLog(text)}`,
+      );
+      requestContext.logSpanDump('slow_query', { sql: compactSqlForLog(text) });
+    }
+
+    return result;
+  } catch (err) {
+    const totalMs = Date.now() - queuedAt;
+    requestContext.recordQuerySpan({
+      sql: text,
+      acquireMs,
+      execMs: Math.max(0, totalMs - acquireMs),
+      totalMs,
+      ok: false,
+      error: err.message,
+    });
+    if (logOnError) {
+      console.error(
+        `Query failed total=${totalMs}ms pool=${JSON.stringify(snapshotPoolMetrics())}` +
+          `${traceSuffixFromContext()} sql=${compactSqlForLog(text)} error=${err.message}`,
+      );
+      requestContext.logSpanDump('query_error', {
+        sql: compactSqlForLog(text),
+        error: err.message,
+      });
+    }
+    throw err;
+  }
+}
+
+function wrapClientForTracing(client) {
+  const nativeQuery = client.query.bind(client);
+  return {
+    ...client,
+    query: (text, params) => runTimedQuery(
+      () => nativeQuery(text, params),
+      text,
+      { logOnError: false },
+    ),
+    release: (...args) => client.release(...args),
+  };
+}
+
 // Single-statement helper. Never holds a transaction across release — callers
 // that need BEGIN/COMMIT must use withTransaction() so the same client is kept.
 async function query(text, params) {
@@ -141,6 +221,16 @@ async function query(text, params) {
 
   const slowQueryMs = parseInt(process.env.DB_SLOW_QUERY_MS, 10) || 100;
   const slowAcquireMs = parseInt(process.env.DB_SLOW_ACQUIRE_MS, 10) || 50;
+
+  if (TXN_CONTROL_RE.test(String(text || ''))) {
+    console.error(
+      '[DB] query() cannot run transaction control SQL (would use a random pool client). Use withTransaction().'
+    );
+    const err = new Error('query() cannot run BEGIN/COMMIT/ROLLBACK; use withTransaction()');
+    err.code = 'DB_TXN_VIA_QUERY';
+    throw err;
+  }
+
   const queuedAt = Date.now();
   let client;
   try {
@@ -148,34 +238,48 @@ async function query(text, params) {
     const acquiredAt = Date.now();
     const acquireMs = acquiredAt - queuedAt;
 
-    if (TXN_CONTROL_RE.test(String(text || ''))) {
-      console.error(
-        '[DB] query() cannot run transaction control SQL (would use a random pool client). Use withTransaction().'
-      );
-      const err = new Error('query() cannot run BEGIN/COMMIT/ROLLBACK; use withTransaction()');
-      err.code = 'DB_TXN_VIA_QUERY';
-      throw err;
-    }
-
     const result = await client.query(text, params);
     const execMs = Date.now() - acquiredAt;
     const totalMs = Date.now() - queuedAt;
+
+    requestContext.recordQuerySpan({
+      sql: text,
+      acquireMs,
+      execMs,
+      totalMs,
+      ok: true,
+    });
 
     if (totalMs > slowQueryMs || acquireMs > slowAcquireMs) {
       const metrics = snapshotPoolMetrics();
       console.warn(
         `Slow query total=${totalMs}ms acquire=${acquireMs}ms exec=${execMs}ms ` +
-          `pool=${JSON.stringify(metrics)} sql=${compactSqlForLog(text)}`
+          `pool=${JSON.stringify(metrics)}${traceSuffixFromContext()} ` +
+          `sql=${compactSqlForLog(text)}`,
       );
+      requestContext.logSpanDump('slow_query', { sql: compactSqlForLog(text) });
     }
 
     return result;
   } catch (err) {
     const totalMs = Date.now() - queuedAt;
+    const acquireMs = client ? Math.min(totalMs, Date.now() - queuedAt) : totalMs;
+    requestContext.recordQuerySpan({
+      sql: text,
+      acquireMs,
+      execMs: Math.max(0, totalMs - acquireMs),
+      totalMs,
+      ok: false,
+      error: err.message,
+    });
     console.error(
-      `Query failed total=${totalMs}ms pool=${JSON.stringify(snapshotPoolMetrics())} ` +
-        `sql=${compactSqlForLog(text)} error=${err.message}`
+      `Query failed total=${totalMs}ms pool=${JSON.stringify(snapshotPoolMetrics())}` +
+        `${traceSuffixFromContext()} sql=${compactSqlForLog(text)} error=${err.message}`,
     );
+    requestContext.logSpanDump('query_error', {
+      sql: compactSqlForLog(text),
+      error: err.message,
+    });
     await rollbackQuiet(client);
     throw err;
   } finally {
@@ -191,7 +295,7 @@ async function query(text, params) {
  */
 async function withTransaction(fn) {
   if (!pool) throw new Error('DATABASE_URL not configured');
-  const client = await pool.connect();
+  const client = wrapClientForTracing(await pool.connect());
   try {
     await client.query('BEGIN');
     const result = await fn(client);
@@ -199,6 +303,7 @@ async function withTransaction(fn) {
     return result;
   } catch (err) {
     await rollbackQuiet(client);
+    requestContext.logSpanDump('transaction_error', { error: err.message });
     throw err;
   } finally {
     client.release();

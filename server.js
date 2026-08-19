@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
-const { testConnection } = require('./db');
+const { testConnection, getPoolMetrics } = require('./db');
 const {
   registerSocketServer,
   getSocketRuntimeStats,
@@ -18,6 +18,7 @@ const {
   startRuntimeObservability,
   setSocketStatsProvider,
   getLastEventLoopLagMs,
+  getHotpathSnapshot,
 } = require('./realtime/runtimeObservability');
 const { startBotInjectionSettingsPoller } = require('./services/botInjectionSettings.service');
 const durableTimer = require('./services/durableTimer.service');
@@ -145,6 +146,8 @@ app.get('/health/details', async (req, res) => {
     redis: redisStatus.ok === true ? 'connected' : redisStatus.ok === false ? 'error' : 'not configured',
     kafka: kafkaStatus.ok === true ? 'connected' : kafkaStatus.ok === false ? 'error' : 'not configured',
     event_loop_lag_ms: getLastEventLoopLagMs(),
+    db_pool: getPoolMetrics(),
+    hotpath: getHotpathSnapshot(),
     sockets,
     durable_timers: durable,
     ...(dbStatus.timestamp && { dbTimestamp: dbStatus.timestamp }),

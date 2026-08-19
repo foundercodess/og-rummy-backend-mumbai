@@ -70,31 +70,11 @@ async function findSessionByIdFromDb(sessionId) {
 }
 
 async function findSessionById(sessionId) {
-  // Phase 3: live Redis snapshot is authoritative for active tables when enabled.
+  // Hot path (pick/discard/turn): trust Redis live snapshot — no per-move PG
+  // fingerprint. Join/create use findSessionByIdFromDb which validates session_code.
   if (liveSessionState.isEnabled()) {
     const live = await liveSessionState.get(sessionId);
-    if (live) {
-      // Cheap PK fingerprint — Redis keys are live:sess:{id}. After a DB
-      // truncate/reset, Postgres can reuse that id for a different table while
-      // Redis still holds the old pick/discard snapshot. session_code is unique
-      // per create, so a mismatch must not be used for gameplay.
-      const fp = await query(
-        'SELECT session_code, status FROM game_sessions WHERE id = $1',
-        [sessionId]
-      );
-      const pg = fp.rows[0] || null;
-      if (liveRowIsStale(live, pg)) {
-        if (!pg) {
-          await liveSessionState.drop(sessionId);
-          if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
-          return null;
-        }
-        const row = await fetchSessionRowFromDb(sessionId);
-        await replaceLiveFromDbRow(sessionId, row);
-        return row;
-      }
-      return live;
-    }
+    if (live) return live;
   }
 
   if (sessionCache.isEnabled()) {
