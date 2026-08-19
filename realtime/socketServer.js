@@ -7114,7 +7114,7 @@ async function finalizePoolSplitOffer(io, sessionId, state) {
       decision: 'accepted',
     })),
   });
-  await emitSessionState(io, sessionId);
+  await emitSessionState(io, sessionId, { includeEvents: false });
   await Promise.all(
     (session.players || []).map((player) => emitPendingRejoinGameForUser(io, player.user_id, 'game_completed'))
   );
@@ -7215,7 +7215,7 @@ async function transitionToNextPoolRound(io, session, payload, roundProgress) {
   });
 
   io.to(sessionRoom(sessionId)).emit('game:result', resultPayload);
-  await emitSessionState(io, sessionId);
+  await emitSessionState(io, sessionId, { includeEvents: false });
   const newlyEliminatedUserIds = Array.from(eliminatedSet)
     .filter((id) => !previousEliminatedSet.has(id));
   await Promise.all(

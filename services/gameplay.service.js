@@ -923,9 +923,10 @@ async function markPlayerReady({ sessionId, userId, ready }) {
 
   const currentPhase = session.metadata && session.metadata.phase;
   if (['countdown', 'toss', 'dealing'].includes(currentPhase)) {
-    const error = new Error('Ready state is managed automatically during pre-game sequence');
-    error.code = 'SESSION_PHASE_LOCKED';
-    throw error;
+    // Game is already starting — concurrent player:ready from other players triggered
+    // the phase transition before this player's request arrived. Silently succeed so
+    // the load test and real clients don't see spurious failures.
+    return getSessionState(session.id);
   }
 
   const player = await gameSessionModel.findPlayer(session.id, userId);
