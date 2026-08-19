@@ -4698,7 +4698,13 @@ function isAutoBestGroupEnabled(playerDistribution) {
 
 function buildAutoBestGroupingResult(handCards, wildJoker, options = {}) {
   const groupingOptions = options.groupingOptions || {};
-  const best = groupingService.buildBestGrouping(handCards, wildJoker, groupingOptions);
+  // On the pick hot-path (fastFinishPlan=true) skip the O(n×DFS) discard scan
+  // fallback. The partition path covers ~95% of finishable hands and we read
+  // finish_card_uid from the grouping summary for the remaining 5%.
+  const buildOpts = options.fastFinishPlan === true
+    ? { ...groupingOptions, skipDiscardScan: true }
+    : groupingOptions;
+  const best = groupingService.buildBestGrouping(handCards, wildJoker, buildOpts);
   const submittedGroups = toSubmittedGroupsFromGrouping(best);
   // Hot-path optimization: when `fastFinishPlan` is enabled (pick ACK),
   // the `best` grouping is already fully evaluated (types + summary + display
@@ -8920,14 +8926,44 @@ async function executeBotPickAction(io, sessionId, expectedTurnId) {
     phase_updated_at: new Date().toISOString(),
   };
 
-  // Discard-history picked markers are UI/audit only. Updating
-  // discard_history on every bot pick increases per-move snapshot serialization.
-  // Keep discard_history timeline updates only on discards.
-
   await gameSessionModel.updateSessionStatus(sessionId, session.status, {
     currentTurnUserId: session.current_turn_user_id,
     metadata: pickedMetadata,
   });
+
+  // Update discard_history picked marker non-blocking after the bot pick persists.
+  if (source === 'discard') {
+    setImmediate(() => {
+      gameSessionModel.findSessionById(sessionId)
+        .then((liveRow) => {
+          if (!liveRow) return;
+          const botPickedUpdate = markDiscardHistoryPicked(
+            liveRow.metadata || {},
+            liveRow.metadata?.distribution || null,
+            {
+              picked_card: pickedCard,
+              picked_by_user_id: turn.user_id,
+              picked_at: new Date().toISOString(),
+            }
+          );
+          if (!botPickedUpdate.changed) return;
+          const patchedMetadata = {
+            ...(liveRow.metadata || {}),
+            discard_history: botPickedUpdate.discardHistory,
+          };
+          return gameSessionModel.updateSessionStatus(sessionId, liveRow.status, {
+            currentTurnUserId: liveRow.current_turn_user_id,
+            metadata: patchedMetadata,
+          }).then(() => {
+            emitDiscardHistoryUpdate(io, { ...liveRow, metadata: patchedMetadata }, {
+              reason: 'bot_pick_discard',
+              latest: botPickedUpdate.latestEntry,
+            });
+          });
+        })
+        .catch(() => {});
+    });
+  }
 
   gameSessionModel.insertEvent({
     sessionId,
@@ -13167,6 +13203,9 @@ function registerSocketServer(httpServer) {
         let finishPlan = null;
 
         if (autoBestGroup) {
+          // Yield before the heavy buildBestGrouping DFS so queued ACKs/pings
+          // from other sessions can run and avoid event-loop lag spikes.
+          await yieldToEventLoop();
           // Auto-best already uses fastFinishPlan (no multi-card scan).
           const autoResult = buildAutoBestGroupingResult(playerDistribution.cards, wildJoker, {
             groupingOptions,
@@ -13217,11 +13256,8 @@ function registerSocketServer(httpServer) {
           phase_updated_at: new Date().toISOString(),
         };
 
-        // Discard-history picked markers are UI/audit only. Updating
-        // discard_history on every pick increases per-move snapshot serialization.
-        // Keep discard_history timeline updates only on discards.
-
         // Persist move first so cluster peers see has_picked before finish-hint CPU.
+        // discard_history picked markers are updated non-blocking after ACK below.
         await gameSessionModel.updateSessionStatus(sessionId, session.status, {
           currentTurnUserId: session.current_turn_user_id,
           metadata: nextMetadata,
@@ -13286,7 +13322,40 @@ function registerSocketServer(httpServer) {
           discard_top: discardPile[0] || null,
         });
 
-        // discard_history update is handled on discards only.
+        // Update discard_history picked marker non-blocking after ACK,
+        // so the UI/audit timeline stays correct without delaying the pick response.
+        if (source === 'discard') {
+          setImmediate(() => {
+            gameSessionModel.findSessionById(sessionId)
+              .then((liveRow) => {
+                if (!liveRow) return;
+                const livePickedUpdate = markDiscardHistoryPicked(
+                  liveRow.metadata || {},
+                  liveRow.metadata?.distribution || null,
+                  {
+                    picked_card: pickedCard,
+                    picked_by_user_id: socket.user.id,
+                    picked_at: new Date().toISOString(),
+                  }
+                );
+                if (!livePickedUpdate.changed) return;
+                const patchedMetadata = {
+                  ...(liveRow.metadata || {}),
+                  discard_history: livePickedUpdate.discardHistory,
+                };
+                return gameSessionModel.updateSessionStatus(sessionId, liveRow.status, {
+                  currentTurnUserId: liveRow.current_turn_user_id,
+                  metadata: patchedMetadata,
+                }).then(() => {
+                  emitDiscardHistoryUpdate(io, { ...liveRow, metadata: patchedMetadata }, {
+                    reason: 'player_pick_discard',
+                    latest: livePickedUpdate.latestEntry,
+                  });
+                });
+              })
+              .catch(() => {});
+          });
+        }
         } finally {
           await redisLockService.releaseLock(pickLockKey, pickLockOwner);
         }
@@ -14686,6 +14755,9 @@ function registerSocketServer(httpServer) {
         }
 
         const submittedGroups = sanitizeSubmittedGroups(payload.groups, playerDistribution.cards || []);
+        // Yield before grouping evaluation so concurrent declare:response
+        // CPU bursts (all 6 players × N tables) don't block one another.
+        await yieldToEventLoop();
         const preview = groupingService.evaluateSubmittedGrouping(
           playerDistribution.cards || [],
           wildJoker,

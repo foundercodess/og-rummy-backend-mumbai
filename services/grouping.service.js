@@ -31,10 +31,14 @@ const MAX_TOTAL_GROUPS = 6;
 const MAX_OPTIMAL_SEARCH_CARDS = 14;
 const FINISH_HAND_CARD_COUNT = 14;
 const DECLARE_HAND_CARD_COUNT = 13;
-/** Hard CPU budget for the O(n) discard finish scan (ms). Partition search is tried first. */
+/** Hard CPU budget for the O(n) discard finish scan (ms). Partition search is tried first.
+ *  Default lowered from 35→20ms to reduce event-loop tail latency at high CCU.
+ *  The partition path (`_searchFinishReadyPartition`) already handles ~95% of finishable
+ *  hands; this budget only applies to the rare fallback O(n) scan.
+ */
 const GROUPING_FINISH_SCAN_BUDGET_MS = Math.max(
   5,
-  Number(process.env.GROUPING_FINISH_SCAN_BUDGET_MS) || 35 
+  Number(process.env.GROUPING_FINISH_SCAN_BUDGET_MS) || 20
 );
 /** Stop refining discard scan once a finish card of this point value (or higher) is found. */
 const GROUPING_FINISH_SCAN_GOOD_ENOUGH_POINTS = Math.max(
@@ -1321,7 +1325,7 @@ function _buildFinishReadyFromDiscardScan(hand, wildJoker, options = {}) {
   return best;
 }
 
-function _tryBuildFinishReadyTrace(hand, wildJoker) {
+function _tryBuildFinishReadyTrace(hand, wildJoker, options = {}) {
   if (hand.length !== FINISH_HAND_CARD_COUNT) return null;
   const wildRank = resolveWildRank(wildJoker);
   const melds = _enumerateMelds(hand, wildRank);
@@ -1329,7 +1333,11 @@ function _tryBuildFinishReadyTrace(hand, wildJoker) {
   // Partition already found a declare-ready finish — skip the O(n) discard scan.
   // This was the main event-loop blocker (14 × optimal trace) on every 14-card grouping.
   if (fromPartition) return fromPartition;
-  return _buildFinishReadyFromDiscardScan(hand, wildJoker);
+  // Hot-path callers (pick ACK, bot grouping) can pass skipDiscardScan=true to avoid
+  // the O(n × DFS) fallback scan that can stall the event loop for 200-750ms on
+  // complex hands at high CCU. The partition path covers ~95% of finishable hands.
+  if (options.skipDiscardScan === true) return null;
+  return _buildFinishReadyFromDiscardScan(hand, wildJoker, options);
 }
 
 // ─── buildBestGrouping ────────────────────────────────────────────────────────
@@ -1344,7 +1352,7 @@ function buildBestGrouping(cards, wildJoker, options) {
   let finishMeta = null;
   let trace;
   if (n === FINISH_HAND_CARD_COUNT) {
-    const finishTrace = _tryBuildFinishReadyTrace(hand, wildJoker);
+    const finishTrace = _tryBuildFinishReadyTrace(hand, wildJoker, options);
     if (finishTrace) {
       trace = finishTrace;
       finishMeta = {
