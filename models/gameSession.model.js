@@ -599,25 +599,59 @@ async function persistSessionEvent({ sessionId, userId = null, eventType, payloa
   return returning ? (result.rows[0] || null) : null;
 }
 
+// ─── Micro-batch event queue ──────────────────────────────────────────────────
+// At high CCU, individual setImmediate inserts flood the pool (one connection
+// per event). We queue them and flush with a single multi-row INSERT every
+// BATCH_FLUSH_MS, using at most one pool connection per flush cycle.
+// Max batch size caps the VALUES list so a single statement doesn't get too large.
+const EVENT_BATCH_FLUSH_MS = Number(process.env.GAME_SESSION_EVENTS_BATCH_MS) || 40;
+const EVENT_BATCH_MAX_SIZE = Number(process.env.GAME_SESSION_EVENTS_BATCH_MAX) || 200;
+let _eventQueue = [];
+let _eventFlushTimer = null;
+
+function _scheduleEventFlush() {
+  if (_eventFlushTimer !== null) return;
+  _eventFlushTimer = setTimeout(_flushEventQueue, EVENT_BATCH_FLUSH_MS);
+  if (_eventFlushTimer.unref) _eventFlushTimer.unref();
+}
+
+async function _flushEventQueue() {
+  _eventFlushTimer = null;
+  if (_eventQueue.length === 0) return;
+
+  const batch = _eventQueue.splice(0, EVENT_BATCH_MAX_SIZE);
+  if (_eventQueue.length > 0) _scheduleEventFlush();
+
+  // Build a single multi-row INSERT for the whole batch.
+  const values = [];
+  const params = [];
+  batch.forEach(({ sessionId, userId, eventType, payload }, i) => {
+    const base = i * 4;
+    values.push(`($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}::jsonb)`);
+    params.push(sessionId, userId ?? null, eventType, JSON.stringify(payload));
+  });
+
+  const sql = `INSERT INTO game_session_events (game_session_id, user_id, event_type, payload) VALUES ${values.join(', ')}`;
+  try {
+    await query(sql, params);
+  } catch (err) {
+    console.warn(`[game_session_events] batch insert failed (${batch.length} rows): ${err.message}`);
+  }
+}
+
 /**
  * Audit-trail write for gameplay. By default does not block the caller: the insert is
- * scheduled on the next event-loop turn so socket emit / ACK paths stay responsive.
+ * queued and flushed in a micro-batch every ~40ms so the pool is not flooded with
+ * individual INSERT connections at high CCU.
  * Game rules never depend on this row existing before the next action.
  */
 async function insertEvent({ sessionId, userId = null, eventType, payload = {} }) {
-  const args = { sessionId, userId, eventType, payload };
   if (shouldAwaitSessionEventInsert()) {
-    return persistSessionEvent(args, { returning: true });
+    return persistSessionEvent({ sessionId, userId, eventType, payload }, { returning: true });
   }
 
-  setImmediate(() => {
-    persistSessionEvent(args, { returning: false }).catch((err) => {
-      console.warn(
-        `[game_session_events] insert failed type=${eventType || 'unknown'} ` +
-        `session=${sessionId}: ${err.message}`
-      );
-    });
-  });
+  _eventQueue.push({ sessionId, userId: userId ?? null, eventType, payload });
+  _scheduleEventFlush();
   return null;
 }
 

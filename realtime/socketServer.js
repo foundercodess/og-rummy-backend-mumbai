@@ -11223,12 +11223,13 @@ function registerSocketServer(httpServer) {
 
       const timeoutEliminatedSet = getTimeoutEliminatedUserIdSet(session.metadata || {});
       const turnEliminatedSet = getTurnEliminatedUserIdSet(session.metadata || {});
-      // Score each player with a yield between seats so that concurrent finalize
-      // calls from N tables don't block the event loop in one long synchronous burst.
-      // Each scoring call (buildBestGrouping DFS) can take 10-80ms per player.
+      // Single yield before scoring all players: lets other tables' pending
+      // callbacks (picks, discards) run before this finalize block starts.
+      // Per-player yields caused a 300-tick staircase at 50 CCU which inflated
+      // declare:response p99 to 390ms — this single yield is the right trade-off.
+      await yieldToEventLoop();
       const results = [];
       for (const player of roundPlayers) {
-        await yieldToEventLoop(); // eslint-disable-line no-await-in-loop
         const playerDistribution = getPlayerDistribution(distribution, player.user_id);
         const playerCards = playerDistribution?.cards || [];
         const playerResponse = getDeclareResponseEntry(state.responses, player.user_id);
