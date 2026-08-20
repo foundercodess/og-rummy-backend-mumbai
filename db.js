@@ -1,119 +1,115 @@
-// const { Pool } = require('pg');
-
-// let pool = null;
-// if (process.env.DATABASE_URL) {
-//   // RDS requires SSL; rejectUnauthorized: false needed for RDS CA in Alpine (traffic still encrypted)
-//   const useSsl = process.env.DATABASE_URL.includes('rds.amazonaws.com') || process.env.DATABASE_SSL === 'true';
-//   pool = new Pool({
-//     connectionString: process.env.DATABASE_URL,
-//     ssl: useSsl ? { rejectUnauthorized: false } : false,
-//     max: 10,
-//     idleTimeoutMillis: 30000,
-//     connectionTimeoutMillis: 10000,
-//   });
-//   pool.on('error', (err) => {
-//     console.error('Unexpected DB pool error:', err);
-//   });
-// }
-
-// async function query(text, params) {
-//   if (!pool) throw new Error('DATABASE_URL not configured');
-//   return pool.query(text, params);
-// }
-
-// async function testConnection() {
-//   if (!pool) return { ok: null };
-//   try {
-//     const result = await pool.query('SELECT NOW()');
-//     return { ok: true, timestamp: result.rows[0].now };
-//   } catch (err) {
-//     return { ok: false, error: err.message };
-//   }
-// }
-
-// module.exports = { pool, query, testConnection };
-
+'use strict';
 
 const { Pool } = require('pg');
 const requestContext = require('./services/requestContext.service');
 
-let pool = null;
+let gameplayPool = null;
+let authPool = null;
 
-if (process.env.DATABASE_URL) {
-  const useSsl = process.env.DATABASE_URL.includes('rds.amazonaws.com') || process.env.DATABASE_SSL === 'true';
-  
-  pool = new Pool({
+const POOL_SPLIT_ENABLED = String(process.env.DB_POOL_SPLIT || '').toLowerCase() === 'true';
+
+function parsePoolMax(envName, fallback) {
+  const parsed = parseInt(process.env[envName], 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function createPool({ applicationNameSuffix, max }) {
+  if (!process.env.DATABASE_URL) return null;
+
+  const useSsl = process.env.DATABASE_URL.includes('rds.amazonaws.com')
+    || process.env.DATABASE_SSL === 'true';
+
+  if (max > 15) {
+    console.warn(
+      `[DB] High pool max=${max} (${applicationNameSuffix}). Prefer PgBouncer + lower per-process max.`,
+    );
+  }
+
+  const created = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: useSsl ? { 
-      // Add these SSL options for better performance
-      requestCert: true,
-      rejectUnauthorized: false
-    } : false,
-    
-    // Single-process default 8. With multiple Node workers put PgBouncer in
-    // front and lower per-process max (e.g. DB_POOL_MAX=8) so total PG
-    // connections stay under RDS max_connections.
-    max: (() => {
-      const parsed = parseInt(process.env.DB_POOL_MAX, 10);
-      const poolMax = Number.isFinite(parsed) && parsed > 0 ? parsed : 8;
-      if (poolMax > 15) {
-        console.warn(
-          `[DB] High DB_POOL_MAX=${poolMax}. With multiple Node workers this can exceed RDS max_connections; prefer PgBouncer + DB_POOL_MAX<=10.`
-        );
+    ssl: useSsl
+      ? {
+        requestCert: true,
+        rejectUnauthorized: false,
       }
-      return poolMax;
-    })(),
-    
-    // Keep connections alive to avoid reconnection overhead
-    idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT) || 30000,
-    connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT) || 5000, // Reduced from 10000
-    
-    // ADD THESE IMPORTANT SETTINGS:
-    // Allow idle connections to be used immediately
+      : false,
+    max,
+    idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT, 10) || 30000,
+    connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT, 10) || 5000,
     allowExitOnIdle: false,
-    
-    // Keep connections alive with heartbeat
     keepAlive: true,
     keepAliveInitialDelayMillis: 10000,
-    
-    // Statement timeout to prevent long-running queries
-    statement_timeout: parseInt(process.env.DB_STATEMENT_TIMEOUT) || 30000,
+    statement_timeout: parseInt(process.env.DB_STATEMENT_TIMEOUT, 10) || 30000,
     idle_in_transaction_session_timeout: parseInt(process.env.DB_IDLE_IN_TX_TIMEOUT, 10) || 60000,
-    
-    // Application name for easier debugging in RDS logs
     application_name: process.env.DB_APPLICATION_NAME
-      || `og-rummy-api${process.env.NODE_APP_INSTANCE != null ? `-w${process.env.NODE_APP_INSTANCE}` : ''}`,
+      || `og-rummy-api-${applicationNameSuffix}${process.env.NODE_APP_INSTANCE != null ? `-w${process.env.NODE_APP_INSTANCE}` : ''}`,
   });
 
-  // Avoid flooding logs under connection churn (10k-scale). Enable with DB_LOG_CONNECT=true.
   if (String(process.env.DB_LOG_CONNECT || '').toLowerCase() === 'true') {
-    pool.on('connect', () => {
-      console.log('[DB] New connection established to Postgres');
+    created.on('connect', () => {
+      console.log(`[DB] New ${applicationNameSuffix} connection established`);
     });
   }
-  // 'acquire' fires on every pool.connect() / pool.query() checkout — far too noisy for logs.
-  // Uncomment only when debugging connection-leak issues.
-  // pool.on('acquire', () => { console.log('[DB] Client acquired from pool'); });
 
-  pool.on('error', (err) => {
-    console.error('[DB] Unexpected pool error:', err.message);
+  created.on('error', (err) => {
+    console.error(`[DB] Unexpected ${applicationNameSuffix} pool error:`, err.message);
   });
-  
-  // Verify connectivity at startup
-  pool.query('SELECT 1').then(() => {
-    console.log('[DB] Pool initialized successfully');
+
+  created.query('SELECT 1').then(() => {
+    console.log(`[DB] ${applicationNameSuffix} pool initialized (max=${max})`);
   }).catch((err) => {
-    console.error('[DB] Failed to connect to Postgres at startup:', err.message);
+    console.error(`[DB] Failed to connect ${applicationNameSuffix} pool:`, err.message);
   });
+
+  return created;
+}
+
+if (process.env.DATABASE_URL) {
+  const gameplayMax = parsePoolMax(
+    'DB_POOL_MAX_GAMEPLAY',
+    parsePoolMax('DB_POOL_MAX', 8),
+  );
+  gameplayPool = createPool({
+    applicationNameSuffix: 'gameplay',
+    max: gameplayMax,
+  });
+
+  if (POOL_SPLIT_ENABLED) {
+    const authMax = parsePoolMax('DB_POOL_MAX_AUTH', 4);
+    authPool = createPool({
+      applicationNameSuffix: 'auth',
+      max: authMax,
+    });
+    console.log('[DB] Pool split enabled (gameplay vs auth/http)');
+  }
+}
+
+/** Active pool from ALS (`auth`) or gameplay default. */
+function getActivePool() {
+  const store = requestContext.getStore();
+  if (authPool && store?.db_pool === 'auth') return authPool;
+  return gameplayPool;
+}
+
+function snapshotOne(target) {
+  if (!target) return null;
+  return {
+    totalCount: target.totalCount,
+    idleCount: target.idleCount,
+    waitingCount: target.waitingCount,
+    max: target.options.max,
+  };
 }
 
 function snapshotPoolMetrics() {
-  if (!pool) return null;
+  if (!POOL_SPLIT_ENABLED || !authPool) {
+    return snapshotOne(gameplayPool);
+  }
   return {
-    totalCount: pool.totalCount,
-    idleCount: pool.idleCount,
-    waitingCount: pool.waitingCount,
-    max: pool.options.max
+    split: true,
+    gameplay: snapshotOne(gameplayPool),
+    auth: snapshotOne(authPool),
+    active: requestContext.getStore()?.db_pool || 'gameplay',
   };
 }
 
@@ -131,7 +127,7 @@ async function rollbackQuiet(client) {
   try {
     await client.query('ROLLBACK');
   } catch (_) {
-    // Connection may already be dead; pool will discard on release(err).
+    // ignore
   }
 }
 
@@ -142,7 +138,21 @@ function traceSuffixFromContext() {
   if (store.trace_id) parts.push(`trace=${store.trace_id}`);
   if (store.event_name) parts.push(`event=${store.event_name}`);
   if (store.session_id != null) parts.push(`session=${store.session_id}`);
+  if (store.db_pool) parts.push(`db_pool=${store.db_pool}`);
   return parts.length ? ` ${parts.join(' ')}` : '';
+}
+
+function wrapClientForTracing(client) {
+  const nativeQuery = client.query.bind(client);
+  return {
+    ...client,
+    query: (text, params) => runTimedQuery(
+      () => nativeQuery(text, params),
+      text,
+      { logOnError: false },
+    ),
+    release: (...args) => client.release(...args),
+  };
 }
 
 async function runTimedQuery(executeQuery, text, { logOnError = true } = {}) {
@@ -201,40 +211,26 @@ async function runTimedQuery(executeQuery, text, { logOnError = true } = {}) {
   }
 }
 
-function wrapClientForTracing(client) {
-  const nativeQuery = client.query.bind(client);
-  return {
-    ...client,
-    query: (text, params) => runTimedQuery(
-      () => nativeQuery(text, params),
-      text,
-      { logOnError: false },
-    ),
-    release: (...args) => client.release(...args),
-  };
-}
-
-// Single-statement helper. Never holds a transaction across release — callers
-// that need BEGIN/COMMIT must use withTransaction() so the same client is kept.
 async function query(text, params) {
-  if (!pool) throw new Error('DATABASE_URL not configured');
-
-  const slowQueryMs = parseInt(process.env.DB_SLOW_QUERY_MS, 10) || 100;
-  const slowAcquireMs = parseInt(process.env.DB_SLOW_ACQUIRE_MS, 10) || 50;
+  const active = getActivePool();
+  if (!active) throw new Error('DATABASE_URL not configured');
 
   if (TXN_CONTROL_RE.test(String(text || ''))) {
     console.error(
-      '[DB] query() cannot run transaction control SQL (would use a random pool client). Use withTransaction().'
+      '[DB] query() cannot run transaction control SQL (would use a random pool client). Use withTransaction().',
     );
     const err = new Error('query() cannot run BEGIN/COMMIT/ROLLBACK; use withTransaction()');
     err.code = 'DB_TXN_VIA_QUERY';
     throw err;
   }
 
+  const slowQueryMs = parseInt(process.env.DB_SLOW_QUERY_MS, 10) || 100;
+  const slowAcquireMs = parseInt(process.env.DB_SLOW_ACQUIRE_MS, 10) || 50;
+
   const queuedAt = Date.now();
   let client;
   try {
-    client = await pool.connect();
+    client = await active.connect();
     const acquiredAt = Date.now();
     const acquireMs = acquiredAt - queuedAt;
 
@@ -283,19 +279,14 @@ async function query(text, params) {
     await rollbackQuiet(client);
     throw err;
   } finally {
-    if (client) {
-      client.release();
-    }
+    if (client) client.release();
   }
 }
 
-/**
- * Run fn(client) inside a single-connection BEGIN/COMMIT.
- * On error the transaction is rolled back before the client is returned to the pool.
- */
 async function withTransaction(fn) {
-  if (!pool) throw new Error('DATABASE_URL not configured');
-  const client = wrapClientForTracing(await pool.connect());
+  const active = getActivePool();
+  if (!active) throw new Error('DATABASE_URL not configured');
+  const client = wrapClientForTracing(await active.connect());
   try {
     await client.query('BEGIN');
     const result = await fn(client);
@@ -310,48 +301,76 @@ async function withTransaction(fn) {
   }
 }
 
-// Add a helper for prepared statements (better performance for repeated queries)
 async function getPreparedStatement(name, text) {
+  const active = getActivePool();
   try {
-    await pool.query(`PREPARE ${name} AS ${text}`);
-    return async (params) => {
-      return pool.query(`EXECUTE ${name}(${params.map((_, i) => `$${i+1}`).join(',')})`, params);
-    };
+    await active.query(`PREPARE ${name} AS ${text}`);
+    return async (params) => active.query(
+      `EXECUTE ${name}(${params.map((_, i) => `$${i + 1}`).join(',')})`,
+      params,
+    );
   } catch (err) {
     console.error(`Error preparing statement ${name}:`, err);
     return null;
   }
 }
 
-// Add connection pool metrics endpoint (useful for monitoring)
 async function getPoolMetrics() {
   return snapshotPoolMetrics();
 }
 
 async function testConnection() {
-  if (!pool) return { ok: null };
+  const active = getActivePool() || gameplayPool;
+  if (!active) return { ok: null };
   try {
     const start = Date.now();
-    const result = await pool.query('SELECT NOW()');
+    const result = await active.query('SELECT NOW()');
     const latency = Date.now() - start;
     const metrics = await getPoolMetrics();
-    
-    return { 
-      ok: true, 
+    return {
+      ok: true,
       timestamp: result.rows[0].now,
       latency: `${latency}ms`,
-      poolMetrics: metrics
+      poolMetrics: metrics,
     };
   } catch (err) {
     return { ok: false, error: err.message };
   }
 }
 
-module.exports = { 
-  pool, 
+/** Express middleware: pin HTTP auth/wallet/admin bursts to the auth PG pool. */
+function dbPoolMiddleware(poolName) {
+  return (req, res, next) => {
+    requestContext.run(
+      {
+        db_pool: poolName,
+        event_name: `http:${req.method}:${req.path}`,
+        trace_id: req.headers['x-request-id'] || null,
+      },
+      () => next(),
+    );
+  };
+}
+
+/** Proxy so `const { pool } = require('../db')` still routes via ALS. */
+const pool = new Proxy({}, {
+  get(_target, prop) {
+    const active = getActivePool();
+    if (!active) return undefined;
+    const value = active[prop];
+    return typeof value === 'function' ? value.bind(active) : value;
+  },
+});
+
+module.exports = {
+  pool,
   query,
   withTransaction,
   testConnection,
   getPoolMetrics,
-  getPreparedStatement 
+  getPreparedStatement,
+  getActivePool,
+  dbPoolMiddleware,
+  gameplayPool,
+  authPool,
 };

@@ -58,6 +58,9 @@ Create an Application Load Balancer:
   - target port: `80` (if using current EC2 deploy script/container mapping)
   - health check path: `/health`
   - success code: `200`
+  - (optional readiness) path `/ready` → `200` when worker can accept sockets; `503` when at
+    `MAX_SOCKETS_PER_WORKER` or `ADMIT_MAX_EVENT_LOOP_LAG_MS`. Use for drain / custom alarms;
+    keep primary TG liveness on `/health` so a brief lag spike does not flap all targets.
 - ALB idle timeout: `120s` (websocket friendly)
 - Security groups:
   - ALB SG allows inbound 80/443 from internet

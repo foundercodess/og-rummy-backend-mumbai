@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
-const { testConnection, getPoolMetrics } = require('./db');
+const { testConnection, getPoolMetrics, dbPoolMiddleware } = require('./db');
 const {
   registerSocketServer,
   getSocketRuntimeStats,
@@ -22,6 +22,7 @@ const {
 } = require('./realtime/runtimeObservability');
 const { startBotInjectionSettingsPoller } = require('./services/botInjectionSettings.service');
 const durableTimer = require('./services/durableTimer.service');
+const groupingAsync = require('./services/groupingAsync.service');
 
 const app = express();
 const server = http.createServer(app);
@@ -48,26 +49,62 @@ const couponRoutes = require('./routes/coupon.routes');
 const supportRoutes = require('./routes/support.routes');
 const adminRoutes = require('./routes/admin.routes');
 const gameplayRoutes = require('./routes/gameplay.routes');
-app.use('/api/auth', authRoutes);
+// Auth/wallet/admin share a dedicated PG pool when DB_POOL_SPLIT=true so login
+// bursts do not starve gameplay socket hot-paths.
+app.use('/api/auth', dbPoolMiddleware('auth'), authRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api/config', configRoutes);
 app.use('/api/games', gameRoutes);
 app.use('/api/gameplay', gameplayRoutes);
 app.use('/api/upload', uploadRoutes);
-app.use('/api/wallet', walletRoutes);
+app.use('/api/wallet', dbPoolMiddleware('auth'), walletRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/rewards', rewardsRoutes);
 app.use('/api/coupons', couponRoutes);
 app.use('/api/support', supportRoutes);
-app.use('/api/admin', adminRoutes);
+app.use('/api/admin', dbPoolMiddleware('auth'), adminRoutes);
 
 
 app.get('/health', (req, res) => {
+  const socketsLocal = io ? getSocketRuntimeStats(io) : null;
   res.json({
     status: 'ok',
     uptime: process.uptime(),
     event_loop_lag_ms: getLastEventLoopLagMs(),
+    sockets_connected: socketsLocal?.connected ?? null,
+    max_sockets_per_worker: Math.max(0, Number(process.env.MAX_SOCKETS_PER_WORKER) || 0) || null,
+    admit_max_event_loop_lag_ms: Math.max(0, Number(process.env.ADMIT_MAX_EVENT_LOOP_LAG_MS) || 0) || null,
+    grouping_workers: groupingAsync.getStats(),
   });
+});
+
+/**
+ * Readiness for ALB target-group drain / ASG protection.
+ * Keep TG health check on /health (always 200 while process is up).
+ * Optionally point a second check or custom action at /ready — returns 503 when
+ * this worker is at socket cap or event-loop lag exceeds ADMIT_MAX_EVENT_LOOP_LAG_MS.
+ */
+app.get('/ready', (req, res) => {
+  const lag = getLastEventLoopLagMs();
+  const connected = io ? (getSocketRuntimeStats(io).connected || 0) : 0;
+  const maxSockets = Math.max(0, Number(process.env.MAX_SOCKETS_PER_WORKER) || 0);
+  const maxLag = Math.max(0, Number(process.env.ADMIT_MAX_EVENT_LOOP_LAG_MS) || 0);
+  const atSocketCap = maxSockets > 0 && connected >= maxSockets;
+  const lagHigh = maxLag > 0 && lag > maxLag;
+  const ready = !atSocketCap && !lagHigh;
+  const body = {
+    status: ready ? 'ready' : 'not_ready',
+    event_loop_lag_ms: lag,
+    sockets_connected: connected,
+    max_sockets_per_worker: maxSockets || null,
+    admit_max_event_loop_lag_ms: maxLag || null,
+    reasons: [
+      ...(atSocketCap ? ['server_at_capacity'] : []),
+      ...(lagHigh ? ['server_backpressure'] : []),
+    ],
+  };
+  if (!ready) return res.status(503).json(body);
+  return res.json(body);
 });
 
 // Health check - useful for Docker and load balancers
@@ -149,6 +186,11 @@ app.get('/health/details', async (req, res) => {
     db_pool: getPoolMetrics(),
     hotpath: getHotpathSnapshot(),
     sockets,
+    grouping_workers: groupingAsync.getStats(),
+    admission: {
+      max_sockets_per_worker: Math.max(0, Number(process.env.MAX_SOCKETS_PER_WORKER) || 0) || null,
+      admit_max_event_loop_lag_ms: Math.max(0, Number(process.env.ADMIT_MAX_EVENT_LOOP_LAG_MS) || 0) || null,
+    },
     durable_timers: durable,
     ...(dbStatus.timestamp && { dbTimestamp: dbStatus.timestamp }),
     ...(dbStatus.error && { dbError: dbStatus.error }),
@@ -167,6 +209,7 @@ app.get('/', (req, res) => {
 const io = registerSocketServer(server);
 setSocketStatsProvider(() => getSocketRuntimeStats(io));
 startRuntimeObservability();
+groupingAsync.ensureStarted();
 startBotInjectionSettingsPoller();
 startBotEngine(io);
 startStaleSessionCleanupCron();

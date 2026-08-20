@@ -1351,7 +1351,7 @@ function buildBestGrouping(cards, wildJoker, options) {
 
   let finishMeta = null;
   let trace;
-  if (n === FINISH_HAND_CARD_COUNT) {
+  if (n === FINISH_HAND_CARD_COUNT && options?.skipFinishReadyTrace !== true) {
     const finishTrace = _tryBuildFinishReadyTrace(hand, wildJoker, options);
     if (finishTrace) {
       trace = finishTrace;

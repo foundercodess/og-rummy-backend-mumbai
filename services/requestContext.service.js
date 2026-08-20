@@ -18,6 +18,8 @@ function run(context, fn) {
     session_id: context.session_id ?? null,
     event_name: context.event_name || null,
     user_id: context.user_id ?? null,
+    // 'auth' | 'gameplay' — routes HTTP auth/wallet bursts off the gameplay PG pool
+    db_pool: context.db_pool === 'auth' ? 'auth' : 'gameplay',
     spans: [],
   };
   return storage.run(store, fn);

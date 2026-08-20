@@ -13,6 +13,7 @@ const loginAttemptModel = require('../models/loginAttempt.model');
 const userModel = require('../models/user.model');
 const avatarModel = require('../models/avatar.model');
 const groupingService = require('../services/grouping.service');
+const groupingAsync = require('../services/groupingAsync.service');
 const { isJokerCard: isJokerCardWithWild } = require('../services/wildJokerRules');
 const redisLockService = require('../services/redisLock.service');
 const durableTimer = require('../services/durableTimer.service');
@@ -37,6 +38,7 @@ const turnActionIdempotency = require('../services/turnActionIdempotency.service
 const { socketAuth } = require('./socketAuth');
 const socketRegistry = require('./socketRegistry');
 const { emitActiveNotices, setSocketIO } = require('./socketBus');
+const { getLastEventLoopLagMs } = require('./runtimeObservability');
 const {
   emitLiveGameCounts,
   startLiveCountBroadcaster,
@@ -256,11 +258,17 @@ const DISCARD_HISTORY_MAX_ENTRIES = Math.max(
   8,
   Math.min(500, Number(process.env.DISCARD_HISTORY_MAX_ENTRIES) || 48),
 );
-/** Human pick ACK finish-hint scan budget (ungrouped leftovers). Rules unchanged. */
+/** Human pick ACK finish-hint scan budget. 0 = defer finish_plan after ACK (null in ACK). */
 const PICK_ACK_FINISH_PLAN_MAX_CANDIDATES = Math.max(
-  1,
-  // Default lowered to reduce CPU spikes at high CCU.
-  Math.min(8, Number(process.env.PICK_ACK_FINISH_PLAN_MAX_CANDIDATES) || 1),
+  0,
+  Math.min(8, Number(process.env.PICK_ACK_FINISH_PLAN_MAX_CANDIDATES) || 0),
+);
+/** Cap concurrent sockets on this worker (0 = disabled). ALB should drain unhealthy nodes. */
+const MAX_SOCKETS_PER_WORKER = Math.max(0, Number(process.env.MAX_SOCKETS_PER_WORKER) || 0);
+/** Reject new socket connects when event-loop lag exceeds this (0 = disabled). */
+const ADMIT_MAX_EVENT_LOOP_LAG_MS = Math.max(
+  0,
+  Number(process.env.ADMIT_MAX_EVENT_LOOP_LAG_MS) || 0,
 );
 /** Yield so inbound socket:ping / player ACKs can run between bot CPU chunks. */
 function yieldToEventLoop() {
@@ -4692,29 +4700,24 @@ function resolveGroupingSnapshot(handCards, wildJoker, submittedGroups) {
   };
 }
 
+/** True when deal/autogroup latched best-group mode (UI latch). Pick ACK no longer re-runs DFS. */
 function isAutoBestGroupEnabled(playerDistribution) {
   return playerDistribution?.auto_best_group === true;
 }
 
-function buildAutoBestGroupingResult(handCards, wildJoker, options = {}) {
+async function buildAutoBestGroupingResult(handCards, wildJoker, options = {}) {
   const groupingOptions = options.groupingOptions || {};
-  // On the pick hot-path (fastFinishPlan=true) skip the O(n×DFS) discard scan
-  // fallback. The partition path covers ~95% of finishable hands and we read
-  // finish_card_uid from the grouping summary for the remaining 5%.
+  // Off event-loop DFS via worker threads. fastFinishPlan skips O(n×DFS) discard scan.
   const buildOpts = options.fastFinishPlan === true
-    ? { ...groupingOptions, skipDiscardScan: true }
+    ? { ...groupingOptions, skipDiscardScan: true, skipFinishReadyTrace: true }
     : groupingOptions;
-  const best = groupingService.buildBestGrouping(handCards, wildJoker, buildOpts);
+  const best = await groupingAsync.buildBestGrouping(handCards, wildJoker, buildOpts);
   const submittedGroups = toSubmittedGroupsFromGrouping(best);
-  // Hot-path optimization: when `fastFinishPlan` is enabled (pick ACK),
-  // the `best` grouping is already fully evaluated (types + summary + display
-  // points). Re-evaluating submitted groups here is redundant and expensive.
   const grouping = options.fastFinishPlan === true
     ? best
-    : groupingService.evaluateSubmittedGrouping(handCards, wildJoker, submittedGroups);
+    : await groupingAsync.evaluateSubmittedGrouping(handCards, wildJoker, submittedGroups);
 
-  // Fast path for pick ACK: trust finish_card_uid from buildBestGrouping instead of
-  // re-scanning every leftover (that scan was a major pick-latency source).
+  // Fast path: trust finish_card_uid from buildBestGrouping instead of re-scanning leftovers.
   let finishPlan = null;
   const preferredUid = String(best?.summary?.finish_card_uid || '').trim();
   if (options.fastFinishPlan === true && preferredUid) {
@@ -4736,7 +4739,7 @@ function buildAutoBestGroupingResult(handCards, wildJoker, options = {}) {
         }
         if (nextSubmitted) {
           try {
-            const preview = groupingService.evaluateSubmittedGrouping(
+            const preview = await groupingAsync.evaluateSubmittedGrouping(
               nextHandCards,
               wildJoker,
               nextSubmitted
@@ -11018,6 +11021,30 @@ function registerSocketServer(httpServer) {
       console.error('Socket Redis adapter init failed. Continuing without adapter:', err.message);
     });
 
+  io.use((socket, next) => {
+    try {
+      if (MAX_SOCKETS_PER_WORKER > 0) {
+        const connected = Number(io.engine?.clientsCount) || 0;
+        if (connected >= MAX_SOCKETS_PER_WORKER) {
+          const err = new Error('server_at_capacity');
+          err.data = { code: 'server_at_capacity', max: MAX_SOCKETS_PER_WORKER };
+          return next(err);
+        }
+      }
+      if (ADMIT_MAX_EVENT_LOOP_LAG_MS > 0) {
+        const lag = getLastEventLoopLagMs();
+        if (lag > ADMIT_MAX_EVENT_LOOP_LAG_MS) {
+          const err = new Error('server_backpressure');
+          err.data = { code: 'server_backpressure', lag_ms: lag };
+          return next(err);
+        }
+      }
+      return next();
+    } catch (err) {
+      return next(err);
+    }
+  });
+
   io.use(socketAuth);
 
   setTurnTimerStarter((payload = {}) => {
@@ -12754,7 +12781,7 @@ function registerSocketServer(httpServer) {
           throw new Error('Valid session_id is required');
         }
 
-        const session = await gameplayService.getSessionState(sessionId);
+        const session = await gameplayService.loadTurnActionSession(sessionId);
         if (!session) {
           throw new Error('Session not found');
         }
@@ -12777,47 +12804,42 @@ function registerSocketServer(httpServer) {
           throw new Error('Player cards not found in distribution');
         }
 
-        const freshSession = await gameplayService.getSessionState(sessionId);
-        const freshDistribution = freshSession?.metadata?.distribution;
-        const freshPlayerDistribution = freshDistribution?.players?.find(
-          (pd) => pd.user_id === socket.user.id
-        );
-        const playerCards = freshPlayerDistribution?.cards || playerDistribution.cards || [];
-        const wildJoker = freshDistribution?.wild_joker || distribution.wild_joker || null;
-        const turnIdForSeed = Number(freshSession?.metadata?.turn?.turn_id) || 0;
+        const playerCards = playerDistribution.cards || [];
+        const wildJoker = distribution.wild_joker || null;
+        const turnIdForSeed = Number(session?.metadata?.turn?.turn_id) || 0;
         const decisionSeed = buildDecisionSeed(sessionId, turnIdForSeed, socket.user.id);
         const groupingOptions = buildGroupingTieBreakOptions(decisionSeed);
-        const bestGrouping = groupingService.buildBestGrouping(playerCards, wildJoker, groupingOptions);
-        const newSubmittedGroups = toSubmittedGroupsFromGrouping(bestGrouping);
-        const evaluatedGrouping = groupingService.evaluateSubmittedGrouping(
-          playerCards,
-          wildJoker,
-          newSubmittedGroups
-        );
-        const finishPlan = tryBuildFinishPlan(playerCards, wildJoker, {
-          submittedGroups: newSubmittedGroups,
+
+        // Yield so concurrent pick/discard ACKs are not blocked by this DFS.
+        await yieldToEventLoop();
+        const autoResult = await buildAutoBestGroupingResult(playerCards, wildJoker, {
           groupingOptions,
           tieBreakSeed: decisionSeed,
           sessionId,
           userId: socket.user.id,
           turnId: turnIdForSeed,
+          // Skip O(n×DFS) discard scan — same finish hint fields on ACK.
+          fastFinishPlan: true,
         });
+        const newSubmittedGroups = autoResult.submittedGroups;
+        const evaluatedGrouping = autoResult.grouping;
+        const finishPlan = autoResult.finishPlan;
 
-        const autoPdIndex = (freshDistribution?.players || distribution.players).findIndex(
+        const autoPdIndex = (distribution.players || []).findIndex(
           (pd) => pd.user_id === socket.user.id
         );
-        const autoUpdatedPlayers = (freshDistribution?.players || distribution.players).map((pd, i) =>
+        const autoUpdatedPlayers = (distribution.players || []).map((pd, i) =>
           i === autoPdIndex
             ? { ...pd, submitted_groups: newSubmittedGroups, auto_best_group: true }
             : pd
         );
 
-        await gameSessionModel.updateSessionStatus(sessionId, freshSession?.status || session.status, {
-          currentTurnUserId: freshSession?.current_turn_user_id || session.current_turn_user_id,
+        await gameSessionModel.updateSessionStatus(sessionId, session.status, {
+          currentTurnUserId: session.current_turn_user_id,
           metadata: {
-            ...(freshSession?.metadata || session.metadata),
+            ...(session.metadata || {}),
             distribution: {
-              ...(freshDistribution || distribution),
+              ...distribution,
               players: autoUpdatedPlayers,
             },
             phase_updated_at: new Date().toISOString(),
@@ -13207,44 +13229,26 @@ function registerSocketServer(httpServer) {
         const turnIdForSeed = Number(session?.metadata?.turn?.turn_id) || 0;
         const decisionSeed = buildDecisionSeed(sessionId, turnIdForSeed, socket.user.id);
         const groupingOptions = buildGroupingTieBreakOptions(decisionSeed);
-        const autoBestGroup = isAutoBestGroupEnabled(playerDistribution);
 
-        let updatedPickGroups;
-        let grouping;
-        let finishPlan = null;
-
-        if (autoBestGroup) {
-          // Yield before the heavy buildBestGrouping DFS so queued ACKs/pings
-          // from other sessions can run and avoid event-loop lag spikes.
-          await yieldToEventLoop();
-          // Auto-best already uses fastFinishPlan (no multi-card scan).
-          const autoResult = buildAutoBestGroupingResult(playerDistribution.cards, wildJoker, {
-            groupingOptions,
-            tieBreakSeed: decisionSeed,
-            sessionId,
-            userId: socket.user.id,
-            turnId: turnIdForSeed,
-            fastFinishPlan: true,
-          });
-          updatedPickGroups = autoResult.submittedGroups;
-          grouping = autoResult.grouping;
-          finishPlan = autoResult.finishPlan;
-        } else {
-          const storedPickGroups = Array.isArray(playerDistribution.submitted_groups)
-            ? playerDistribution.submitted_groups
-            : [];
-          updatedPickGroups = appendCardToSpecifiedGroupOrLast(
-            storedPickGroups,
-            pickedCard.card_uid,
-            requestedGroupId,
-            requestedPosition
-          );
-          ({ grouping } = resolveGroupingSnapshot(
-            playerDistribution.cards,
-            wildJoker,
-            updatedPickGroups
-          ));
-        }
+        // Pick ACK must stay lag-free for real-money play.
+        // Deal/autogroup may set auto_best_group=true, but NEVER re-run buildBestGrouping
+        // DFS on every pick — that caused 100–200ms+ ack_timeouts at 600 CCU.
+        // Incremental append keeps the same ACK shape (grouping + finish_plan fields).
+        // Full re-best remains on explicit player:autogroup only.
+        const storedPickGroups = Array.isArray(playerDistribution.submitted_groups)
+          ? playerDistribution.submitted_groups
+          : [];
+        const updatedPickGroups = appendCardToSpecifiedGroupOrLast(
+          storedPickGroups,
+          pickedCard.card_uid,
+          requestedGroupId,
+          requestedPosition
+        );
+        const { grouping } = resolveGroupingSnapshot(
+          playerDistribution.cards,
+          wildJoker,
+          updatedPickGroups
+        );
 
         playerDistribution.submitted_groups = updatedPickGroups;
         playersDistribution[playerIndex] = playerDistribution;
@@ -13267,8 +13271,8 @@ function registerSocketServer(httpServer) {
           phase_updated_at: new Date().toISOString(),
         };
 
-        // Persist move first so cluster peers see has_picked before finish-hint CPU.
-        // discard_history picked markers are updated non-blocking after ACK below.
+        // Persist move first (Redis live sync; PG async). Cluster peers see has_picked
+        // before ACK returns. discard_history markers updated non-blocking after ACK.
         await gameSessionModel.updateSessionStatus(sessionId, session.status, {
           currentTurnUserId: session.current_turn_user_id,
           metadata: nextMetadata,
@@ -13286,8 +13290,11 @@ function registerSocketServer(httpServer) {
           },
         }).catch(() => {});
 
-        // Human finish hint stays on ACK (Flutter finish suggestion). Keep scan budget small.
-        if (!autoBestGroup) {
+        // Phase 1: ACK after Redis mutate + cheap grouping snapshot.
+        // Finish-plan DFS/hint is deferred when PICK_ACK_FINISH_PLAN_MAX_CANDIDATES=0
+        // (default) — Flutter tolerates null finish_plan / finish_card_suggestion.
+        let finishPlan = null;
+        if (PICK_ACK_FINISH_PLAN_MAX_CANDIDATES > 0) {
           finishPlan = tryBuildFinishPlanFromSubmittedGroups(playerDistribution.cards, wildJoker, {
             submittedGroups: updatedPickGroups,
             groupingOptions,

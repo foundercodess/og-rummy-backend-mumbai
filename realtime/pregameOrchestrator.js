@@ -9,6 +9,7 @@ const {
 } = require('../services/poolPrizePool.service');
 const gameSessionModel = require('../models/gameSession.model');
 const groupingService = require('../services/grouping.service');
+const groupingAsync = require('../services/groupingAsync.service');
 const { resolveWildRank } = require('../services/wildJokerRules');
 const redisLockService = require('../services/redisLock.service');
 const durableTimer = require('../services/durableTimer.service');
@@ -782,7 +783,7 @@ function selectBestDealCandidate(candidates = []) {
 
 // ─── Deal payload builder ─────────────────────────────────────────────────────
 
-function buildDealPayload({ session, players, tossWinnerUserId, seed }) {
+async function buildDealPayload({ session, players, tossWinnerUserId, seed }) {
   const seats = [...players].sort((a, b) => a.seat_no - b.seat_no);
   const metadata = session?.metadata || {};
   const recentPatternsByUser = metadata?.recent_hand_patterns_by_user || {};
@@ -925,9 +926,13 @@ function buildDealPayload({ session, players, tossWinnerUserId, seed }) {
       winner_user_id: tossWinnerUserId,
     },
     distribution: {
-      players: seats.map((player) => {
+      players: await Promise.all(seats.map(async (player) => {
         const playerCards = handsByUser[player.user_id];
-        const bestGrouping = groupingService.buildBestGrouping(playerCards, normalizedWildJoker);
+        // Worker-thread DFS — keeps deal off the Socket.IO event loop.
+        const bestGrouping = await groupingAsync.buildBestGrouping(playerCards, normalizedWildJoker, {
+          skipDiscardScan: true,
+          skipFinishReadyTrace: true,
+        });
         const submittedGroups = groupingService.toSubmittedGroupsFromGrouping(bestGrouping);
         return {
           user_id: player.user_id,
@@ -939,7 +944,7 @@ function buildDealPayload({ session, players, tossWinnerUserId, seed }) {
           has_picked: false,
           first_turn_cycle_complete: false,
         };
-      }),
+      })),
       wild_joker: normalizedWildJoker,
       wild_rank: resolveWildRank(normalizedWildJoker),
       discard_pile: discardTop ? [normalizeCard(discardTop)] : [],
@@ -1249,7 +1254,7 @@ async function emitDealFromPregame({
 
   console.log(`[PREGAME][${sessionId}] Building deal — sequence=${sequence} firstTurn=uid:${firstTurnPlayer.user_id}`);
 
-  const dealPayload = buildDealPayload({
+  const dealPayload = await buildDealPayload({
     session: sessionForDeal,
     players: participants,
     tossWinnerUserId: firstTurnPlayer.user_id,
