@@ -178,7 +178,7 @@ app.get('/health/details', async (req, res) => {
   const sockets = io ? await getClusterSocketRuntimeStats(io) : null;
   res.json({
     status: 'ok',
-    message: 'OG Rummy API is running on EC2, version 5',
+    message: 'OG Rummy API is running on EC2, 20 aug 2026',
     database: dbStatus.ok === true ? 'connected' : dbStatus.ok === false ? 'error' : 'not configured',
     redis: redisStatus.ok === true ? 'connected' : redisStatus.ok === false ? 'error' : 'not configured',
     kafka: kafkaStatus.ok === true ? 'connected' : kafkaStatus.ok === false ? 'error' : 'not configured',
