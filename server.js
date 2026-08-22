@@ -23,6 +23,8 @@ const {
 const { startBotInjectionSettingsPoller } = require('./services/botInjectionSettings.service');
 const durableTimer = require('./services/durableTimer.service');
 const groupingAsync = require('./services/groupingAsync.service');
+const liveSessionState = require('./services/liveSessionState.service');
+const gameSessionModel = require('./models/gameSession.model');
 
 const app = express();
 const server = http.createServer(app);
@@ -65,7 +67,7 @@ app.use('/api/support', supportRoutes);
 app.use('/api/admin', dbPoolMiddleware('auth'), adminRoutes);
 
 
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   const socketsLocal = io ? getSocketRuntimeStats(io) : null;
   res.json({
     status: 'ok',
@@ -75,6 +77,9 @@ app.get('/health', (req, res) => {
     max_sockets_per_worker: Math.max(0, Number(process.env.MAX_SOCKETS_PER_WORKER) || 0) || null,
     admit_max_event_loop_lag_ms: Math.max(0, Number(process.env.ADMIT_MAX_EVENT_LOOP_LAG_MS) || 0) || null,
     grouping_workers: groupingAsync.getStats(),
+    live_session: liveSessionState.getStats(),
+    async_pg_queue: gameSessionModel.getAsyncPgQueueStats(),
+    db_pool: await getPoolMetrics(),
   });
 });
 
@@ -178,7 +183,7 @@ app.get('/health/details', async (req, res) => {
   const sockets = io ? await getClusterSocketRuntimeStats(io) : null;
   res.json({
     status: 'ok',
-    message: 'OG Rummy API is running on EC2, 20 aug 2026',
+    message: 'OG Rummy API is running on EC2, 22 aug 2026',
     database: dbStatus.ok === true ? 'connected' : dbStatus.ok === false ? 'error' : 'not configured',
     redis: redisStatus.ok === true ? 'connected' : redisStatus.ok === false ? 'error' : 'not configured',
     kafka: kafkaStatus.ok === true ? 'connected' : kafkaStatus.ok === false ? 'error' : 'not configured',

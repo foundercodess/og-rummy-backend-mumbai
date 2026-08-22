@@ -1,6 +1,7 @@
 const authService = require('../services/auth.service');
 const loginAttemptModel = require('../models/loginAttempt.model');
 const userModel = require('../models/user.model');
+const requestContext = require('../services/requestContext.service');
 
 async function socketAuth(socket, next) {
   try {
@@ -19,24 +20,28 @@ async function socketAuth(socket, next) {
       return next(new Error('Invalid or expired token'));
     }
 
-    const activeSession = await loginAttemptModel.findActiveBySessionId(payload.sessionId);
-    if (!activeSession || activeSession.user_id !== payload.userId) {
-      return next(new Error('Session invalid or logged out'));
-    }
+    // login_attempts / users reads must use the auth pool when DB_POOL_SPLIT=true
+    // so handshake bursts do not steal gameplay connections from pick/discard.
+    await requestContext.run({ db_pool: 'auth', event_name: 'socket:auth' }, async () => {
+      const activeSession = await loginAttemptModel.findActiveBySessionId(payload.sessionId);
+      if (!activeSession || activeSession.user_id !== payload.userId) {
+        throw new Error('Session invalid or logged out');
+      }
 
-    const user = await userModel.findById(payload.userId);
-    if (!user || user.active === false) {
-      return next(new Error('User not allowed'));
-    }
+      const user = await userModel.findById(payload.userId);
+      if (!user || user.active === false) {
+        throw new Error('User not allowed');
+      }
 
-    socket.user = {
-      id: payload.userId,
-      sessionId: payload.sessionId,
-      role: payload.role || 'user',
-      name: user.name,
-      avatar: user.avatar,
-      viewId: user.view_id,
-    };
+      socket.user = {
+        id: payload.userId,
+        sessionId: payload.sessionId,
+        role: payload.role || 'user',
+        name: user.name,
+        avatar: user.avatar,
+        viewId: user.view_id,
+      };
+    });
 
     return next();
   } catch (err) {

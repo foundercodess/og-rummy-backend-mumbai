@@ -12,8 +12,8 @@ function compactSql(text) {
     .substring(0, 160);
 }
 
-function run(context, fn) {
-  const store = {
+function buildStore(context = {}) {
+  return {
     trace_id: context.trace_id || null,
     session_id: context.session_id ?? null,
     event_name: context.event_name || null,
@@ -22,7 +22,26 @@ function run(context, fn) {
     db_pool: context.db_pool === 'auth' ? 'auth' : 'gameplay',
     spans: [],
   };
-  return storage.run(store, fn);
+}
+
+function run(context, fn) {
+  return storage.run(buildStore(context), fn);
+}
+
+/**
+ * Fresh ALS store for background PG work (async live persist, event batch flush).
+ * Prevents inheriting socket hot-path spans / event_name so slow-query traces
+ * are not falsely attributed to player:pick / player:discard ACK handlers.
+ */
+function runBackground(context, fn) {
+  return storage.run(
+    buildStore({
+      event_name: 'background',
+      db_pool: 'gameplay',
+      ...context,
+    }),
+    fn,
+  );
 }
 
 function getStore() {
@@ -84,6 +103,7 @@ function logSpanDump(reason, extra = {}) {
 
 module.exports = {
   run,
+  runBackground,
   getStore,
   recordQuerySpan,
   formatSpanDump,

@@ -1,6 +1,7 @@
 const { query } = require('../db');
 const sessionCache = require('../services/sessionCache.service');
 const liveSessionState = require('../services/liveSessionState.service');
+const requestContext = require('../services/requestContext.service');
 
 function isTerminalSessionStatus(status) {
   return status === 'completed' || status === 'cancelled';
@@ -512,6 +513,104 @@ async function persistSessionStatusToPostgres(sessionId, status, fields = {}) {
   return result.rows[0] || null;
 }
 
+// ─── Coalesced async PG persist (hot pick/discard) ───────────────────────────
+// Every move used to setImmediate() a full JSONB UPDATE. At 100×6 that floods
+// the gameplay pool (acquire 100–250ms) even after ACK returns. Keep only the
+// latest pending snapshot per session and drain with limited concurrency.
+const ASYNC_PG_MAX_INFLIGHT = Math.max(
+  1,
+  Number(process.env.LIVE_SESSION_ASYNC_PG_CONCURRENCY) || 2,
+);
+const pendingAsyncPgBySession = new Map();
+let asyncPgInflight = 0;
+let asyncPgWakeScheduled = false;
+const asyncPgStats = {
+  scheduled: 0,
+  coalesced: 0,
+  started: 0,
+  failed: 0,
+};
+
+function wakeAsyncPgWorker() {
+  if (asyncPgWakeScheduled) return;
+  asyncPgWakeScheduled = true;
+  setImmediate(() => {
+    asyncPgWakeScheduled = false;
+    drainAsyncPgQueue();
+  });
+}
+
+function scheduleAsyncPgPersist(sessionId, status, fields, version) {
+  asyncPgStats.scheduled += 1;
+  const prev = pendingAsyncPgBySession.get(sessionId);
+  if (prev) asyncPgStats.coalesced += 1;
+  // Always keep the newest live_version snapshot for this session.
+  if (!prev || Number(version) >= Number(prev.version)) {
+    pendingAsyncPgBySession.set(sessionId, {
+      status,
+      fields: { ...fields },
+      version,
+    });
+  }
+  wakeAsyncPgWorker();
+}
+
+function drainAsyncPgQueue() {
+  while (asyncPgInflight < ASYNC_PG_MAX_INFLIGHT && pendingAsyncPgBySession.size > 0) {
+    const next = pendingAsyncPgBySession.entries().next().value;
+    if (!next) break;
+    const [sessionId, job] = next;
+    pendingAsyncPgBySession.delete(sessionId);
+    asyncPgInflight += 1;
+    asyncPgStats.started += 1;
+
+    requestContext.runBackground(
+      {
+        event_name: 'async_pg_persist',
+        session_id: sessionId,
+        db_pool: 'gameplay',
+      },
+      () => {
+        persistSessionStatusToPostgres(sessionId, job.status, job.fields)
+          .then((row) => {
+            if (!row) return null;
+            return liveSessionState.get(sessionId).then((current) => {
+              if (!current) return null;
+              if (Number(current.live_version) > Number(job.version)) return null;
+              return liveSessionState.hydrateFromRow(sessionId, {
+                ...row,
+                live_version: job.version,
+              });
+            });
+          })
+          .catch((err) => {
+            asyncPgStats.failed += 1;
+            console.warn(
+              `[live-session] async PG persist failed session=${sessionId} ` +
+                `v=${job.version}: ${err.message}`,
+            );
+          })
+          .finally(() => {
+            asyncPgInflight -= 1;
+            if (pendingAsyncPgBySession.size > 0) wakeAsyncPgWorker();
+          });
+      },
+    );
+  }
+}
+
+function getAsyncPgQueueStats() {
+  return {
+    max_inflight: ASYNC_PG_MAX_INFLIGHT,
+    inflight: asyncPgInflight,
+    pending_sessions: pendingAsyncPgBySession.size,
+    scheduled: asyncPgStats.scheduled,
+    coalesced: asyncPgStats.coalesced,
+    started: asyncPgStats.started,
+    failed: asyncPgStats.failed,
+  };
+}
+
 async function updateSessionStatus(sessionId, status, fields = {}) {
   // ── Phase 3 live path (flag OFF → fall through to classic PG-only) ─────────
   if (liveSessionState.isEnabled()) {
@@ -533,6 +632,8 @@ async function updateSessionStatus(sessionId, status, fields = {}) {
 
     if (awaitPg) {
       liveSessionState.noteSyncPersist();
+      // Drop any stale async snapshot so it cannot overwrite a terminal sync write.
+      pendingAsyncPgBySession.delete(sessionId);
       const row = await persistSessionStatusToPostgres(sessionId, status, fields);
       if (terminal) {
         await liveSessionState.drop(sessionId);
@@ -548,30 +649,7 @@ async function updateSessionStatus(sessionId, status, fields = {}) {
 
     // Async Postgres snapshot — Redis already has the move; ACK path stays fast.
     liveSessionState.noteAsyncPersist();
-    const capturedFields = { ...fields };
-    const capturedStatus = status;
-    const capturedVersion = nextLive.live_version;
-    setImmediate(() => {
-      persistSessionStatusToPostgres(sessionId, capturedStatus, capturedFields)
-        .then((row) => {
-          if (!row) return;
-          // Only refresh live from PG if no newer live write raced ahead.
-          return liveSessionState.get(sessionId).then((current) => {
-            if (!current) return;
-            if (Number(current.live_version) > capturedVersion) return;
-            return liveSessionState.hydrateFromRow(sessionId, {
-              ...row,
-              live_version: capturedVersion,
-            });
-          });
-        })
-        .catch((err) => {
-          console.warn(
-            `[live-session] async PG persist failed session=${sessionId} ` +
-            `v=${capturedVersion}: ${err.message}`
-          );
-        });
-    });
+    scheduleAsyncPgPersist(sessionId, status, fields, nextLive.live_version);
     return nextLive;
   }
 
@@ -633,7 +711,14 @@ async function _flushEventQueue() {
 
   const sql = `INSERT INTO game_session_events (game_session_id, user_id, event_type, payload) VALUES ${values.join(', ')}`;
   try {
-    await query(sql, params);
+    await new Promise((resolve, reject) => {
+      requestContext.runBackground(
+        { event_name: 'game_session_events_batch', db_pool: 'gameplay' },
+        () => {
+          query(sql, params).then(resolve, reject);
+        },
+      );
+    });
   } catch (err) {
     console.warn(`[game_session_events] batch insert failed (${batch.length} rows): ${err.message}`);
   }
@@ -690,4 +775,5 @@ module.exports = {
   updateSessionStatus,
   insertEvent,
   listRecentEvents,
+  getAsyncPgQueueStats,
 };

@@ -40,6 +40,12 @@ LIVE_SESSION_STATE_ASYNC_PG=true
 SESSION_STATE_CACHE_ENABLED=true
 ```
 
+Hot pick/discard: Redis is authoritative; Postgres snapshots are coalesced per
+session with limited concurrency (`LIVE_SESSION_ASYNC_PG_CONCURRENCY`, default 2)
+so the gameplay pool is not flooded by full JSONB UPDATEs after every move.
+Socket auth uses the auth PG pool when `DB_POOL_SPLIT=true`. Players cache TTL
+defaults to 30s (`SESSION_STATE_CACHE_TTL_MS`).
+
 Notes:
 - Increase `CLUSTER_INSTANCES` to 4 only if instance CPU has headroom.
 - Increase `DB_POOL_MAX` carefully. Total possible PG connections is roughly:
@@ -138,20 +144,23 @@ node scripts/load_test_concurrency.js \
   --hold-seconds 300
 ```
 
-2) Gameplay capacity ramp:
+2) Gameplay capacity ramp (stepwise auto ladder):
 
 ```bash
-node scripts/load_test_gameplay.js \
+# Creates phones/users as needed, climbs steps, optional --ramp-down
+node scripts/run_load_ramp.js \
   --url https://<alb-domain> \
-  --tokens load_tokens.jsonl \
-  --game-id <id> \
-  --contest-id <id> \
-  --tables 200 \
-  --concurrency 20 \
-  --max-game-seconds 120
+  --steps 100,200,500,1000,2000,5000,10000,20000 \
+  --max-players 6 --game-id 3 --contest-id 199 \
+  --concurrency 50 --hold-seconds 180 --max-game-seconds 900 \
+  --ramp-down
+
+# Or: ./scripts/run_load_ramp.sh
+#      STEPS=100,200,500 RAMP_DOWN=1 ./scripts/run_load_ramp.sh
 ```
 
-Then ramp 200 -> 500 -> 1000 tables.
+Single-hold still works via `load_test_gameplay.js` / `run_load_cycle.js`.
+Manual ladder without the orchestrator: 200 -> 500 -> 1000 tables.
 
 ## Success Criteria (Phase 1)
 

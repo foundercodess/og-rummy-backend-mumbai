@@ -15,7 +15,7 @@ const { cacheGetJson, cacheSetJson, cacheDel } = require('./redis.service');
 
 const SESSION_ROW_PREFIX = 'sess:row:';
 const SESSION_PLAYERS_PREFIX = 'sess:players:';
-const DEFAULT_TTL_MS = 3000;
+const DEFAULT_TTL_MS = 30_000;
 
 const stats = {
   rowHit: 0,
