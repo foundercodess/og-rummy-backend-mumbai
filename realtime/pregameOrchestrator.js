@@ -2,6 +2,8 @@
 
 const crypto = require('crypto');
 const { computeWalletDebitSplit } = require('../services/walletDebitSplit');
+const gameCommission = require('../services/gameCommission.service');
+const commercialSettings = require('../services/commercialSettings.service');
 const gameplayService = require('../services/gameplay.service');
 const {
   buildPoolSessionPrizePoolFields,
@@ -41,7 +43,6 @@ const CARDS_PER_PLAYER = 13;
 const PREGAME_LOCK_TTL_SECONDS = 45;
 const PREGAME_LOCK_RENEW_EVERY_MS = 8000;
 const BONUS_ATTEMPTS_PER_PLAYER = 1;
-const ENTRY_DEBIT_COMMISSION_PERCENT = 12;
 const HAND_PATTERN_HISTORY_LIMIT = Math.max(3, Number(process.env.HAND_PATTERN_HISTORY_LIMIT) || 8);
 const DEAL_SHUFFLE_CANDIDATE_COUNT = Math.max(1, Math.min(7, Number(process.env.DEAL_SHUFFLE_CANDIDATE_COUNT) || 5));
 const DEAL_RANDOM_PICK_PROBABILITY = Math.max(0, Math.min(0.6, Number(process.env.DEAL_RANDOM_PICK_PROBABILITY) || 0.05));
@@ -341,10 +342,16 @@ function buildSessionPrizePoolFields(session = null) {
   const isEntryPotMode = isDealLikeMode(mode) || mode === 'pool';
   const entryFee = Number(session?.contest?.entry);
   const playerCount = resolveEntryPotPlayerCount(session);
+  const winningPercent = gameCommission.resolveSessionWinningCommissionPercent(
+    session,
+    commercialSettings.getGameCommissionPercentSync(),
+  );
+  const entrySplits = commercialSettings.listEntryDebitSplitsFromMetadata(session?.metadata || {});
 
   let totalEntry = null;
   let adminCommissionAmount = null;
   let winningBalance = null;
+  let adminCommissionPercent = null;
 
   if (isEntryPotMode && Number.isFinite(entryFee) && entryFee > 0 && playerCount > 0) {
     if (mode === 'spin_go') {
@@ -354,10 +361,16 @@ function buildSessionPrizePoolFields(session = null) {
         : null;
       totalEntry = roundCurrency(entryFee * playerCount);
       adminCommissionAmount = null;
+      adminCommissionPercent = null;
     } else {
       totalEntry = roundCurrency(entryFee * playerCount);
-      adminCommissionAmount = roundCurrency(totalEntry * 0.12);
+      if (entrySplits.length > 0) {
+        adminCommissionAmount = gameCommission.computeCommissionForDebitSplits(entrySplits, winningPercent);
+      } else {
+        adminCommissionAmount = gameCommission.computeFlatCommission(totalEntry, winningPercent);
+      }
       winningBalance = roundCurrency(totalEntry - adminCommissionAmount);
+      adminCommissionPercent = winningPercent;
     }
   }
 
@@ -367,7 +380,7 @@ function buildSessionPrizePoolFields(session = null) {
       player_count: playerCount,
       entry_fee: Number.isFinite(entryFee) ? roundCurrency(entryFee) : null,
       total_entry: totalEntry,
-      admin_commission_percent: mode === 'spin_go' ? null : (isEntryPotMode ? 12 : null),
+      admin_commission_percent: adminCommissionPercent,
       admin_commission_amount: adminCommissionAmount,
       winning_balance: winningBalance,
     },
@@ -1129,8 +1142,14 @@ async function debitEntriesOnMatchFilled({ sessionId, sequence }) {
     }
 
     const metadata = sessionRow.metadata || {};
+    const lockResult = commercialSettings.lockWinningCommissionOnMetadata(
+      metadata,
+      commercialSettings.getGameCommissionPercentSync(),
+    );
+    let workingMetadata = lockResult.metadata;
+    const lockedWinningPercent = lockResult.locked_winning_commission_percent;
     const alreadyDebited = new Set(
-      (Array.isArray(metadata?.entry_debited_user_ids) ? metadata.entry_debited_user_ids : [])
+      (Array.isArray(workingMetadata?.entry_debited_user_ids) ? workingMetadata.entry_debited_user_ids : [])
         .map((id) => Number(id)).filter((id) => !Number.isNaN(id)),
     );
 
@@ -1168,6 +1187,17 @@ async function debitEntriesOnMatchFilled({ sessionId, sequence }) {
         throw err;
       }
 
+      const commissionMeta = mode === 'spin_go'
+        ? {
+            debit_from_deposit: debitSplit.debitFromDeposit,
+            debit_from_released_bonus: debitSplit.debitFromReleased,
+            debit_from_withdrawable: debitSplit.debitFromWithdrawable,
+            admin_commission_percent: null,
+            winning_commission_percent: null,
+            commission_amount: null,
+          }
+        : gameCommission.buildCommissionMetaFromSplit(debitSplit, lockedWinningPercent);
+
       const nextTotal = roundCurrency(Number(wallet?.total_balance || 0) - entryFee);
       await client.query(
         `UPDATE wallets SET deposit=$2, released_bonus=$3, withdrawable=$4, total_balance=$5, updated_at=NOW()
@@ -1185,18 +1215,28 @@ async function debitEntriesOnMatchFilled({ sessionId, sequence }) {
           contest_id: sessionRow.contest_id,
           entry_fee: entryFee,
           lock_sequence: sequence,
-          admin_commission_percent: mode === 'spin_go' ? null : ENTRY_DEBIT_COMMISSION_PERCENT,
+          ...commissionMeta,
         })],
       );
+
+      workingMetadata = commercialSettings.mergeEntryDebitSplitOnMetadata(workingMetadata, userId, {
+        ...commissionMeta,
+        entry_fee: entryFee,
+        actualDebit: debitSplit.actualDebit,
+        debitFromDeposit: debitSplit.debitFromDeposit,
+        debitFromReleased: debitSplit.debitFromReleased,
+        debitFromWithdrawable: debitSplit.debitFromWithdrawable,
+      });
       debitedUserIds.push(userId);
       alreadyDebited.add(userId);
     }
 
     const nextMetadata = {
-      ...metadata,
+      ...workingMetadata,
       entry_debited_user_ids: Array.from(alreadyDebited),
       entry_debited_at: getNowIso(),
       entry_debit_lock_sequence: sequence,
+      locked_winning_commission_percent: lockedWinningPercent,
     };
     await client.query(
       'UPDATE game_sessions SET metadata=$2::jsonb, updated_at=NOW() WHERE id=$1',
@@ -1206,7 +1246,12 @@ async function debitEntriesOnMatchFilled({ sessionId, sequence }) {
     await client.query('COMMIT');
     if (sessionCache.isEnabled()) await sessionCache.invalidate(sessionId);
     if (liveSessionState.isEnabled()) await liveSessionState.drop(sessionId);
-    return { debited_user_ids: debitedUserIds, skipped: false, entry_fee: entryFee };
+    return {
+      debited_user_ids: debitedUserIds,
+      skipped: false,
+      entry_fee: entryFee,
+      locked_winning_commission_percent: lockedWinningPercent,
+    };
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;

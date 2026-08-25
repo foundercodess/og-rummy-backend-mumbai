@@ -685,6 +685,34 @@ async function syncWithdrawalStatus(req, res) {
   }
 }
 
+async function lookupWalletCreditUser(req, res) {
+  try {
+    const query = req.body?.query ?? req.body?.q ?? req.body?.view_id ?? '';
+    const result = await walletService.lookupUserForAdminCredit(query);
+    return res.json({
+      success: true,
+      message: 'User matched successfully',
+      ...result,
+    });
+  } catch (err) {
+    console.error('lookupWalletCreditUser error:', err);
+    if (err.code === 'INVALID_QUERY') {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    if (err.code === 'USER_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: err.message });
+    }
+    if (err.code === 'AMBIGUOUS_USER') {
+      return res.status(409).json({
+        success: false,
+        message: err.message,
+        candidates: err.candidates || [],
+      });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to look up user' });
+  }
+}
+
 async function creditWalletByViewId(req, res) {
   try {
     const creditPinRaw = req.body?.credit_pin ?? req.body?.password;
@@ -699,12 +727,32 @@ async function creditWalletByViewId(req, res) {
       return res.status(403).json({ success: false, message: 'Invalid wallet credit PIN' });
     }
 
-    const { view_id: viewId, amount, reason } = req.body || {};
+    const {
+      view_id: viewId,
+      query,
+      user_id: userId,
+      amount,
+      reason,
+      matched_by: matchedBy,
+      confirm,
+    } = req.body || {};
+
+    // Require explicit confirm when crediting by resolved user_id (lookup → confirm flow).
+    if (userId != null && String(userId).trim() !== '' && confirm !== true && confirm !== 'true') {
+      return res.status(400).json({
+        success: false,
+        message: 'confirm must be true when crediting by user_id',
+      });
+    }
+
     const result = await walletService.creditWalletByAdmin({
-      viewId,
+      viewId: viewId || null,
+      query: query || null,
+      userId: userId || null,
       amount,
       adminId: req.auth?.adminId || null,
       reason: reason || null,
+      matchedBy: matchedBy || null,
     });
 
     return res.json({
@@ -714,7 +762,7 @@ async function creditWalletByViewId(req, res) {
     });
   } catch (err) {
     console.error('creditWalletByViewId error:', err);
-    if (err.code === 'INVALID_VIEW_ID') {
+    if (err.code === 'INVALID_VIEW_ID' || err.code === 'INVALID_QUERY' || err.code === 'INVALID_USER_ID') {
       return res.status(400).json({ success: false, message: err.message });
     }
     if (err.code === 'INVALID_AMOUNT') {
@@ -722,6 +770,13 @@ async function creditWalletByViewId(req, res) {
     }
     if (err.code === 'USER_NOT_FOUND') {
       return res.status(404).json({ success: false, message: err.message });
+    }
+    if (err.code === 'AMBIGUOUS_USER') {
+      return res.status(409).json({
+        success: false,
+        message: err.message,
+        candidates: err.candidates || [],
+      });
     }
     if (err.code === 'WALLET_NOT_FOUND') {
       return res.status(404).json({ success: false, message: err.message });
@@ -814,6 +869,53 @@ async function updateBotInjectionSettings(req, res) {
       return res.status(400).json({ success: false, message: 'updated_by admin id must be a valid positive integer' });
     }
     return res.status(500).json({ success: false, message: 'Failed to update bot injection settings' });
+  }
+}
+
+async function getCommercialSettings(req, res) {
+  try {
+    const result = await adminService.getCommercialSettingsForAdmin();
+    return res.json({
+      success: true,
+      message: 'Commercial settings fetched successfully',
+      ...result,
+    });
+  } catch (err) {
+    console.error('getCommercialSettings error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to fetch commercial settings' });
+  }
+}
+
+async function updateCommercialSettings(req, res) {
+  try {
+    const { game_commission_percent: gameCommissionPercent } = req.body || {};
+
+    const result = await adminService.updateCommercialSettingsForAdmin({
+      gameCommissionPercent,
+      updatedBy: req.auth?.userId || null,
+    });
+
+    return res.json({
+      success: true,
+      message: `Game commission set to ${result?.commercial_settings?.game_commission_percent}% (applies to new sessions; live tables keep their locked rate)`,
+      ...result,
+    });
+  } catch (err) {
+    console.error('updateCommercialSettings error:', err);
+    if (err.code === 'INVALID_GAME_COMMISSION_PERCENT') {
+      return res.status(400).json({ success: false, message: 'game_commission_percent must be a number' });
+    }
+    if (err.code === 'GAME_COMMISSION_PERCENT_OUT_OF_RANGE') {
+      return res.status(400).json({
+        success: false,
+        message: 'game_commission_percent must be between 0 and 12',
+        details: err.details || null,
+      });
+    }
+    if (err.code === 'INVALID_UPDATED_BY_ADMIN_ID') {
+      return res.status(400).json({ success: false, message: 'updated_by admin id must be a valid positive integer' });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to update commercial settings' });
   }
 }
 
@@ -1730,6 +1832,7 @@ module.exports = {
   getAppSettings,
   getMaintenanceMode,
   getBotInjectionSettings,
+  getCommercialSettings,
   getGameHistoryDetails,
   listGameTelemetry,
   getGameTelemetrySessionReport,
@@ -1741,6 +1844,7 @@ module.exports = {
   settleWithdrawal,
   rejectWithdrawal,
   syncWithdrawalStatus,
+  lookupWalletCreditUser,
   creditWalletByViewId,
   getUserDetails,
   updateAddCashOptionActive,
@@ -1749,6 +1853,7 @@ module.exports = {
   updateFaqActive,
   updateMaintenanceMode,
   updateBotInjectionSettings,
+  updateCommercialSettings,
   updateSupport,
   listGamesHistory,
   getGameSessionStats,

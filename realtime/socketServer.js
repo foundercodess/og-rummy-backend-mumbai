@@ -3,6 +3,8 @@ const { createAdapter } = require('@socket.io/redis-adapter');
 const crypto = require('crypto');
 const gameplayService = require('../services/gameplay.service');
 const { computeWalletDebitSplit } = require('../services/walletDebitSplit');
+const gameCommission = require('../services/gameCommission.service');
+const commercialSettings = require('../services/commercialSettings.service');
 const {
   releasePendingBonusAfterPlay,
   resolveEntryFeesPaidForSession,
@@ -174,6 +176,10 @@ const TURN_TIMEOUT_IDEMPOTENCY_TTL_SECONDS = 120;
 const POOL_SPLIT_WINDOW_SECONDS = Math.max(10, Number(process.env.POOL_SPLIT_WINDOW_SECONDS) || 20);
 const POOL_NEXT_DEAL_COUNTDOWN_SECONDS = Math.max(5, Number(process.env.POOL_NEXT_DEAL_COUNTDOWN_SECONDS) || 10);
 const POOL_SPLIT_ENABLED = String(process.env.POOL_SPLIT_ENABLED || '').toLowerCase() === 'true';
+/** 101 split weights: `brackets` = client 0–20→5…81–100→1; `drops` = legacy drops-remaining. 201 always uses drops. */
+const POOL_SPLIT_WEIGHT_MODEL = String(process.env.POOL_SPLIT_WEIGHT_MODEL || 'brackets').trim().toLowerCase() === 'drops'
+  ? 'drops'
+  : 'brackets';
 const MAX_BONUS_ATTEMPTS_PER_PLAYER = 1;
 const MAX_ROUND_LOSS_POINTS = 80;
 const TURN_START_GRACE_MS = 1000;
@@ -887,10 +893,16 @@ function buildSessionPrizePoolFields(session = null) {
   const isEntryPotMode = isDealLikeMode(mode) || mode === 'pool';
   const entryFee = Number(session?.contest?.entry);
   const playerCount = resolveEntryPotPlayerCount(session);
+  const winningPercent = gameCommission.resolveSessionWinningCommissionPercent(
+    session,
+    commercialSettings.getGameCommissionPercentSync(),
+  );
+  const entrySplits = commercialSettings.listEntryDebitSplitsFromMetadata(session?.metadata || {});
 
   let totalEntry = null;
   let adminCommissionAmount = null;
   let winningBalance = null;
+  let adminCommissionPercent = null;
   if (isEntryPotMode && Number.isFinite(entryFee) && entryFee > 0 && playerCount > 0) {
     if (mode === 'spin_go') {
       const configuredWin = Number(session?.contest?.win_upto);
@@ -899,10 +911,16 @@ function buildSessionPrizePoolFields(session = null) {
         : null;
       totalEntry = roundCurrency(entryFee * playerCount);
       adminCommissionAmount = null;
+      adminCommissionPercent = null;
     } else {
       totalEntry = roundCurrency(entryFee * playerCount);
-      adminCommissionAmount = roundCurrency(totalEntry * 0.12);
+      if (entrySplits.length > 0) {
+        adminCommissionAmount = gameCommission.computeCommissionForDebitSplits(entrySplits, winningPercent);
+      } else {
+        adminCommissionAmount = gameCommission.computeFlatCommission(totalEntry, winningPercent);
+      }
       winningBalance = roundCurrency(totalEntry - adminCommissionAmount);
+      adminCommissionPercent = winningPercent;
     }
   }
 
@@ -912,7 +930,7 @@ function buildSessionPrizePoolFields(session = null) {
       player_count: playerCount,
       entry_fee: Number.isFinite(entryFee) ? roundCurrency(entryFee) : null,
       total_entry: totalEntry,
-      admin_commission_percent: mode === 'spin_go' ? null : (isEntryPotMode ? 12 : null),
+      admin_commission_percent: adminCommissionPercent,
       admin_commission_amount: adminCommissionAmount,
       winning_balance: winningBalance,
     },
@@ -2020,9 +2038,9 @@ function distributeByWeights(totalAmount, weightedRows = []) {
 }
 
 /**
- * Drops remaining = how many first-drop penalties fit under the pool limit
- * after the player's cumulative score (includes the round just finished).
- * Example 101 Pool: score 0 → 5, score 20 → 4, score 80 → 1.
+ * Legacy drops-remaining weight (201 Pool, or 101 when POOL_SPLIT_WEIGHT_MODEL=drops).
+ * Example 101: score 0 → 5, score 20 → 4, score 80 → 1.
+ * Example 201: score 0 → 8 (drop unit 25).
  */
 function resolvePoolSplitDropsRemaining(poolLimit, totalScore) {
   const safeLimit = Number(poolLimit) >= 201 ? 201 : 101;
@@ -2031,6 +2049,29 @@ function resolvePoolSplitDropsRemaining(poolLimit, totalScore) {
   if (score >= safeLimit) return 0;
   const remainingCapacity = Math.max(0, (safeLimit - 1) - score);
   return Math.floor(remainingCapacity / dropUnit);
+}
+
+/**
+ * Client 101 Pool weight brackets (finalized):
+ * 0–20 → 5, 21–40 → 4, 41–60 → 3, 61–80 → 2, 81–100 → 1, 101+ → out (0).
+ * 201 Pool always keeps legacy drops-remaining until a separate 201 table is defined.
+ */
+function resolvePoolSplitWeight(poolLimit, totalScore) {
+  const score = Math.max(0, Number(totalScore) || 0);
+  const safeLimit = Number(poolLimit) >= 201 ? 201 : 101;
+  if (score >= safeLimit) return 0;
+
+  if (safeLimit === 101 && POOL_SPLIT_WEIGHT_MODEL === 'brackets') {
+    if (score <= 20) return 5;
+    if (score <= 40) return 4;
+    if (score <= 60) return 3;
+    if (score <= 80) return 2;
+    return 1; // 81–100
+  }
+
+  // 201 (always) or 101 legacy rollback via POOL_SPLIT_WEIGHT_MODEL=drops
+  const dropsRemaining = resolvePoolSplitDropsRemaining(safeLimit, score);
+  return dropsRemaining > 0 ? dropsRemaining : 1;
 }
 
 function buildPoolSplitPlan(session = {}, roundProgress = {}, payload = null) {
@@ -2071,8 +2112,9 @@ function buildPoolSplitPlan(session = {}, roundProgress = {}, payload = null) {
     .map((userId) => {
       const player = playersByUser.get(userId) || {};
       const totalScore = Number(roundProgress?.scoresByUser?.[String(userId)]) || 0;
-      const dropsRemaining = resolvePoolSplitDropsRemaining(poolLimit, totalScore);
-      const splitWeight = dropsRemaining > 0 ? dropsRemaining : 0.5;
+      const splitWeight = resolvePoolSplitWeight(poolLimit, totalScore);
+      // Keep drops_remaining aligned with the share factor so existing UI stays consistent.
+      const dropsRemaining = splitWeight;
       return {
         user_id: userId,
         seat_no: Number(player?.seat_no) || 0,
@@ -5579,7 +5621,20 @@ async function settleGameResult(sessionId, finalizedResults, winnerUserId, point
     (sum, l) => sum + Math.round((Number(l.points) || 0) * numericPointValue * 100) / 100,
     0
   );
-  const totalCommission = Math.round(totalLossPool * 0.12 * 100) / 100;
+  // Points games: flat rake at session-locked / admin winning-wallet percent (default 12).
+  // Deposit vs winning differentiation applies on entry-pot modes where debit splits are stored at join.
+  let sessionMeta = {};
+  try {
+    const metaRes = await pool.query('SELECT metadata FROM game_sessions WHERE id = $1', [sessionId]);
+    sessionMeta = metaRes.rows[0]?.metadata || {};
+  } catch (_) {
+    sessionMeta = {};
+  }
+  const winningPercent = gameCommission.resolveSessionWinningCommissionPercent(
+    { metadata: sessionMeta },
+    commercialSettings.getGameCommissionPercentSync(),
+  );
+  const totalCommission = gameCommission.computeFlatCommission(totalLossPool, winningPercent);
   const totalWinnerPool = Math.round((totalLossPool - totalCommission) * 100) / 100;
   const winnerCount = winners.length;
   const winnerShare = winnerCount > 0 ? Math.round((totalWinnerPool / winnerCount) * 100) / 100 : 0;
@@ -5836,7 +5891,14 @@ async function settlePoolPotResult(session = {}, winnerUserId = null) {
   }
 
   const totalEntry = roundCurrency(entryFee * totalEntries);
-  const commissionAmount = roundCurrency(totalEntry * 0.12);
+  const winningPercent = gameCommission.resolveSessionWinningCommissionPercent(
+    session,
+    commercialSettings.getGameCommissionPercentSync(),
+  );
+  const entrySplits = commercialSettings.listEntryDebitSplitsFromMetadata(session?.metadata || {});
+  const commissionAmount = entrySplits.length > 0
+    ? gameCommission.computeCommissionForDebitSplits(entrySplits, winningPercent)
+    : gameCommission.computeFlatCommission(totalEntry, winningPercent);
   const winnerAmount = roundCurrency(totalEntry - commissionAmount);
   if (winnerAmount <= 0) {
     warnGame(sessionId, `Pool settlement skipped — winner amount non-positive (${winnerAmount})`);
@@ -5883,7 +5945,7 @@ async function settlePoolPotResult(session = {}, winnerUserId = null) {
             rejoin_entry_count: rejoinEntryCount,
             total_entries: totalEntries,
             total_entry: totalEntry,
-            commission_percent: 12,
+            commission_percent: winningPercent,
             commission_amount: commissionAmount,
           }),
         ]
@@ -5978,7 +6040,7 @@ async function settlePoolPotResult(session = {}, winnerUserId = null) {
       rejoin_entry_count: rejoinEntryCount,
       total_entries: totalEntries,
       total_entry: totalEntry,
-      commission_percent: 12,
+      commission_percent: winningPercent,
       commission_amount: commissionAmount,
       winner_gain: winnerAmount,
       per_player: [
@@ -6157,7 +6219,14 @@ async function settleDealsPotResult(session = {}, finalizedResults = [], winnerU
   }
 
   const totalEntry = roundCurrency(entryFee * playerCount);
-  const totalCommission = roundCurrency(totalEntry * 0.12);
+  const winningPercent = gameCommission.resolveSessionWinningCommissionPercent(
+    session,
+    commercialSettings.getGameCommissionPercentSync(),
+  );
+  const entrySplits = commercialSettings.listEntryDebitSplitsFromMetadata(session?.metadata || {});
+  const totalCommission = entrySplits.length > 0
+    ? gameCommission.computeCommissionForDebitSplits(entrySplits, winningPercent)
+    : gameCommission.computeFlatCommission(totalEntry, winningPercent);
   const totalWinnerPool = roundCurrency(totalEntry - totalCommission);
   if (totalWinnerPool <= 0) {
     warnGame(sessionId, `Deals settlement skipped — winner pool non-positive (${totalWinnerPool})`);
@@ -6243,7 +6312,7 @@ async function settleDealsPotResult(session = {}, finalizedResults = [], winnerU
             entry_fee: entryFee,
             player_count: playerCount,
             total_entry: totalEntry,
-            commission_percent: 12,
+            commission_percent: winningPercent,
             commission_amount: entry.commission,
             total_commission: totalCommission,
             tied_winner_count: winnerCount,
@@ -6326,7 +6395,7 @@ async function settleDealsPotResult(session = {}, finalizedResults = [], winnerU
       entry_fee: entryFee,
       player_count: playerCount,
       total_entry: totalEntry,
-      commission_percent: 12,
+      commission_percent: winningPercent,
       commission_amount: totalCommission,
       per_player: perPlayer.map((p) => ({
         user_id: p.user_id,
@@ -6546,7 +6615,7 @@ async function processPoolRejoinRequest({ sessionId, userId }) {
       throw err;
     }
 
-    const sessionMetadata = sessionRow.metadata || {};
+    let sessionMetadata = sessionRow.metadata || {};
     const mode = resolveSessionGameMode({
       metadata: sessionMetadata,
       game: { name: sessionRow.game_name },
@@ -6647,6 +6716,13 @@ async function processPoolRejoinRequest({ sessionId, userId }) {
         err.details = { required: entryFee, available: debitSplit.available };
         throw err;
       }
+      const lockResult = commercialSettings.lockWinningCommissionOnMetadata(
+        sessionMetadata,
+        commercialSettings.getGameCommissionPercentSync(),
+      );
+      sessionMetadata = lockResult.metadata;
+      const winningPercent = lockResult.locked_winning_commission_percent;
+      const commissionMeta = gameCommission.buildCommissionMetaFromSplit(debitSplit, winningPercent);
       const nextDeposit = debitSplit.nextDeposit;
       const nextReleasedBonus = debitSplit.nextReleasedBonus;
       const nextWithdrawable = debitSplit.nextWithdrawable;
@@ -6674,8 +6750,18 @@ async function processPoolRejoinRequest({ sessionId, userId }) {
           entry_fee: entryFee,
           rejoin_score: rejoinScore,
           rejoin_threshold: rejoinContext.rejoin_threshold ?? null,
+          ...commissionMeta,
         })]
       );
+      sessionMetadata = commercialSettings.mergeEntryDebitSplitOnMetadata(sessionMetadata, userId, {
+        ...commissionMeta,
+        entry_fee: entryFee,
+        actualDebit: debitSplit.actualDebit,
+        debitFromDeposit: debitSplit.debitFromDeposit,
+        debitFromReleased: debitSplit.debitFromReleased,
+        debitFromWithdrawable: debitSplit.debitFromWithdrawable,
+        reason: 'pool_rejoin_entry_debit',
+      });
     }
 
     const nextPoolEliminatedUserIds = poolEliminatedUserIds.filter((id) => Number(id) !== Number(userId));
@@ -15455,6 +15541,7 @@ module.exports = {
     isBotPoolDropBlockedByScore,
     resolvePoolBotDropBlockScore,
     resolvePoolSplitDropsRemaining,
+    resolvePoolSplitWeight,
     buildPoolSplitPlan,
     evaluateAdminProfitProtection,
     shouldBotAcceptSplitOffer,

@@ -26,6 +26,9 @@ function computeWalletDebitSplit(wallet = {}, amount = 0) {
   return {
     available,
     actualDebit,
+    debitFromDeposit,
+    debitFromReleased,
+    debitFromWithdrawable,
     nextDeposit: roundCurrency(deposit - debitFromDeposit),
     nextReleasedBonus: roundCurrency(releasedBonus - debitFromReleased),
     nextWithdrawable: roundCurrency(withdrawable - debitFromWithdrawable),

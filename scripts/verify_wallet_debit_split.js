@@ -9,6 +9,15 @@ function run(label, wallet, amount, expect) {
     assert.strictEqual(got.nextDeposit, expect.nextDeposit, `${label} nextDeposit`);
     assert.strictEqual(got.nextReleasedBonus, expect.nextReleasedBonus, `${label} nextReleasedBonus`);
     assert.strictEqual(got.nextWithdrawable, expect.nextWithdrawable, `${label} nextWithdrawable`);
+    if (expect.debitFromDeposit != null) {
+      assert.strictEqual(got.debitFromDeposit, expect.debitFromDeposit, `${label} debitFromDeposit`);
+    }
+    if (expect.debitFromReleased != null) {
+      assert.strictEqual(got.debitFromReleased, expect.debitFromReleased, `${label} debitFromReleased`);
+    }
+    if (expect.debitFromWithdrawable != null) {
+      assert.strictEqual(got.debitFromWithdrawable, expect.debitFromWithdrawable, `${label} debitFromWithdrawable`);
+    }
   } catch (e) {
     console.error(label, 'got', got, 'expect', expect);
     throw e;
@@ -19,6 +28,9 @@ function run(label, wallet, amount, expect) {
 run('deposit-only', { deposit: 50, released_bonus: 30, withdrawable: 20 }, 40, {
   available: 100,
   actualDebit: 40,
+  debitFromDeposit: 40,
+  debitFromReleased: 0,
+  debitFromWithdrawable: 0,
   nextDeposit: 10,
   nextReleasedBonus: 30,
   nextWithdrawable: 20,
@@ -28,6 +40,9 @@ run('deposit-only', { deposit: 50, released_bonus: 30, withdrawable: 20 }, 40, {
 run('deposit-then-released', { deposit: 10, released_bonus: 25, withdrawable: 5 }, 30, {
   available: 40,
   actualDebit: 30,
+  debitFromDeposit: 10,
+  debitFromReleased: 20,
+  debitFromWithdrawable: 0,
   nextDeposit: 0,
   nextReleasedBonus: 5,
   nextWithdrawable: 5,
@@ -37,6 +52,9 @@ run('deposit-then-released', { deposit: 10, released_bonus: 25, withdrawable: 5 
 run('three-bucket', { deposit: 5, released_bonus: 7, withdrawable: 11 }, 20, {
   available: 23,
   actualDebit: 20,
+  debitFromDeposit: 5,
+  debitFromReleased: 7,
+  debitFromWithdrawable: 8,
   nextDeposit: 0,
   nextReleasedBonus: 0,
   nextWithdrawable: 3,
@@ -46,6 +64,9 @@ run('three-bucket', { deposit: 5, released_bonus: 7, withdrawable: 11 }, 20, {
 run('capped-debit', { deposit: 1, released_bonus: 1, withdrawable: 1 }, 100, {
   available: 3,
   actualDebit: 3,
+  debitFromDeposit: 1,
+  debitFromReleased: 1,
+  debitFromWithdrawable: 1,
   nextDeposit: 0,
   nextReleasedBonus: 0,
   nextWithdrawable: 0,
@@ -55,6 +76,9 @@ run('capped-debit', { deposit: 1, released_bonus: 1, withdrawable: 1 }, 100, {
 run('zero-amount', { deposit: 10, released_bonus: 0, withdrawable: 0 }, 0, {
   available: 10,
   actualDebit: 0,
+  debitFromDeposit: 0,
+  debitFromReleased: 0,
+  debitFromWithdrawable: 0,
   nextDeposit: 10,
   nextReleasedBonus: 0,
   nextWithdrawable: 0,
@@ -64,6 +88,9 @@ run('zero-amount', { deposit: 10, released_bonus: 0, withdrawable: 0 }, 0, {
 run('no-deposit', { deposit: 0, released_bonus: 15, withdrawable: 10 }, 20, {
   available: 25,
   actualDebit: 20,
+  debitFromDeposit: 0,
+  debitFromReleased: 15,
+  debitFromWithdrawable: 5,
   nextDeposit: 0,
   nextReleasedBonus: 0,
   nextWithdrawable: 5,

@@ -9,6 +9,7 @@ const supportLinkModel = require('../models/supportLink.model');
 const stateModel = require('../models/state.model');
 const maintenanceModeModel = require('../models/maintenanceMode.model');
 const botInjectionSettingsService = require('./botInjectionSettings.service');
+const commercialSettingsService = require('./commercialSettings.service');
 const appUpdateConfigModel = require('../models/appUpdateConfig.model');
 const appUpdateBuildModel = require('../models/appUpdateBuild.model');
 const notificationService = require('./notification.service');
@@ -1550,6 +1551,20 @@ async function updateBotInjectionSettingsForAdmin({
   });
 }
 
+async function getCommercialSettingsForAdmin() {
+  return commercialSettingsService.getCommercialSettingsForAdmin();
+}
+
+async function updateCommercialSettingsForAdmin({
+  gameCommissionPercent,
+  updatedBy,
+}) {
+  return commercialSettingsService.updateCommercialSettingsForAdmin({
+    game_commission_percent: gameCommissionPercent,
+    updatedBy: updatedBy == null ? null : normalizeIntegerFilter(updatedBy, 'INVALID_UPDATED_BY_ADMIN_ID'),
+  });
+}
+
 async function updateMaintenanceModeForAdmin({
   enabled,
   message,
@@ -1576,7 +1591,7 @@ async function updateMaintenanceModeForAdmin({
 }
 
 async function getAppSettingsForAdmin() {
-  const [avatars, states, addCashOptions, withdrawOptions, faqs, supports, maintenanceMode, botInjection] = await Promise.all([
+  const [avatars, states, addCashOptions, withdrawOptions, faqs, supports, maintenanceMode, botInjection, commercial] = await Promise.all([
     avatarModel.getAll(),
     stateModel.getActiveForConfig(),
     addCashOptionModel.getAllForAdmin(),
@@ -1585,6 +1600,7 @@ async function getAppSettingsForAdmin() {
     supportLinkModel.getAllForAdmin(),
     maintenanceModeModel.getCurrent(),
     botInjectionSettingsService.getBotInjectionSettingsForAdmin(),
+    commercialSettingsService.getCommercialSettingsForAdmin(),
   ]);
 
   return {
@@ -1597,6 +1613,7 @@ async function getAppSettingsForAdmin() {
       supports,
       maintenanceMode: toMaintenanceResponse(maintenanceMode),
       botInjection: botInjection?.bot_injection || null,
+      commercialSettings: commercial?.commercial_settings || null,
     },
   };
 }
@@ -3340,6 +3357,7 @@ module.exports = {
   getAppSettingsForAdmin,
   getMaintenanceModeForAdmin,
   getBotInjectionSettingsForAdmin,
+  getCommercialSettingsForAdmin,
   getRechargeDetailsForAdmin,
   listWithdrawalsForAdmin,
   getWithdrawalDetailsForAdmin,
@@ -3358,6 +3376,7 @@ module.exports = {
   updateAppUpdateConfigForAdmin,
   updateMaintenanceModeForAdmin,
   updateBotInjectionSettingsForAdmin,
+  updateCommercialSettingsForAdmin,
   listRechargesForAdmin,
   listWalletTransactionsForAdmin,
   listGamesHistoryForAdmin,

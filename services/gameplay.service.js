@@ -2,7 +2,9 @@ const crypto = require('crypto');
 const gameModel = require('../models/game.model');
 const gameSessionModel = require('../models/gameSession.model');
 const walletModel = require('../models/wallet.model');
-const { computeWalletDebitSplit } = require('./walletDebitSplit');
+const { computeWalletDebitSplit, roundCurrency } = require('./walletDebitSplit');
+const gameCommission = require('./gameCommission.service');
+const commercialSettings = require('./commercialSettings.service');
 const { buildPoolSessionPrizePoolFields } = require('./poolPrizePool.service');
 const sessionCache = require('./sessionCache.service');
 const liveSessionState = require('./liveSessionState.service');
@@ -147,10 +149,6 @@ function buildSessionModeMetadata({ metadata = {}, game = null }) {
   return nextMetadata;
 }
 
-function roundCurrency(value) {
-  return Math.round((Number(value) || 0) * 100) / 100;
-}
-
 function resolveEntryPotPlayerCount({ mode = null, players = [], maxPlayers = null } = {}) {
   if (mode === 'deals_2') {
     const seats = Number(maxPlayers);
@@ -171,10 +169,17 @@ function buildSessionPrizePoolFields({ mode = null, contest = null, players = []
   const isEntryPotMode = mode === 'deals_2' || mode === 'spin_go' || mode === 'pool';
   const entryFee = Number(contest?.entry);
   const playerCount = resolveEntryPotPlayerCount({ mode, players, maxPlayers });
+  const sessionLike = { metadata: metadata || {}, contest, players, max_players: maxPlayers };
+  const winningPercent = gameCommission.resolveSessionWinningCommissionPercent(
+    sessionLike,
+    commercialSettings.getGameCommissionPercentSync(),
+  );
+  const entrySplits = commercialSettings.listEntryDebitSplitsFromMetadata(metadata || {});
 
   let totalEntry = null;
   let adminCommissionAmount = null;
   let winningBalance = null;
+  let adminCommissionPercent = null;
 
   if (isEntryPotMode && Number.isFinite(entryFee) && entryFee > 0 && playerCount > 0) {
     if (mode === 'spin_go') {
@@ -184,10 +189,16 @@ function buildSessionPrizePoolFields({ mode = null, contest = null, players = []
         : null;
       totalEntry = roundCurrency(entryFee * playerCount);
       adminCommissionAmount = null;
+      adminCommissionPercent = null;
     } else {
       totalEntry = roundCurrency(entryFee * playerCount);
-      adminCommissionAmount = roundCurrency(totalEntry * 0.12);
+      if (entrySplits.length > 0) {
+        adminCommissionAmount = gameCommission.computeCommissionForDebitSplits(entrySplits, winningPercent);
+      } else {
+        adminCommissionAmount = gameCommission.computeFlatCommission(totalEntry, winningPercent);
+      }
       winningBalance = roundCurrency(totalEntry - adminCommissionAmount);
+      adminCommissionPercent = winningPercent;
     }
   }
 
@@ -197,7 +208,7 @@ function buildSessionPrizePoolFields({ mode = null, contest = null, players = []
       player_count: playerCount,
       entry_fee: Number.isFinite(entryFee) ? roundCurrency(entryFee) : null,
       total_entry: totalEntry,
-      admin_commission_percent: mode === 'spin_go' ? null : (isEntryPotMode ? 12 : null),
+      admin_commission_percent: adminCommissionPercent,
       admin_commission_amount: adminCommissionAmount,
       winning_balance: winningBalance,
     },
@@ -258,6 +269,11 @@ async function debitJoinEntryForDeals({ session, userId, contest }) {
     const nextReleasedBonus = debitSplit.nextReleasedBonus;
     const nextWithdrawable = debitSplit.nextWithdrawable;
     const nextTotal = roundCurrency(Number(wallet?.total_balance || 0) - entryFee);
+    const winningPercent = gameCommission.resolveSessionWinningCommissionPercent(
+      session,
+      commercialSettings.getGameCommissionPercentSync(),
+    );
+    const commissionMeta = gameCommission.buildCommissionMetaFromSplit(debitSplit, winningPercent);
 
     await client.query(
       `UPDATE wallets
@@ -281,6 +297,7 @@ async function debitJoinEntryForDeals({ session, userId, contest }) {
         session_id: session.id,
         contest_id: session.contest_id,
         entry_fee: entryFee,
+        ...commissionMeta,
       })]
     );
 
@@ -289,6 +306,8 @@ async function debitJoinEntryForDeals({ session, userId, contest }) {
       amount: entryFee,
       remaining_deposit: nextDeposit,
       remaining_total_balance: nextTotal,
+      debit_split: debitSplit,
+      commission_meta: commissionMeta,
     };
   } catch (err) {
     await client.query('ROLLBACK');

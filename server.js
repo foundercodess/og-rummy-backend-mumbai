@@ -21,6 +21,7 @@ const {
   getHotpathSnapshot,
 } = require('./realtime/runtimeObservability');
 const { startBotInjectionSettingsPoller } = require('./services/botInjectionSettings.service');
+const { startCommercialSettingsPoller } = require('./services/commercialSettings.service');
 const durableTimer = require('./services/durableTimer.service');
 const groupingAsync = require('./services/groupingAsync.service');
 const liveSessionState = require('./services/liveSessionState.service');
@@ -216,6 +217,7 @@ setSocketStatsProvider(() => getSocketRuntimeStats(io));
 startRuntimeObservability();
 groupingAsync.ensureStarted();
 startBotInjectionSettingsPoller();
+startCommercialSettingsPoller();
 startBotEngine(io);
 startStaleSessionCleanupCron();
 startWithdrawalPayoutSyncCron();

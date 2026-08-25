@@ -194,6 +194,23 @@ async function findByViewId(viewId) {
   return result.rows[0] || null;
 }
 
+/** Exact name match for humans only (case-insensitive). Used for admin wallet credit lookup. */
+async function findHumansByExactName(name) {
+  const normalized = name == null ? '' : String(name).trim();
+  if (!normalized) return [];
+  const result = await query(
+    `SELECT *
+     FROM users u
+     WHERE ${HUMAN_USERS_WHERE}
+       AND u.name IS NOT NULL
+       AND LOWER(TRIM(u.name)) = LOWER($1)
+     ORDER BY u.id ASC
+     LIMIT 11`,
+    [normalized]
+  );
+  return result.rows;
+}
+
 async function verifyOtpAndMarkVerified(phone, name = null, viewId = null, avatar = null) {
   const updates = ['otp = NULL', 'otp_expires_at = NULL', 'is_verified = TRUE', 'updated_at = NOW()'];
   const params = [phone];
@@ -270,6 +287,7 @@ module.exports = {
   HUMAN_USERS_WHERE,
   findById,
   findByViewId,
+  findHumansByExactName,
   getAll,
   getAllPaginated,
   findByPhone,

@@ -54,6 +54,7 @@ router.get('/wallet/withdrawals/:withdrawalId', ...P('withdrawals.read'), adminC
 router.post('/wallet/withdrawals/:withdrawalId/settle', ...P('withdrawals.write'), adminController.settleWithdrawal);
 router.post('/wallet/withdrawals/:withdrawalId/reject', ...P('withdrawals.write'), adminController.rejectWithdrawal);
 router.post('/wallet/withdrawals/:withdrawalId/sync-status', ...P('withdrawals.write'), adminController.syncWithdrawalStatus);
+router.post('/wallet/credit/lookup', ...P('users.write'), adminController.lookupWalletCreditUser);
 router.post('/wallet/credit', ...P('users.write'), adminController.creditWalletByViewId);
 
 // Admin: support queues
@@ -73,6 +74,9 @@ router.patch('/maintenance-mode', ...P('app_settings.write'), adminController.up
 
 router.get('/bot-injection', ...P('app_settings.read'), adminController.getBotInjectionSettings);
 router.patch('/bot-injection', ...P('app_settings.write'), adminController.updateBotInjectionSettings);
+
+router.get('/commercial-settings', ...P('app_settings.read'), adminController.getCommercialSettings);
+router.patch('/commercial-settings', ...P('app_settings.write'), adminController.updateCommercialSettings);
 
 // Admin: unified app settings (includes disabled records)
 router.get('/app-settings', ...P('app_settings.read'), adminController.getAppSettings);

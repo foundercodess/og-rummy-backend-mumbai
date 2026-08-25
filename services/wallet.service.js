@@ -779,19 +779,114 @@ async function listTransactionDetails({ userId, limit = 50, offset = 0, fromDate
   return rows.map(mapWalletTransactionForDetails);
 }
 
-async function creditWalletByAdmin({
-  viewId,
-  amount,
-  adminId = null,
-  reason = null,
-}) {
-  const normalizedViewId = viewId == null ? '' : String(viewId).trim();
-  if (!/^\d{6}$/.test(normalizedViewId)) {
-    const err = new Error('view_id must be a 6-digit View ID');
-    err.code = 'INVALID_VIEW_ID';
+async function toPublicCreditUser(user) {
+  if (!user) return null;
+  return {
+    id: user.id,
+    name: user.name || null,
+    phone: user.phone || null,
+    view_id: user.view_id || null,
+  };
+}
+
+/**
+ * Resolve a unique human user for admin wallet credit from a single query field.
+ * Matching rules (first match wins by type):
+ * - exactly 6 digits → View ID
+ * - 10–15 digits (after stripping non-digits) → phone
+ * - otherwise → exact display name (case-insensitive); must be unique
+ */
+async function resolveUserForAdminCredit(query) {
+  const raw = query == null ? '' : String(query).trim();
+  if (!raw) {
+    const err = new Error('Enter a View ID, mobile number, or exact user name');
+    err.code = 'INVALID_QUERY';
     throw err;
   }
 
+  const digitsOnly = raw.replace(/\D/g, '');
+
+  if (/^\d{6}$/.test(raw)) {
+    const user = await userModel.findByViewId(raw);
+    if (!user || user.is_bot) {
+      const err = new Error('No user found for this View ID');
+      err.code = 'USER_NOT_FOUND';
+      throw err;
+    }
+    return { user, matched_by: 'view_id' };
+  }
+
+  const looksLikePhone =
+    digitsOnly.length >= 10 &&
+    digitsOnly.length <= 15 &&
+    /^[+]?[\d\s\-()]+$/.test(raw);
+
+  if (looksLikePhone) {
+    const candidates = [digitsOnly];
+    if (digitsOnly.length > 10) {
+      candidates.push(digitsOnly.slice(-10));
+    }
+    let user = null;
+    for (const phone of candidates) {
+      // eslint-disable-next-line no-await-in-loop
+      user = await userModel.findByPhone(phone);
+      if (user && !user.is_bot) break;
+      user = null;
+    }
+    if (!user) {
+      const err = new Error('No user found for this mobile number');
+      err.code = 'USER_NOT_FOUND';
+      throw err;
+    }
+    return { user, matched_by: 'phone' };
+  }
+
+  if (raw.length < 2 || raw.length > 80) {
+    const err = new Error('Name must be between 2 and 80 characters');
+    err.code = 'INVALID_QUERY';
+    throw err;
+  }
+
+  const matches = await userModel.findHumansByExactName(raw);
+  if (matches.length === 0) {
+    const err = new Error('No user found with that exact name');
+    err.code = 'USER_NOT_FOUND';
+    throw err;
+  }
+  if (matches.length > 1) {
+    const err = new Error(
+      'Multiple users share this name. Use mobile number or View ID instead.'
+    );
+    err.code = 'AMBIGUOUS_USER';
+    err.candidates = matches.slice(0, 5).map((u) => ({
+      id: u.id,
+      name: u.name || null,
+      phone: u.phone || null,
+      view_id: u.view_id || null,
+    }));
+    throw err;
+  }
+
+  return { user: matches[0], matched_by: 'name' };
+}
+
+async function lookupUserForAdminCredit(query) {
+  const { user, matched_by } = await resolveUserForAdminCredit(query);
+  return {
+    user: await toPublicCreditUser(user),
+    matched_by,
+  };
+}
+
+async function creditWalletByAdmin({
+  viewId = null,
+  query = null,
+  userId = null,
+  amount,
+  adminId = null,
+  reason = null,
+  matchedBy = null,
+}) {
   const creditAmount = roundCurrency(amount);
   if (!Number.isFinite(creditAmount) || creditAmount <= 0) {
     const err = new Error('amount must be a positive number');
@@ -799,11 +894,41 @@ async function creditWalletByAdmin({
     throw err;
   }
 
-  const user = await userModel.findByViewId(normalizedViewId);
-  if (!user) {
-    const err = new Error('User not found for this View ID');
-    err.code = 'USER_NOT_FOUND';
-    throw err;
+  let user = null;
+  let resolvedMatchedBy = matchedBy || null;
+
+  if (userId != null && String(userId).trim() !== '') {
+    const uid = Number(userId);
+    if (!Number.isInteger(uid) || uid <= 0) {
+      const err = new Error('user_id must be a positive integer');
+      err.code = 'INVALID_USER_ID';
+      throw err;
+    }
+    user = await userModel.findById(uid);
+    if (!user || user.is_bot) {
+      const err = new Error('User not found');
+      err.code = 'USER_NOT_FOUND';
+      throw err;
+    }
+    resolvedMatchedBy = resolvedMatchedBy || 'user_id';
+  } else if (viewId != null && String(viewId).trim() !== '') {
+    const normalizedViewId = String(viewId).trim();
+    if (!/^\d{6}$/.test(normalizedViewId)) {
+      const err = new Error('view_id must be a 6-digit View ID');
+      err.code = 'INVALID_VIEW_ID';
+      throw err;
+    }
+    user = await userModel.findByViewId(normalizedViewId);
+    if (!user || user.is_bot) {
+      const err = new Error('User not found for this View ID');
+      err.code = 'USER_NOT_FOUND';
+      throw err;
+    }
+    resolvedMatchedBy = 'view_id';
+  } else {
+    const resolved = await resolveUserForAdminCredit(query);
+    user = resolved.user;
+    resolvedMatchedBy = resolved.matched_by;
   }
 
   const client = await pool.connect();
@@ -858,10 +983,11 @@ async function creditWalletByAdmin({
         walletRow.id,
         creditAmount,
         JSON.stringify({
-          view_id: normalizedViewId,
+          view_id: user.view_id || null,
           admin_id: adminId,
           reason: reason || null,
           credited_to: 'deposit',
+          matched_by: resolvedMatchedBy,
         }),
       ]
     );
@@ -892,15 +1018,11 @@ async function creditWalletByAdmin({
     }
 
     return {
-      user: {
-        id: user.id,
-        name: user.name,
-        phone: user.phone,
-        view_id: user.view_id,
-      },
+      user: await toPublicCreditUser(user),
       wallet,
       transaction: ledgerRes.rows[0],
       credited_amount: creditAmount,
+      matched_by: resolvedMatchedBy,
     };
   } catch (err) {
     await client.query('ROLLBACK');
@@ -997,6 +1119,7 @@ module.exports = {
   listUserTransactions,
   listPendingBonusTransactions,
   listTransactionDetails,
+  lookupUserForAdminCredit,
   creditWalletByAdmin,
   ensureLoadTestFunds,
 };
