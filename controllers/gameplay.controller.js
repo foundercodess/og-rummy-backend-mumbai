@@ -8,7 +8,7 @@ function handleGameplayError(res, err) {
       ...(err.details && { details: err.details }),
     });
   }
-  if (['CONTEST_INACTIVE', 'SESSION_NOT_JOINABLE', 'SESSION_FULL', 'SESSION_PHASE_LOCKED', 'SESSION_ACCESS_DENIED', 'PLAYER_LEFT_TABLE', 'INSUFFICIENT_BALANCE', 'MAX_CONCURRENT_TABLES', 'SESSION_JOIN_BUSY'].includes(err.code)) {
+  if (['CONTEST_INACTIVE', 'GAME_ENGINE_NOT_READY', 'SESSION_NOT_JOINABLE', 'SESSION_FULL', 'SESSION_PHASE_LOCKED', 'SESSION_ACCESS_DENIED', 'PLAYER_LEFT_TABLE', 'INSUFFICIENT_BALANCE', 'MAX_CONCURRENT_TABLES', 'SESSION_JOIN_BUSY'].includes(err.code)) {
     return res.status(400).json({
       success: false,
       message: err.message,

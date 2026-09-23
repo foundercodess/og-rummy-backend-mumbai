@@ -1,6 +1,6 @@
 const gameModel = require('../models/game.model');
 
-const ALLOWED_PLAY_TYPES = new Set([2, 3, 4, 6]);
+const ALLOWED_PLAY_TYPES = new Set([2, 3, 4, 5, 6]);
 const POINTS_DIVISOR = 80;
 const DEFAULT_SPIN_GO_MULTIPLIER = 10;
 
@@ -40,6 +40,7 @@ function normalizeGameKey(gameName) {
   if (normalized === '101 pool' || normalized === '201 pool') return 'pool';
   if (normalized === 'deals') return 'deals';
   if (normalized === 'spin & go') return 'spin_go';
+  if (normalized === 'teen patti' || normalized === 'teenpatti') return 'teen_patti';
   return 'unsupported';
 }
 
@@ -124,6 +125,11 @@ function buildContestConfig(game, payload, sortOrder) {
       throw err;
     }
     winUpto = formatNumber(entryFee * multiplierX);
+  } else if (gameKey === 'teen_patti') {
+    expectedPlayTypes = [2, 5];
+    defaultPlayerCounts = [2, 5];
+    allowedPlayerCounts = [2, 5];
+    winUpto = formatNumber(entryFee * 128);
   }
 
   const playTypes = normalizePlayTypes(payload.play_types, expectedPlayTypes);
@@ -169,6 +175,7 @@ function shapeGamesResponse(rows) {
       gamesMap.set(gid, {
         id: gid,
         name: row.name,
+        game_family: row.game_family || 'rummy',
         dashboard_banner: row.dashboard_banner,
         side_banner: row.side_banner,
         badge: row.badge,

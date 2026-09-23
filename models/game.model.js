@@ -38,6 +38,7 @@ async function getAllWithContests(options = {}) {
     SELECT 
       g.id AS game_id,
       g.name,
+      g.game_family,
       g.dashboard_banner,
       g.side_banner,
       g.badge,
@@ -88,7 +89,7 @@ async function updateContestActive(contestId, active) {
 
 async function findGameById(gameId) {
   const result = await query(
-    'SELECT id, name, active FROM games WHERE id = $1',
+    'SELECT id, name, active, game_family FROM games WHERE id = $1',
     [gameId]
   );
   return result.rows[0] || null;

@@ -14,6 +14,8 @@ function main() {
   assert(adapter.supportsSession({ game: { name: 'Deals' } }) === true, 'Expected Deals to be supported');
   assert(adapter.supportsSession({ game: { name: 'Spin & Go' } }) === true, 'Expected Spin & Go to be supported');
   assert(adapter.supportsSession({ game: { name: 'Practice' } }) === true, 'Expected Practice to be supported');
+  assert(adapter.supportsSession({ game: { name: 'Teen Patti' } }) === false, 'Expected Teen Patti to be unsupported');
+  assert(adapter.supportsSession({ game: { name: 'Teen Patti Practice' } }) === false, 'Expected Teen Patti Practice to be unsupported');
   assert(adapter.supportsSession({ game: { name: '' } }) === false, 'Expected empty game name to be unsupported');
   assert(adapter.supportsSession({}) === false, 'Expected missing game object to be unsupported');
 

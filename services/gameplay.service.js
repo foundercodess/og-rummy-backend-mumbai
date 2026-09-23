@@ -10,6 +10,7 @@ const sessionCache = require('./sessionCache.service');
 const liveSessionState = require('./liveSessionState.service');
 const redisLockService = require('./redisLock.service');
 const { pool, withTransaction } = require('../db');
+const { assertTeenPattiEngineReady, resolveGameFamily, isTeenPattiGame, isTeenPattiSession } = require('./gameFamily');
 
 function createSessionCode() {
   return crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -32,6 +33,9 @@ function resolveMaxConcurrentTables() {
  */
 async function assertUnderConcurrentTableCap(userId, options = {}) {
   if (options.skipCap === true) return;
+  await vacateUnrejoinableTeenPattiSeats(userId, {
+    excludeSessionId: options.excludeSessionId,
+  });
   const max = resolveMaxConcurrentTables();
   const count = await gameSessionModel.countConcurrentTablesForUser(userId, {
     excludeSessionId: options.excludeSessionId,
@@ -126,6 +130,10 @@ function buildSessionModeMetadata({ metadata = {}, game = null }) {
   const nextMetadata = {
     ...(metadata || {}),
     game_mode: mode,
+    game_family: resolveGameFamily({
+      ...game,
+      game_family: metadata.game_family || game?.game_family,
+    }),
   };
 
   if (mode === 'deals_2' || mode === 'spin_go') {
@@ -615,6 +623,7 @@ async function getGameAndContestData(gameId, contestId) {
   const game = {
     id: gameBase.game_id,
     name: gameBase.name,
+    game_family: gameBase.game_family || resolveGameFamily(gameBase),
     dashboard_banner: gameBase.dashboard_banner,
     side_banner: gameBase.side_banner,
     badge: gameBase.badge,
@@ -671,6 +680,9 @@ async function createSession({ gameId, contestId, hostUserId, maxPlayers, metada
     throw error;
   }
 
+  // Teen Patti must not enter the rummy pregame/deal path.
+  assertTeenPattiEngineReady(game);
+
   // Validate host has enough balance before any seat allocation.
   await checkSufficientBalance(hostUserId, contest);
 
@@ -696,6 +708,17 @@ async function createSession({ gameId, contestId, hostUserId, maxPlayers, metada
     ? requestedMax
     : normalizedContestPlayerCount);
   const sessionMetadata = buildSessionModeMetadata({ metadata, game });
+  if (isTeenPattiGame(game)) {
+    const boot = Number(String(contest.entry || '0').replace(/[₹,]/g, '')) || 10;
+    sessionMetadata.game_family = 'teenpatti';
+    sessionMetadata.game_mode = 'classic';
+    sessionMetadata.teenpatti = {
+      phase: 'waiting',
+      boot,
+      pot: 0,
+      players: [],
+    };
+  }
   if (isPracticeGame) {
     sessionMetadata.practice_bot_only = true;
     sessionMetadata.allowed_user_ids = [hostUserId];
@@ -809,9 +832,32 @@ async function joinSession({ sessionIdOrCode, userId, skipBalanceCheck = false }
 
   const existingPlayer = await gameSessionModel.findPlayer(session.id, userId);
   if (existingPlayer) {
+    if (isTeenPattiSession(session) || isTeenPattiGame(session.game || {
+      game_family: session.metadata?.game_family,
+      name: session.game_name,
+    })) {
+      const status = String(existingPlayer.status || '').toLowerCase();
+      const meta = existingPlayer.metadata || {};
+      const leftSeat = meta.table_left === true
+        || status === 'left'
+        || meta.pending_rejoin_opt_out === true;
+      const wasDisconnected = status === 'disconnected'
+        || String(meta.connection_status || '').toLowerCase() === 'disconnected';
+      if (leftSeat || wasDisconnected) {
+        const error = new Error('Teen Patti tables cannot be rejoined after leaving or closing the app');
+        error.code = 'TP_NO_REJOIN';
+        throw error;
+      }
+    }
     // Player is reconnecting — no balance re-check / concurrent-cap needed.
     return getSessionState(session.id);
   }
+
+  const { game: joinedGame } = await getGameAndContestData(session.game_id, session.contest_id);
+  assertTeenPattiEngineReady(joinedGame || {
+    name: session.game_name,
+    game_family: session.metadata?.game_family,
+  });
 
   // New seat: enforce multi-table cap (bots / load-test can skip).
   const skipConcurrentCap = skipBalanceCheck === true
@@ -1098,7 +1144,9 @@ async function getPendingRejoinSessions(userId, options = {}) {
   const states = [];
   for (const row of rows) {
     const state = await getSessionState(row.id);
-    if (state) states.push(state);
+    if (!state) continue;
+    if (isTeenPattiSession(state)) continue;
+    states.push(state);
   }
   return states;
 }
@@ -1481,6 +1529,78 @@ async function recordExplicitTableLeave({
   });
 
   return getSessionState(sourceSession.id);
+}
+
+/**
+ * Teen Patti cannot be rejoined, but leftover waiting/disconnected seats still
+ * occupied the rummy 3-table cap. Drop those seats before counting.
+ */
+async function vacateUnrejoinableTeenPattiSeats(userId, options = {}) {
+  const excludeSessionId = options.excludeSessionId != null
+    ? Number(options.excludeSessionId)
+    : null;
+  const rows = await gameSessionModel.listConcurrentSessionsForUser(userId, { limit: 10 });
+  for (const row of rows) {
+    if (Number.isFinite(excludeSessionId) && Number(row.id) === excludeSessionId) {
+      continue;
+    }
+    const state = await getSessionState(row.id);
+    if (!state || !isTeenPattiSession(state)) continue;
+
+    const player = (state.players || []).find(
+      (item) => Number(item.user_id) === Number(userId)
+    );
+    if (!player) continue;
+
+    const playerStatus = String(player.status || '').toLowerCase();
+    const sessionStatus = String(state.status || '').toLowerCase();
+    const disconnected = playerStatus === 'disconnected'
+      || String(player.metadata?.connection_status || '').toLowerCase() === 'disconnected';
+    const waitingAbandoned = sessionStatus === 'waiting' || sessionStatus === 'ready';
+    if (!disconnected && !waitingAbandoned && playerStatus !== 'eliminated') {
+      continue;
+    }
+
+    try {
+      await recordExplicitTableLeave({
+        sourceSessionId: state.id,
+        userId,
+        reason: 'teenpatti_vacate_unrejoinable',
+        activeSessionExit: true,
+      });
+    } catch (err) {
+      console.warn(`[TP] vacate seat failed session=${state.id} uid=${userId}:`, err.message);
+    }
+
+    const fresh = await getSessionState(state.id);
+    if (!fresh) continue;
+    const humansLeft = (fresh.players || []).some((item) => {
+      const status = String(item.status || '').toLowerCase();
+      if (!['joined', 'disconnected'].includes(status)) return false;
+      if (item.metadata?.table_left === true) return false;
+      if (item.metadata?.is_bot === true) return false;
+      return true;
+    });
+    if (humansLeft) continue;
+    if (!['waiting', 'ready', 'active'].includes(String(fresh.status || '').toLowerCase())) {
+      continue;
+    }
+    const tp = fresh.metadata?.teenpatti || {};
+    await gameSessionModel.updateSessionStatus(fresh.id, 'completed', {
+      endedAt: new Date(),
+      currentTurnUserId: null,
+      metadata: {
+        ...(fresh.metadata || {}),
+        game_family: 'teenpatti',
+        phase: 'completed',
+        teenpatti: {
+          ...tp,
+          phase: 'completed',
+          ended_reason: 'teenpatti_vacate_unrejoinable',
+        },
+      },
+    });
+  }
 }
 
 /**

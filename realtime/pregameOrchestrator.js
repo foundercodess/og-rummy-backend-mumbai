@@ -1575,6 +1575,13 @@ async function startPregame(io, sessionId, options = {}) {
     console.warn(`[PREGAME][${sessionId}] startPregame aborted — session not found`);
     return;
   }
+
+  const { isTeenPattiSession } = require('../services/gameFamily');
+  if (isTeenPattiSession(session)) {
+    const teenPattiPregame = require('./teenpatti/pregame');
+    return teenPattiPregame.startPregame(io, sessionId, options);
+  }
+
   if (session.status !== 'ready') {
     console.log(`[PREGAME][${sessionId}] startPregame aborted — status=${session.status} (expected: ready)`);
     return;

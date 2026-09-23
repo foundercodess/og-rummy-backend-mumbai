@@ -46,6 +46,8 @@ const {
   startLiveCountBroadcaster,
 } = require('./gameLiveCount');
 const { startPregame, cancelPregame } = require('./pregameOrchestrator');
+const { isTeenPattiSession, allowsPendingRejoin } = require('../services/gameFamily');
+const teenPattiSocket = require('./teenpatti/socket');
 const {
   anticlockwiseNextTurnUserId,
   resolveNextDealFirstTurnUserId,
@@ -7387,6 +7389,15 @@ function isUserPresentInSessionRoom(io, sessionId, userId) {
 
 function buildRejoinPendingGamePayload(session, userId, reason = 'connect', options = {}) {
   const { isPresentInSessionRoom = null } = options;
+  if (!allowsPendingRejoin(session)) {
+    return {
+      server_time: new Date().toISOString(),
+      event: 'rejoin_pending_game',
+      reason,
+      has_pending_game: false,
+      session: null,
+    };
+  }
   const player = (session?.players || []).find((item) => Number(item.user_id) === Number(userId)) || null;
   const sessionStatus = String(session?.status || '').toLowerCase();
   const sessionActive = sessionStatus === 'active';
@@ -7530,6 +7541,7 @@ function buildRejoinPendingGamePayload(session, userId, reason = 'connect', opti
       game: session.game ? {
         id: session.game.id,
         name: session.game.name,
+        game_family: session.game.game_family || session.metadata?.game_family || null,
         dashboard_banner: session.game.dashboard_banner,
         side_banner: session.game.side_banner,
         badge: session.game.badge,
@@ -8035,6 +8047,9 @@ function buildTurnSyncPayload(session) {
 }
 
 function syncSocketToSessionPhase(socket, session, reason = 'session_sync') {
+  if (isTeenPattiSession(session)) {
+    return teenPattiSocket.syncSocket(socket, session, reason);
+  }
   if (!socket || !session) {
     return { phase: 'none', event: null, reason };
   }
@@ -8114,6 +8129,31 @@ async function attachSocketToSession(io, socket, session, options = {}) {
   socket.join(sessionRoom(session.id));
   const presence = await setPlayerConnectionState(io, session.id, socket.user.id, true, presenceReason);
   const liveSession = presence.session || session;
+
+  if (isTeenPattiSession(liveSession)) {
+    const self = (liveSession.players || []).find(
+      (player) => Number(player.user_id) === Number(socket.user.id)
+    );
+    const status = String(self?.status || '').toLowerCase();
+    const meta = self?.metadata || {};
+    const blocked = !self
+      || meta.table_left === true
+      || status === 'left'
+      || meta.pending_rejoin_opt_out === true;
+    if (blocked) {
+      leaveSessionRoom(socket, liveSession.id);
+      return { liveSession, presence };
+    }
+    if (presence.playerFound) {
+      teenPattiSocket.syncSocket(socket, liveSession, presenceReason);
+    }
+    if (startPregameIfReady && liveSession.status === 'ready') {
+      startPregame(io, liveSession.id).catch((pregameErr) => {
+        console.error(`[SOCKET] Failed to start Teen Patti pregame for session=${liveSession.id}:`, pregameErr.message);
+      });
+    }
+    return { liveSession, presence };
+  }
 
   if (
     liveSession.status === 'active'
@@ -12497,6 +12537,7 @@ function registerSocketServer(httpServer) {
 
   io.on('connection', (socket) => {
     instrumentSocket(socket);
+    teenPattiSocket.attachTeenPattiSocket(io, socket);
     // Socket.IO Redis adapter includes socket.data in cluster-wide
     // fetchSockets() results. Keep only the non-sensitive user identifier.
     socket.data = socket.data || {};
@@ -12662,7 +12703,11 @@ function registerSocketServer(httpServer) {
         callback({ success: true, session: buildJoinAckSessionPayload(joinAckSession) });
       } catch (err) {
         console.warn(`[SOCKET] uid=${socket.user.id} session:join failed:`, err.message);
-        callback({ success: false, message: err.message });
+        callback({
+          success: false,
+          message: err.message,
+          ...(err.code ? { code: err.code } : {}),
+        });
       }
     });
 
@@ -14205,6 +14250,11 @@ function registerSocketServer(httpServer) {
     socket.on('table:leave', async (payload = {}, callback = () => { }) => {
       try {
         const sourceSession = await requireSourceSessionForTransition(payload, socket.user.id);
+        if (isTeenPattiSession(sourceSession) && ['waiting', 'ready', 'active'].includes(String(sourceSession.status || '').toLowerCase())) {
+          await teenPattiSocket.handleLeave(io, socket, sourceSession);
+          callback({ success: true, server_time: new Date().toISOString() });
+          return;
+        }
         const isActiveSession = sourceSession.status === 'active';
         const isReadySession = String(sourceSession.status || '').toLowerCase() === 'ready';
         const isActiveTwoPlayerExit = isActiveSession
@@ -14361,6 +14411,12 @@ function registerSocketServer(httpServer) {
         const sessionId = Number(payload.session_id);
         if (Number.isNaN(sessionId)) {
           throw new Error('Valid session_id is required');
+        }
+        const poolSession = await gameplayService.getSessionState(sessionId);
+        if (isTeenPattiSession(poolSession)) {
+          const err = new Error('Teen Patti tables cannot be rejoined');
+          err.code = 'TP_NO_REJOIN';
+          throw err;
         }
         if (activePoolSplitBySession.has(sessionId)) {
           throw new Error('Pool rejoin is unavailable while split flow is active');
@@ -15432,13 +15488,20 @@ function registerSocketServer(httpServer) {
           return;
         }
 
-        setPlayerConnectionState(io, sessionId, userId, false, 'socket_disconnect')
-          .then((result) => {
-            if (result?.changed) {
-              emitPendingRejoinGameForUser(io, userId, 'socket_disconnect').catch((rejoinErr) => {
-                console.error(`[SOCKET] Failed to emit pending rejoin after disconnect uid=${userId}:`, rejoinErr.message);
-              });
+        gameplayService.getSessionState(sessionId)
+          .then(async (session) => {
+            if (session && isTeenPattiSession(session)) {
+              await teenPattiSocket.handleDisconnectLeave(io, session, userId);
+              return;
             }
+            return setPlayerConnectionState(io, sessionId, userId, false, 'socket_disconnect')
+              .then((result) => {
+                if (result?.changed) {
+                  emitPendingRejoinGameForUser(io, userId, 'socket_disconnect').catch((rejoinErr) => {
+                    console.error(`[SOCKET] Failed to emit pending rejoin after disconnect uid=${userId}:`, rejoinErr.message);
+                  });
+                }
+              });
           })
           .catch((err) => {
             errorGame(sessionId, `Disconnect presence update failed: ${err.message}`);

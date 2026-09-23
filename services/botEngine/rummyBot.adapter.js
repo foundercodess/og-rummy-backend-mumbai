@@ -8,6 +8,7 @@ class RummyBotAdapter extends BaseBotAdapter {
   supportsSession(session) {
     const gameName = String(session?.game?.name || session?.game_name || '').toLowerCase();
     if (!gameName) return false;
+    if (gameName.includes('teen patti') || gameName.includes('teenpatti')) return false;
 
     // Covers current and future rummy variants (points, pool, deals, spin & go, etc.)
     return ['rummy', 'points', 'pool', 'deal', 'spin', 'practice'].some((token) => gameName.includes(token));

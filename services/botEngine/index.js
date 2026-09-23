@@ -9,6 +9,7 @@ const { startProcessLeader } = require('../processLeader.service');
 const { startPregame } = require('../../realtime/pregameOrchestrator');
 const { isBotInjectionEnabled } = require('../botInjectionSettings.service');
 const RummyBotAdapter = require('./rummyBot.adapter');
+const TeenPattiBotAdapter = require('./teenpattiBot.adapter');
 
 const DEFAULTS = {
   enabled: false,
@@ -196,10 +197,19 @@ async function maybeInjectBotsInSession(io, session, config, adapters) {
       }
     }
 
-    if (injectedCount > 0) {
+      if (injectedCount > 0) {
       console.log(`[BOT][${fresh.id}] Injected ${injectedCount} bot(s)`);
       const updatedSession = await gameplayService.getSessionState(fresh.id);
       io.to(sessionRoom(fresh.id)).emit('session:state', updatedSession);
+      try {
+        const { isTeenPattiSession } = require('../gameFamily');
+        if (isTeenPattiSession(updatedSession)) {
+          const tableService = require('../../realtime/teenpatti/table.service');
+          tableService.emitState(io, updatedSession);
+        }
+      } catch (tpErr) {
+        console.warn(`[BOT][${fresh.id}] Teen Patti state emit skipped: ${tpErr.message}`);
+      }
 
       if (updatedSession?.status === 'ready') {
         startPregame(io, fresh.id).catch((err) => {
@@ -216,7 +226,7 @@ async function maybeInjectBotsInSession(io, session, config, adapters) {
 
 function startBotEngine(io) {
   const config = buildConfig();
-  const adapters = [new RummyBotAdapter()];
+  const adapters = [new RummyBotAdapter(), new TeenPattiBotAdapter()];
 
   let running = false;
 

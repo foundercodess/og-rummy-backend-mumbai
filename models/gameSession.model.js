@@ -187,6 +187,13 @@ async function countConcurrentTablesForUser(userId, options = {}) {
        AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
        AND NOT COALESCE(gs.metadata->'post_result_left_user_ids', '[]'::jsonb)
          @> jsonb_build_array($1::int)
+       AND (
+         COALESCE(gs.metadata->>'game_family', '') <> 'teenpatti'
+         OR (
+           gsp.status = 'joined'
+           AND COALESCE(gsp.metadata->>'connection_status', '') <> 'disconnected'
+         )
+       )
        AND ($2::int IS NULL OR gs.id <> $2::int)`,
     [userId, Number.isFinite(excludeSessionId) ? excludeSessionId : null]
   );
@@ -207,6 +214,13 @@ async function listConcurrentSessionsForUser(userId, options = {}) {
        AND COALESCE((gsp.metadata->>'table_left')::boolean, false) = false
        AND NOT COALESCE(gs.metadata->'post_result_left_user_ids', '[]'::jsonb)
          @> jsonb_build_array($1::int)
+       AND (
+         COALESCE(gs.metadata->>'game_family', '') <> 'teenpatti'
+         OR (
+           gsp.status = 'joined'
+           AND COALESCE(gsp.metadata->>'connection_status', '') <> 'disconnected'
+         )
+       )
      ORDER BY
        gs.updated_at DESC,
        gs.id DESC
@@ -218,6 +232,7 @@ async function listConcurrentSessionsForUser(userId, options = {}) {
 
 const REJOINABLE_SESSION_WHERE = `
        AND gs.updated_at >= (NOW() - make_interval(mins => $2::int))
+       AND COALESCE(gs.metadata->>'game_family', '') <> 'teenpatti'
        AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
        AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
        AND COALESCE((gsp.metadata->>'pending_rejoin_opt_out')::boolean, false) = false
@@ -298,6 +313,7 @@ async function findLatestActiveSessionForUser(userId, options = {}) {
      JOIN game_session_players gsp ON gsp.game_session_id = gs.id
      WHERE gsp.user_id = $1
        AND gs.updated_at >= (NOW() - make_interval(mins => $2::int))
+       AND COALESCE(gs.metadata->>'game_family', '') <> 'teenpatti'
        AND COALESCE((gs.metadata->>'practice_mode')::boolean, false) = false
        AND COALESCE((gs.metadata->>'practice_bot_only')::boolean, false) = false
        AND COALESCE((gsp.metadata->>'pending_rejoin_opt_out')::boolean, false) = false
