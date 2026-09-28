@@ -11,7 +11,7 @@ const {
   legalActions,
 } = require('../../services/teenpatti/teenpattiRules.service');
 const { isTeenPattiSession } = require('../../services/gameFamily');
-const walletModel = require('../../models/wallet.model');
+const tpWallet = require('../../services/teenpatti/wallet.service');
 
 const SUITS = ['H', 'D', 'C', 'S'];
 const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
@@ -348,6 +348,7 @@ function buildPublicState(session, viewerId) {
       }
       : null,
     result: tp.result || null,
+    wallet_balance: viewer?.wallet_balance == null ? null : Number(viewer.wallet_balance),
     toss: phase === 'toss' ? (tp.toss || null) : null,
     players: ((Array.isArray(tp.players) && tp.players.length)
       ? tp.players
@@ -515,20 +516,54 @@ async function dealNewRound(io, sessionId) {
   const boot = bootAmount(session);
   const deck = buildDeck();
   const order = dealOrderFromDealer(seats, dealer.user_id);
-  const firstTurn = order[0] || Number(seats[0].user_id);
-  const tpPlayers = seats.map((player) => ({
-    user_id: Number(player.user_id),
-    cards: [deck.pop(), deck.pop(), deck.pop()],
-    state: 'blind',
-    current_stake: boot,
-    total_invested: boot,
-    blind_count: 0,
-  }));
+  const settleCash = tpWallet.shouldSettle(session);
+  const tpPlayers = [];
+  let pot = 0;
+  for (const player of seats) {
+    const userId = Number(player.user_id);
+    const bot = isBotSeat(session, userId);
+    let invested = boot;
+    let settled = 0;
+    let walletBalance;
+    if (settleCash && !bot) {
+      try {
+        const paid = await tpWallet.debitStake({
+          sessionId,
+          userId,
+          amount: boot,
+          reason: 'teenpatti_boot',
+        });
+        settled = Number(paid.actualDebit || 0);
+        walletBalance = paid.total_balance;
+      } catch (err) {
+        if (err.code !== 'TP_INSUFFICIENT_BALANCE') throw err;
+        invested = 0;
+      }
+    }
+    pot += invested;
+    tpPlayers.push({
+      user_id: userId,
+      cards: [deck.pop(), deck.pop(), deck.pop()],
+      state: invested > 0 ? 'blind' : 'packed',
+      current_stake: invested,
+      total_invested: invested,
+      blind_count: 0,
+      wallet_settled: settled,
+      wallet_balance: walletBalance,
+    });
+  }
+
+  const aliveIds = tpPlayers
+    .filter((player) => player.state !== 'packed')
+    .map((player) => Number(player.user_id));
+  const firstTurn = order.find((id) => aliveIds.includes(Number(id)))
+    || aliveIds[0]
+    || Number(seats[0].user_id);
 
   const tp = {
     phase: 'dealing',
     boot,
-    pot: boot * seats.length,
+    pot,
     pot_limit: potLimit(session),
     last_bet: boot,
     last_better_user_id: Number(dealer.user_id),
@@ -731,6 +766,32 @@ async function finishRound(io, session, winnerUserIds, reason) {
   clearSideShowRevealTimer(session.id);
   tp.side_show_reveal = null;
   delete tp.turn_paused_remaining_ms;
+  if (tpWallet.shouldSettle(session) && !tp.wallet_credited) {
+    const collected = (tp.players || []).reduce(
+      (sum, player) => sum + Number(player.wallet_settled || 0),
+      0
+    );
+    const humanWinners = (winnerUserIds || []).filter((id) => !isBotSeat(session, id));
+    if (collected > 0 && humanWinners.length > 0) {
+      const share = tpWallet.roundCurrency(collected / humanWinners.length);
+      for (const winnerId of humanWinners) {
+        try {
+          const paid = await tpWallet.creditWin({
+            sessionId: session.id,
+            userId: winnerId,
+            amount: share,
+            reason: 'teenpatti_win',
+          });
+          const winner = findTpPlayer(tp, winnerId);
+          if (winner && paid.total_balance != null) winner.wallet_balance = paid.total_balance;
+        } catch (err) {
+          console.error(`[TP][${session.id}] win credit failed uid=${winnerId}: ${err.message}`);
+        }
+      }
+    }
+    tp.wallet_credited = true;
+    session.metadata.teenpatti = tp;
+  }
   await persist(session, { status: 'active' });
   const fresh = await gameplayService.getSessionState(session.id);
   emitState(io, fresh);
@@ -1104,15 +1165,15 @@ async function applyAction(io, sessionId, userId, action = {}) {
       if (tp.pot + stake > tp.pot_limit) {
         throw Object.assign(new Error('Pot limit reached'), { code: 'TP_POT_LIMIT' });
       }
-      // Gate bets by live wallet balance (bots / practice-flagged seats skip).
-      if (!isBotSeat(session, userId) && session?.metadata?.practice_mode !== true) {
-        const wallet = await walletModel.getOrCreateByUserId(userId);
-        const bal = Number(wallet?.total_balance || 0);
-        if (!Number.isFinite(bal) || bal < stake) {
-          throw Object.assign(new Error('Insufficient wallet balance'), {
-            code: 'TP_INSUFFICIENT_BALANCE',
-          });
-        }
+      if (!isBotSeat(session, userId) && tpWallet.shouldSettle(session)) {
+        const paid = await tpWallet.debitStake({
+          sessionId,
+          userId,
+          amount: stake,
+          reason: type === 'blind' ? 'teenpatti_blind' : 'teenpatti_chaal',
+        });
+        player.wallet_settled = Number(player.wallet_settled || 0) + Number(paid.actualDebit || 0);
+        if (paid.total_balance != null) player.wallet_balance = paid.total_balance;
       }
       player.current_stake = stake;
       player.total_invested += stake;
