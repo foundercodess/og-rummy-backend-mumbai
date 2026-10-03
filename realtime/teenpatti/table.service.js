@@ -514,6 +514,7 @@ async function dealNewRound(io, sessionId) {
   }
 
   const boot = bootAmount(session);
+  const roundNo = Number(prev.round_no || 0) + 1;
   const deck = buildDeck();
   const order = dealOrderFromDealer(seats, dealer.user_id);
   const settleCash = tpWallet.shouldSettle(session);
@@ -532,6 +533,7 @@ async function dealNewRound(io, sessionId) {
           userId,
           amount: boot,
           reason: 'teenpatti_boot',
+          roundNo,
         });
         settled = Number(paid.actualDebit || 0);
         walletBalance = paid.total_balance;
@@ -576,7 +578,7 @@ async function dealNewRound(io, sessionId) {
     orbit_acted: [],
     side_show: null,
     side_show_reveal: null,
-    round_no: Number(prev.round_no || 0) + 1,
+    round_no: roundNo,
     deal_order: order,
     toss: null,
     players: tpPlayers,
@@ -781,6 +783,7 @@ async function finishRound(io, session, winnerUserIds, reason) {
             userId: winnerId,
             amount: share,
             reason: 'teenpatti_win',
+            roundNo: tp.round_no,
           });
           const winner = findTpPlayer(tp, winnerId);
           if (winner && paid.total_balance != null) winner.wallet_balance = paid.total_balance;
@@ -1171,6 +1174,7 @@ async function applyAction(io, sessionId, userId, action = {}) {
           userId,
           amount: stake,
           reason: type === 'blind' ? 'teenpatti_blind' : 'teenpatti_chaal',
+          roundNo: tp.round_no,
         });
         player.wallet_settled = Number(player.wallet_settled || 0) + Number(paid.actualDebit || 0);
         if (paid.total_balance != null) player.wallet_balance = paid.total_balance;

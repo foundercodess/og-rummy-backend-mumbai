@@ -51,7 +51,62 @@ function resolveGameModeFromLedgerRow(row = {}) {
     || 'points';
 }
 
+function resolveGameFamilyFromLedgerRow(row = {}) {
+  if (row?.reference_type === 'dt_round') return 'dragontiger';
+  const family = row?.metadata?.game_family || row?.session_metadata?.game_family;
+  return family ? String(family).toLowerCase() : 'rummy';
+}
+
+const TEENPATTI_DEBIT_LABELS = Object.freeze({
+  teenpatti_boot: 'Teen Patti Boot',
+  teenpatti_blind: 'Teen Patti Blind',
+  teenpatti_chaal: 'Teen Patti Chaal',
+});
+
+function groupedBetCount(row = {}) {
+  const count = Number(row?.group_count);
+  return Number.isFinite(count) && count > 0 ? count : 1;
+}
+
+function resolveTeenPattiReason(row = {}) {
+  const txType = String(row?.transaction_type || '');
+  if (txType === 'game_win_credit') return 'Teen Patti Won';
+  if (txType === 'game_entry_debit') {
+    if (groupedBetCount(row) > 1) return 'Teen Patti Bets';
+    return TEENPATTI_DEBIT_LABELS[row?.metadata?.reason] || 'Teen Patti Bet';
+  }
+  return 'Teen Patti';
+}
+
+const DT_AREA_ORDER = ['dragon', 'tiger', 'tie'];
+
+function resolveDragonTigerReason(row = {}) {
+  const txType = String(row?.transaction_type || '');
+  const meta = row?.metadata || {};
+  if (txType === 'game_win_credit') return 'Dragon Tiger Won';
+  if (txType === 'game_entry_debit') {
+    const areas = Array.isArray(row?.group_areas) && row.group_areas.length
+      ? row.group_areas
+      : (meta.area ? [meta.area] : []);
+    const label = groupedBetCount(row) > 1 ? 'Dragon Tiger Bets' : 'Dragon Tiger Bet';
+    const names = DT_AREA_ORDER
+      .filter((area) => areas.includes(area))
+      .map((area) => `${area.charAt(0).toUpperCase()}${area.slice(1)}`);
+    return names.length ? `${label} (${names.join(', ')})` : label;
+  }
+  if (txType === 'game_refund_credit') {
+    if (meta.reason === 'dragontiger_tie_half_back') return 'Dragon Tiger Tie (Half Back)';
+    if (meta.reason === 'dragontiger_clear_bets') return 'Dragon Tiger Bets Cleared';
+    return 'Dragon Tiger Refund';
+  }
+  return 'Dragon Tiger';
+}
+
 function resolveLedgerReason(row = {}) {
+  const family = resolveGameFamilyFromLedgerRow(row);
+  if (family === 'teenpatti') return resolveTeenPattiReason(row);
+  if (family === 'dragontiger') return resolveDragonTigerReason(row);
+
   const txType = String(row?.transaction_type || '');
   const mode = resolveGameModeFromLedgerRow(row);
 
@@ -84,7 +139,7 @@ function buildPublicTransactionId(row = {}) {
 
 function mapWalletTransactionForDetails(row = {}) {
   const txType = String(row?.transaction_type || '');
-  const amount = roundCurrency(row?.amount);
+  const amount = roundCurrency(row?.group_amount ?? row?.amount);
   const isBonusReleaseType = (
     txType === 'bonus_release_credit'
     || txType === 'released_bonus_credit'
@@ -94,6 +149,7 @@ function mapWalletTransactionForDetails(row = {}) {
   const creditTypes = new Set([
     'deposit_credit',
     'game_win_credit',
+    'game_refund_credit',
     'pending_bonus_credit',
     'bonus_release_credit',
     'released_bonus_credit',
@@ -111,6 +167,7 @@ function mapWalletTransactionForDetails(row = {}) {
     txType === 'deposit_credit'
     || txType === 'game_loss_debit'
     || txType === 'game_entry_debit'
+    || txType === 'game_refund_credit'
   ) ? Math.abs(amount) : 0;
 
   const bonusAmount = (

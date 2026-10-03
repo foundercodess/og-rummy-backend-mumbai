@@ -230,14 +230,15 @@ async function listUserWalletTransactions({
 
   const params = [userId];
   let idx = params.length + 1;
-  const where = ['wt.user_id = $1'];
+  const scope = ['wt.user_id = $1'];
+  const where = [];
 
   if (fromDate) {
-    where.push(`wt.created_at >= $${idx++}`);
+    scope.push(`wt.created_at >= $${idx++}`);
     params.push(fromDate);
   }
   if (toDate) {
-    where.push(`wt.created_at <= $${idx++}`);
+    scope.push(`wt.created_at <= $${idx++}`);
     params.push(toDate);
   }
 
@@ -264,22 +265,70 @@ async function listUserWalletTransactions({
 
   params.push(safeLimit, safeOffset);
 
+  // Teen Patti bets collapse per hand (session + round_no) and Dragon Tiger bets
+  // per round; a Dragon Tiger Clear refund nets into its round's bets and fully
+  // cleared rounds are hidden. Filters apply to each group's latest bet row so
+  // pagination counts groups, not raw ledger rows.
   const result = await query(
-    `SELECT
+    `WITH scoped AS (
+       SELECT
+         wt.*,
+         CASE
+           WHEN wt.reference_type = 'dt_round'
+            AND (
+              wt.transaction_type = 'game_entry_debit'
+              OR wt.metadata->>'reason' = 'dragontiger_clear_bets'
+            )
+             THEN 'dt:' || wt.reference_id
+           WHEN wt.transaction_type = 'game_entry_debit' AND wt.metadata->>'game_family' = 'teenpatti'
+             THEN 'tp:' || wt.reference_id || ':' || COALESCE(wt.metadata->>'round_no', '')
+           ELSE 'tx:' || wt.id
+         END AS group_key
+       FROM wallet_transactions wt
+       WHERE ${scope.join(' AND ')}
+     ),
+     grouped AS (
+       SELECT
+         group_key,
+         COALESCE(MAX(id) FILTER (WHERE transaction_type = 'game_entry_debit'), MAX(id)) AS rep_id,
+         COALESCE(MAX(id) FILTER (WHERE transaction_type = 'game_refund_credit'), 0) AS last_clear_id,
+         SUM(amount) AS group_amount
+       FROM scoped
+       GROUP BY group_key
+       HAVING group_key LIKE 'tx:%' OR SUM(amount) <> 0
+     )
+     SELECT
        wt.*,
+       g.group_amount,
+       (
+         SELECT COUNT(*)
+         FROM scoped s
+         WHERE s.group_key = g.group_key
+           AND s.transaction_type = 'game_entry_debit'
+           AND s.id > g.last_clear_id
+       )::int AS group_count,
+       (
+         SELECT ARRAY_AGG(DISTINCT s.metadata->>'area')
+         FROM scoped s
+         WHERE s.group_key = g.group_key
+           AND s.transaction_type = 'game_entry_debit'
+           AND s.id > g.last_clear_id
+           AND s.metadata->>'area' IS NOT NULL
+       ) AS group_areas,
        gs.game_id AS session_game_id,
        gs.contest_id AS session_contest_id,
        gs.metadata AS session_metadata,
-       g.name AS game_name,
+       gm.name AS game_name,
        c.entry AS contest_entry,
        c.point_value AS contest_point_value
-     FROM wallet_transactions wt
+     FROM grouped g
+     JOIN scoped wt ON wt.id = g.rep_id
      LEFT JOIN game_sessions gs
        ON wt.reference_type = 'game_session'
       AND gs.id = wt.reference_id
-     LEFT JOIN games g ON g.id = gs.game_id
+     LEFT JOIN games gm ON gm.id = gs.game_id
      LEFT JOIN contests c ON c.id = gs.contest_id
-     WHERE ${where.join(' AND ')}
+     ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
      ORDER BY wt.created_at DESC, wt.id DESC
      LIMIT $${idx++} OFFSET $${idx}`,
     params

@@ -2,6 +2,7 @@ const express = require('express');
 const adminController = require('../controllers/admin.controller');
 const noticeController = require('../controllers/notice.controller');
 const adminRbacController = require('../controllers/adminRbac.controller');
+const dragonTigerController = require('../controllers/dragonTiger.controller');
 const { requireAdmin, requirePermission, requireAnyPermission } = require('../middleware/auth');
 
 const router = express.Router();
@@ -129,5 +130,11 @@ router.patch('/roles/:roleId', ...P('roles.write'), adminRbacController.updateRo
 router.get('/admins', ...P('admins.read'), adminRbacController.listAdmins);
 router.post('/admins', ...P('admins.write'), adminRbacController.createAdmin);
 router.patch('/admins/:adminId', ...P('admins.write'), adminRbacController.updateAdmin);
+
+// Dragon Tiger: on/off + limits, and round history with per-user bets/payouts
+router.get('/dragon-tiger/settings', ...P('app_settings.read'), dragonTigerController.getSettings);
+router.patch('/dragon-tiger/settings', ...P('app_settings.write'), dragonTigerController.updateSettings);
+router.get('/dragon-tiger/rounds', ...P('games.history.read'), dragonTigerController.listRounds);
+router.get('/dragon-tiger/rounds/:roundId', ...P('games.history.read'), dragonTigerController.getRound);
 
 module.exports = router;

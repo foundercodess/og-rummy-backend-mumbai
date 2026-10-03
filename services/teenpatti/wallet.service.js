@@ -19,7 +19,7 @@ function insufficientError(required, available) {
   return err;
 }
 
-async function debitStake({ sessionId, userId, amount, reason }) {
+async function debitStake({ sessionId, userId, amount, reason, roundNo = null }) {
   const stake = roundCurrency(amount);
   if (!(stake > 0)) {
     return { actualDebit: 0, total_balance: null };
@@ -86,6 +86,7 @@ async function debitStake({ sessionId, userId, amount, reason }) {
           reason: reason || 'teenpatti_stake',
           game_family: 'teenpatti',
           session_id: sessionId,
+          round_no: roundNo,
           stake,
         }),
       ]
@@ -100,7 +101,7 @@ async function debitStake({ sessionId, userId, amount, reason }) {
   }
 }
 
-async function creditWin({ sessionId, userId, amount, reason }) {
+async function creditWin({ sessionId, userId, amount, reason, roundNo = null }) {
   const credit = roundCurrency(amount);
   if (!(credit > 0)) {
     return { total_balance: null, credited: 0 };
@@ -154,6 +155,7 @@ async function creditWin({ sessionId, userId, amount, reason }) {
           reason: reason || 'teenpatti_win',
           game_family: 'teenpatti',
           session_id: sessionId,
+          round_no: roundNo,
           amount: credit,
         }),
       ]

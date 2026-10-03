@@ -11,6 +11,7 @@ const {
 const { pingRedis } = require('./services/redis.service');
 const { pingKafka } = require('./services/kafka.service');
 const { startBotEngine } = require('./services/botEngine');
+const { startDragonTigerEngine } = require('./realtime/dragontiger/engine');
 const { startStaleSessionCleanupCron } = require('./services/staleSessionCleanup.scheduler');
 const { startWithdrawalPayoutSyncCron } = require('./services/withdrawalPayoutSync.scheduler');
 const { startRechargePayinSyncCron } = require('./services/rechargePayinSync.scheduler');
@@ -219,6 +220,11 @@ groupingAsync.ensureStarted();
 startBotInjectionSettingsPoller();
 startCommercialSettingsPoller();
 startBotEngine(io);
+try {
+  startDragonTigerEngine(io);
+} catch (err) {
+  console.error('[DT] failed to start engine:', err.message);
+}
 startStaleSessionCleanupCron();
 startWithdrawalPayoutSyncCron();
 startRechargePayinSyncCron();

@@ -48,6 +48,7 @@ const {
 const { startPregame, cancelPregame } = require('./pregameOrchestrator');
 const { isTeenPattiSession, allowsPendingRejoin } = require('../services/gameFamily');
 const teenPattiSocket = require('./teenpatti/socket');
+const dragonTigerSocket = require('./dragontiger/socket');
 const {
   anticlockwiseNextTurnUserId,
   resolveNextDealFirstTurnUserId,
@@ -12538,6 +12539,11 @@ function registerSocketServer(httpServer) {
   io.on('connection', (socket) => {
     instrumentSocket(socket);
     teenPattiSocket.attachTeenPattiSocket(io, socket);
+    try {
+      dragonTigerSocket.attachDragonTigerSocket(io, socket);
+    } catch (err) {
+      console.error('[SOCKET] Dragon Tiger attach failed:', err.message);
+    }
     // Socket.IO Redis adapter includes socket.data in cluster-wide
     // fetchSockets() results. Keep only the non-sensitive user identifier.
     socket.data = socket.data || {};
