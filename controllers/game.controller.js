@@ -1,4 +1,15 @@
 const gameService = require('../services/game.service');
+const dragonTigerSettings = require('../services/dragontiger/dtSettings.service');
+
+/** Never let Dragon Tiger settings break the games list. */
+async function dragonTigerLobbyInfo() {
+  try {
+    return await dragonTigerSettings.lobbyInfo();
+  } catch (err) {
+    console.error('getGames dragon_tiger error:', err.message);
+    return null;
+  }
+}
 
 async function createContest(req, res) {
   try {
@@ -61,12 +72,16 @@ async function createContest(req, res) {
 
 async function getGames(req, res) {
   try {
-    const games = await gameService.getGames();
+    const [games, dragonTiger] = await Promise.all([
+      gameService.getGames(),
+      dragonTigerLobbyInfo(),
+    ]);
 
     res.json({
       status: true,
       message: "Game and it's type fetched successfully",
       games,
+      dragon_tiger: dragonTiger,
     });
   } catch (err) {
     console.error('getGames error:', err);

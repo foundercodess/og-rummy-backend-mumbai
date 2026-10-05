@@ -34,9 +34,28 @@ async function updateSettings(req, res) {
   }
 }
 
+async function getSummary(req, res) {
+  try {
+    const [summary, settings] = await Promise.all([
+      repo.getAdminSummary(),
+      settingsService.getSettings({ fresh: true }),
+    ]);
+    return res.json({
+      status: true,
+      ...summary,
+      table_enabled: settings.enabled === true,
+      engine_enabled: settingsService.isEngineEnabled(),
+    });
+  } catch (err) {
+    console.error('dragonTiger.getSummary error:', err);
+    return res.status(500).json({ status: false, message: 'Failed to load Dragon Tiger summary' });
+  }
+}
+
 async function listRounds(req, res) {
   try {
-    const data = await repo.listRoundsForAdmin({ page: req.query.page, limit: req.query.limit });
+    const { page, limit, result, status, user, from, to } = req.query;
+    const data = await repo.listRoundsForAdmin({ page, limit, result, status, user, from, to });
     return res.json({ status: true, ...data });
   } catch (err) {
     console.error('dragonTiger.listRounds error:', err);
@@ -62,6 +81,7 @@ async function getRound(req, res) {
 module.exports = {
   getSettings,
   updateSettings,
+  getSummary,
   listRounds,
   getRound,
 };

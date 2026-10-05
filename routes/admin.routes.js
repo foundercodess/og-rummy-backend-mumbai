@@ -3,6 +3,7 @@ const adminController = require('../controllers/admin.controller');
 const noticeController = require('../controllers/notice.controller');
 const adminRbacController = require('../controllers/adminRbac.controller');
 const dragonTigerController = require('../controllers/dragonTiger.controller');
+const teenPattiController = require('../controllers/teenPatti.controller');
 const { requireAdmin, requirePermission, requireAnyPermission } = require('../middleware/auth');
 
 const router = express.Router();
@@ -131,10 +132,16 @@ router.get('/admins', ...P('admins.read'), adminRbacController.listAdmins);
 router.post('/admins', ...P('admins.write'), adminRbacController.createAdmin);
 router.patch('/admins/:adminId', ...P('admins.write'), adminRbacController.updateAdmin);
 
-// Dragon Tiger: on/off + limits, and round history with per-user bets/payouts
+// Dragon Tiger: on/off + limits, summary, and round history with per-user bets/payouts
 router.get('/dragon-tiger/settings', ...P('app_settings.read'), dragonTigerController.getSettings);
 router.patch('/dragon-tiger/settings', ...P('app_settings.write'), dragonTigerController.updateSettings);
+router.get('/dragon-tiger/summary', ...P('games.read'), dragonTigerController.getSummary);
 router.get('/dragon-tiger/rounds', ...P('games.history.read'), dragonTigerController.listRounds);
 router.get('/dragon-tiger/rounds/:roundId', ...P('games.history.read'), dragonTigerController.getRound);
+
+// Teen Patti: overview (boot tables, live counts, stakes) and table history with per-hand ledger
+router.get('/teen-patti/overview', ...P('games.read'), teenPattiController.getOverview);
+router.get('/teen-patti/sessions', ...P('games.history.read'), teenPattiController.listSessions);
+router.get('/teen-patti/sessions/:sessionId', ...P('games.history.read'), teenPattiController.getSession);
 
 module.exports = router;

@@ -92,6 +92,17 @@ function publicSettings(settings) {
   };
 }
 
+/** Dragon Tiger entry for the public games list (it has no `games` row). */
+async function lobbyInfo() {
+  const settings = await getSettings();
+  return {
+    name: 'Dragon Tiger',
+    game_family: 'dragontiger',
+    enabled: isEngineEnabled() && settings.enabled === true,
+    ...publicSettings(settings),
+  };
+}
+
 function invalid(code, message) {
   const err = new Error(message || code);
   err.code = code;
@@ -178,5 +189,6 @@ module.exports = {
   getSettings,
   isPlayable,
   publicSettings,
+  lobbyInfo,
   updateSettings,
 };

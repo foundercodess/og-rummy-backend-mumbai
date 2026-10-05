@@ -187,10 +187,55 @@ async function getWalletBalance(userId) {
   };
 }
 
-async function listRoundsForAdmin({ page = 1, limit = 20 } = {}) {
+const ROUND_STATUSES = ['betting', 'locked', 'settling', 'settled', 'cancelled'];
+
+function validDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function buildRoundFilters({ result, status, user, from, to } = {}) {
+  const where = [];
+  const params = [];
+  if (AREAS.includes(result)) {
+    params.push(result);
+    where.push(`r.result = $${params.length}`);
+  }
+  if (ROUND_STATUSES.includes(status)) {
+    params.push(status);
+    where.push(`r.status = $${params.length}`);
+  }
+  const userKey = String(user || '').trim();
+  if (userKey) {
+    params.push(userKey);
+    where.push(`EXISTS (
+      SELECT 1 FROM dt_bets fb JOIN users fu ON fu.id = fb.user_id
+      WHERE fb.round_id = r.id AND (fu.id::text = $${params.length} OR fu.view_id::text = $${params.length})
+    )`);
+  }
+  const fromDate = validDate(from);
+  if (fromDate) {
+    params.push(fromDate);
+    where.push(`r.created_at >= $${params.length}`);
+  }
+  const toDate = validDate(to);
+  if (toDate) {
+    params.push(toDate);
+    where.push(`r.created_at <= $${params.length}`);
+  }
+  return { whereClause: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
+}
+
+function houseResult(staked, returned, commission) {
+  return roundCurrency(Number(staked || 0) - Number(returned || 0) + Number(commission || 0));
+}
+
+async function listRoundsForAdmin({ page = 1, limit = 20, ...filters } = {}) {
   const safeLimit = Math.min(100, Math.max(1, Number(limit) || 20));
   const safePage = Math.max(1, Number(page) || 1);
   const offset = (safePage - 1) * safeLimit;
+  const { whereClause, params } = buildRoundFilters(filters);
   const [rows, count] = await Promise.all([
     query(
       `SELECT r.id, r.status, r.result, r.dragon_card, r.tiger_card,
@@ -199,11 +244,12 @@ async function listRoundsForAdmin({ page = 1, limit = 20 } = {}) {
               r.created_at, r.locked_at, r.settled_at,
               (SELECT COUNT(DISTINCT b.user_id) FROM dt_bets b WHERE b.round_id = r.id AND b.status <> 'refunded') AS bettors
        FROM dt_rounds r
+       ${whereClause}
        ORDER BY r.id DESC
-       LIMIT $1 OFFSET $2`,
-      [safeLimit, offset]
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, safeLimit, offset]
     ),
-    query('SELECT COUNT(*)::int AS total FROM dt_rounds'),
+    query(`SELECT COUNT(*)::int AS total FROM dt_rounds r ${whereClause}`, params),
   ]);
   return {
     page: safePage,
@@ -213,7 +259,113 @@ async function listRoundsForAdmin({ page = 1, limit = 20 } = {}) {
       ...row,
       id: Number(row.id),
       bettors: Number(row.bettors || 0),
-      house_result: roundCurrency(Number(row.total_staked) - Number(row.total_returned) + Number(row.total_commission)),
+      house_result: houseResult(row.total_staked, row.total_returned, row.total_commission),
+    })),
+  };
+}
+
+async function getPeriodStatsForAdmin(since) {
+  const [rounds, players] = await Promise.all([
+    query(
+      `SELECT COUNT(*)::int AS rounds,
+              COUNT(*) FILTER (WHERE total_staked > 0)::int AS rounds_with_bets,
+              COUNT(*) FILTER (WHERE result = 'dragon')::int AS dragon,
+              COUNT(*) FILTER (WHERE result = 'tiger')::int AS tiger,
+              COUNT(*) FILTER (WHERE result = 'tie')::int AS tie,
+              COALESCE(SUM(total_staked), 0) AS staked,
+              COALESCE(SUM(total_returned), 0) AS returned,
+              COALESCE(SUM(total_commission), 0) AS commission
+       FROM dt_rounds
+       WHERE status = 'settled' AND ($1::timestamptz IS NULL OR settled_at >= $1)`,
+      [since]
+    ),
+    query(
+      `SELECT COUNT(DISTINCT user_id)::int AS players
+       FROM dt_round_settlements
+       WHERE ($1::timestamptz IS NULL OR created_at >= $1)`,
+      [since]
+    ),
+  ]);
+  const row = rounds.rows[0] || {};
+  const staked = roundCurrency(row.staked);
+  const returned = roundCurrency(row.returned);
+  const commission = roundCurrency(row.commission);
+  return {
+    rounds: Number(row.rounds || 0),
+    rounds_with_bets: Number(row.rounds_with_bets || 0),
+    results: { dragon: Number(row.dragon || 0), tiger: Number(row.tiger || 0), tie: Number(row.tie || 0) },
+    players: Number(players.rows[0]?.players || 0),
+    staked,
+    returned,
+    commission,
+    paid_out: roundCurrency(returned - commission),
+    house_result: houseResult(staked, returned, commission),
+  };
+}
+
+/** Admin overview: live round + today / last 7 days / all-time totals (UTC day) + top players. */
+async function getAdminSummary() {
+  const now = new Date();
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const weekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+  const [openRound, today, last7Days, allTime, topPlayers] = await Promise.all([
+    findOpenRound(),
+    getPeriodStatsForAdmin(todayStart),
+    getPeriodStatsForAdmin(weekStart),
+    getPeriodStatsForAdmin(null),
+    query(
+      `SELECT s.user_id, u.name, u.view_id,
+              COUNT(*)::int AS rounds,
+              COALESCE(SUM(s.staked), 0) AS staked,
+              COALESCE(SUM(s.credited), 0) AS credited,
+              COALESCE(SUM(s.commission), 0) AS commission,
+              COALESCE(SUM(s.net), 0) AS net
+       FROM dt_round_settlements s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.created_at >= $1
+       GROUP BY s.user_id, u.name, u.view_id
+       ORDER BY SUM(s.staked) DESC
+       LIMIT 10`,
+      [weekStart]
+    ),
+  ]);
+
+  let liveRound = null;
+  if (openRound) {
+    const bettors = await query(
+      `SELECT COUNT(DISTINCT user_id)::int AS bettors
+       FROM dt_bets WHERE round_id = $1 AND status <> 'refunded'`,
+      [openRound.id]
+    );
+    liveRound = {
+      id: Number(openRound.id),
+      status: openRound.status,
+      betting_ends_at: openRound.betting_ends_at,
+      created_at: openRound.created_at,
+      totals: totalsFromRow(openRound),
+      total_staked: roundCurrency(openRound.total_staked),
+      bettors: Number(bettors.rows[0]?.bettors || 0),
+      result: openRound.result,
+      dragon_card: openRound.dragon_card,
+      tiger_card: openRound.tiger_card,
+    };
+  }
+
+  return {
+    timezone: 'UTC',
+    as_of: now.toISOString(),
+    live_round: liveRound,
+    periods: { today, last_7_days: last7Days, all_time: allTime },
+    top_players: topPlayers.rows.map((row) => ({
+      user_id: Number(row.user_id),
+      name: row.name,
+      view_id: row.view_id,
+      rounds: Number(row.rounds || 0),
+      staked: roundCurrency(row.staked),
+      credited: roundCurrency(row.credited),
+      commission: roundCurrency(row.commission),
+      net: roundCurrency(row.net),
     })),
   };
 }
@@ -241,7 +393,11 @@ async function getRoundDetailForAdmin(roundId) {
     ),
   ]);
   return {
-    round: { ...round, id: Number(round.id) },
+    round: {
+      ...round,
+      id: Number(round.id),
+      house_result: houseResult(round.total_staked, round.total_returned, round.total_commission),
+    },
     bets: bets.rows.map((row) => ({ ...row, id: Number(row.id) })),
     settlements: settlements.rows,
   };
@@ -263,5 +419,6 @@ module.exports = {
   getUserSettlement,
   getWalletBalance,
   listRoundsForAdmin,
+  getAdminSummary,
   getRoundDetailForAdmin,
 };
