@@ -2,6 +2,7 @@
 
 const { query } = require('../../db');
 const { roundCurrency } = require('./dtRules.service');
+const { normalizeDifficulty, isDifficulty, DIFFICULTIES } = require('./dtBias.service');
 
 const CACHE_TTL_MS = Math.max(1000, Number(process.env.DT_SETTINGS_CACHE_MS) || 3000);
 const MAX_COMMISSION_PERCENT = 12;
@@ -17,6 +18,7 @@ const DEFAULTS = Object.freeze({
   max_round_payout: 500000,
   commission_percent: 5,
   updated_at: null,
+  difficulty: 'medium',
 });
 
 let cache = { value: null, loadedAt: 0 };
@@ -30,6 +32,28 @@ function toBool(value, fallback = false) {
 function isEngineEnabled() {
   return toBool(process.env.DRAGONTIGER_ENGINE_ENABLED, false);
 }
+
+// function normalizeRow(row) {
+//   if (!row) return { ...DEFAULTS };
+//   const chips = Array.isArray(row.chip_values)
+//     ? row.chip_values.map(Number).filter((n) => Number.isInteger(n) && n > 0).sort((a, b) => a - b)
+//     : DEFAULTS.chip_values;
+//   return {
+//     enabled: row.enabled !== false,
+//     betting_seconds: Number(row.betting_seconds) || DEFAULTS.betting_seconds,
+//     reveal_seconds: Number(row.reveal_seconds) || DEFAULTS.reveal_seconds,
+//     result_seconds: Number(row.result_seconds) || DEFAULTS.result_seconds,
+//     chip_values: chips.length > 0 ? chips : DEFAULTS.chip_values,
+//     min_bet: roundCurrency(row.min_bet) || DEFAULTS.min_bet,
+//     max_bet_per_area: roundCurrency(row.max_bet_per_area) || DEFAULTS.max_bet_per_area,
+//     max_round_payout: roundCurrency(row.max_round_payout) || DEFAULTS.max_round_payout,
+//     commission_percent: Math.min(
+//       MAX_COMMISSION_PERCENT,
+//       Math.max(0, Number(row.commission_percent ?? DEFAULTS.commission_percent))
+//     ),
+//     updated_at: row.updated_at || null,
+//   };
+// }
 
 function normalizeRow(row) {
   if (!row) return { ...DEFAULTS };
@@ -50,6 +74,7 @@ function normalizeRow(row) {
       Math.max(0, Number(row.commission_percent ?? DEFAULTS.commission_percent))
     ),
     updated_at: row.updated_at || null,
+    difficulty: normalizeDifficulty(row.difficulty),   // ✅ ADD THIS
   };
 }
 
@@ -152,6 +177,41 @@ async function updateSettings(fields = {}, adminId = null) {
     throw invalid('INVALID_BET_LIMITS', 'min_bet cannot exceed max_bet_per_area');
   }
 
+  if (fields.difficulty != null) {
+    if (!isDifficulty(fields.difficulty)) {
+      throw invalid('INVALID_DIFFICULTY', 'difficulty must be min|medium|high');
+    }
+    next.difficulty = normalizeDifficulty(fields.difficulty);
+  }
+
+  // await query(
+  //   `UPDATE dt_settings
+  //    SET enabled = $1,
+  //        betting_seconds = $2,
+  //        reveal_seconds = $3,
+  //        result_seconds = $4,
+  //        chip_values = $5,
+  //        min_bet = $6,
+  //        max_bet_per_area = $7,
+  //        max_round_payout = $8,
+  //        commission_percent = $9,
+  //        updated_by = $10,
+  //        updated_at = NOW()
+  //    WHERE id = 1`,
+  //   [
+  //     next.enabled,
+  //     next.betting_seconds,
+  //     next.reveal_seconds,
+  //     next.result_seconds,
+  //     next.chip_values,
+  //     next.min_bet,
+  //     next.max_bet_per_area,
+  //     next.max_round_payout,
+  //     next.commission_percent,
+  //     adminId,
+  //   ]
+  // );
+
   await query(
     `UPDATE dt_settings
      SET enabled = $1,
@@ -163,7 +223,8 @@ async function updateSettings(fields = {}, adminId = null) {
          max_bet_per_area = $7,
          max_round_payout = $8,
          commission_percent = $9,
-         updated_by = $10,
+         difficulty = $10,
+         updated_by = $11,
          updated_at = NOW()
      WHERE id = 1`,
     [
@@ -176,6 +237,7 @@ async function updateSettings(fields = {}, adminId = null) {
       next.max_bet_per_area,
       next.max_round_payout,
       next.commission_percent,
+      next.difficulty,           // <-- new
       adminId,
     ]
   );
@@ -191,4 +253,7 @@ module.exports = {
   publicSettings,
   lobbyInfo,
   updateSettings,
+  normalizeDifficulty,
+  isDifficulty,
+  DIFFICULTIES,
 };

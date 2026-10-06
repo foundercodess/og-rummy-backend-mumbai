@@ -18,6 +18,7 @@ const { DragonTigerShoe } = require('../../services/dragontiger/dtShoe.service')
 const { buildSeats, rotateSeats } = require('../../services/dragontiger/dtBots.service');
 const { TABLE_ROOM, userRoom } = require('./rooms');
 const { INTERMISSION_MS } = require('./phase');
+const { decideTarget } = require('../../services/dragontiger/dtBias.service');
 
 const PAUSE_POLL_MS = 3000;
 const ERROR_BACKOFF_MS = 2000;
@@ -82,16 +83,67 @@ async function openNewRound(settings) {
   return round;
 }
 
-async function lockRound(round) {
+// async function lockRound(round) {
+//   if (!shoe) shoe = new DragonTigerShoe();
+//   const pair = shoe.drawPair();
+//   const locked = await repo.lockAndReveal(round.id, {
+//     dragonCard: pair.dragon,
+//     tigerCard: pair.tiger,
+//     result: decideOutcome(pair.dragon, pair.tiger),
+//     shoeId: pair.shoe_id,
+//     shoePosition: pair.shoe_position,
+//   });
+//   const revealEndsAt = toMs(locked.locked_at) + Number(locked.reveal_seconds) * 1000;
+//   emitTable('dt:reveal', {
+//     round_id: Number(locked.id),
+//     phase: 'reveal',
+//     dragon_card: locked.dragon_card,
+//     tiger_card: locked.tiger_card,
+//     result: locked.result,
+//     reveal_ends_at: new Date(revealEndsAt).toISOString(),
+//   });
+//   return locked;
+// }
+
+async function lockRound(round, settings) {
   if (!shoe) shoe = new DragonTigerShoe();
-  const pair = shoe.drawPair();
+
+  // THIS round's totals — already maintained by placeBet / clearBets.
+  // const totals = {
+  //   dragon: Number(round.dragon_total) || 0,
+  //   tiger:  Number(round.tiger_total)  || 0,
+  //   tie:    Number(round.tie_total)    || 0,
+  // };
+
+  const fresh = await repo.findRoundById(round.id);
+  const totals = {
+    dragon: Number(fresh?.dragon_total) || 0,
+    tiger:  Number(fresh?.tiger_total)  || 0,
+    tie:    Number(fresh?.tie_total)    || 0,
+  };
+
+  const { targetOutcome, difficulty } = decideTarget({
+    totals,
+    difficulty: settings.difficulty,
+  });
+
+  const pair = shoe.drawPair({ targetOutcome });
+
   const locked = await repo.lockAndReveal(round.id, {
     dragonCard: pair.dragon,
     tigerCard: pair.tiger,
-    result: decideOutcome(pair.dragon, pair.tiger),
+    result: pair.outcome,                 // authoritative — same rules fn as settlement
     shoeId: pair.shoe_id,
     shoePosition: pair.shoe_position,
   });
+
+  // Audit trail — one line per round.
+  console.log(
+    `[DT] round=${round.id} difficulty=${difficulty} ` +
+    `totals=[D:${totals.dragon} T:${totals.tiger} Tie:${totals.tie}] ` +
+    `target=${targetOutcome || 'random'} got=${pair.outcome} biased=${pair.biased}`
+  );
+
   const revealEndsAt = toMs(locked.locked_at) + Number(locked.reveal_seconds) * 1000;
   emitTable('dt:reveal', {
     round_id: Number(locked.id),
@@ -187,7 +239,8 @@ async function runOneRound(token) {
   if (round.status === 'betting') {
     await sleep(toMs(round.betting_ends_at) - Date.now());
     if (token !== runToken) return;
-    round = await lockRound(round);
+    // round = await lockRound(round);
+    round = await lockRound(round, settings);
   }
 
   const revealEndsAt = toMs(round.locked_at) + Number(round.reveal_seconds) * 1000;

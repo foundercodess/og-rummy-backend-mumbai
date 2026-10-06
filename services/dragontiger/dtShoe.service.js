@@ -1,11 +1,12 @@
 'use strict';
 
 const crypto = require('crypto');
-const { RANKS, SUITS } = require('./dtRules.service');
+const { RANKS, SUITS, decideOutcome } = require('./dtRules.service'); 
 
 const DEFAULT_DECKS = 8;
 // Reshuffle once fewer than this many cards remain (the "cut card").
 const DEFAULT_CUT_REMAINING = 60;
+const BIAS_SCAN_WINDOW = 60; 
 
 function buildCards(decks) {
   const cards = [];
@@ -47,14 +48,66 @@ class DragonTigerShoe {
   }
 
   /** Dragon card first, then Tiger card. */
-  drawPair() {
-    if (this.remaining() < Math.max(2, this.cutRemaining)) this.reshuffle();
-    const dragon = this.cards[this.position];
-    const tiger = this.cards[this.position + 1];
-    const position = this.position;
-    this.position += 2;
-    return { dragon, tiger, shoe_id: this.id, shoe_position: position };
-  }
+  // drawPair() {
+  //   if (this.remaining() < Math.max(2, this.cutRemaining)) this.reshuffle();
+  //   const dragon = this.cards[this.position];
+  //   const tiger = this.cards[this.position + 1];
+  //   const position = this.position;
+  //   this.position += 2;
+  //   return { dragon, tiger, shoe_id: this.id, shoe_position: position };
+  // }
+
+
+    /**
+   * @param {object} [opts]
+   * @param {'dragon'|'tiger'|'tie'|null} [opts.targetOutcome] null → pure random
+   */
+    drawPair({ targetOutcome = null } = {}) {
+      if (this.remaining() < Math.max(2, this.cutRemaining)) this.reshuffle();
+  
+      if (!targetOutcome) return this._drawAt(this.position, false);
+  
+      // Scan forward in pair-aligned steps. Each i and i+1 form one candidate pair.
+      const max = Math.min(this.position + BIAS_SCAN_WINDOW, this.cards.length - 2);
+      const matches = [];
+      for (let i = this.position; i <= max; i += 2) {
+        if (decideOutcome(this.cards[i], this.cards[i + 1]) === targetOutcome) {
+          matches.push(i);
+        }
+      }
+  
+      if (matches.length === 0) {
+        // No matching pair in the window → natural draw, no bias applied.
+        return this._drawAt(this.position, false);
+      }
+  
+      const pick = matches[crypto.randomInt(matches.length)];
+      this._swapPair(pick, this.position);
+      return this._drawAt(this.position, true);
+    }
+
+    _drawAt(pos, biased) {
+      const dragon = this.cards[pos];
+      const tiger = this.cards[pos + 1];
+      this.position = pos + 2;
+      return {
+        dragon,
+        tiger,
+        shoe_id: this.id,
+        shoe_position: pos,
+        biased,
+        outcome: decideOutcome(dragon, tiger),
+      };
+    }
+  
+    _swapPair(from, to) {
+      if (from === to) return;
+      for (let k = 0; k < 2; k += 1) {
+        const tmp = this.cards[to + k];
+        this.cards[to + k] = this.cards[from + k];
+        this.cards[from + k] = tmp;
+      }
+    }
 }
 
 module.exports = {
