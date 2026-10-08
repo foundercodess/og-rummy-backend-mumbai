@@ -19,6 +19,8 @@ const DEFAULTS = Object.freeze({
   commission_percent: 5,
   updated_at: null,
   difficulty: 'medium',
+  override_result: null,
+  override_set_at: null,
 });
 
 let cache = { value: null, loadedAt: 0 };
@@ -75,6 +77,10 @@ function normalizeRow(row) {
     ),
     updated_at: row.updated_at || null,
     difficulty: normalizeDifficulty(row.difficulty),   // ✅ ADD THIS
+    override_result: ['dragon', 'tiger', 'tie'].includes(row?.override_result)
+      ? row.override_result
+      : null,
+    override_set_at: row?.override_set_at || null,
   };
 }
 
@@ -183,7 +189,18 @@ async function updateSettings(fields = {}, adminId = null) {
     }
     next.difficulty = normalizeDifficulty(fields.difficulty);
   }
-
+  if (fields.override_result !== undefined) {
+    const val = fields.override_result;
+    if (val === null || val === '' || val === 'none') {
+      next.override_result = null;
+      next.override_set_at = null;
+    } else if (['dragon', 'tiger', 'tie'].includes(String(val).toLowerCase())) {
+      next.override_result = String(val).toLowerCase();
+      next.override_set_at = new Date();
+    } else {
+      throw invalid('INVALID_OVERRIDE_RESULT', 'override_result must be dragon|tiger|tie|null');
+    }
+  }
   // await query(
   //   `UPDATE dt_settings
   //    SET enabled = $1,
@@ -212,6 +229,36 @@ async function updateSettings(fields = {}, adminId = null) {
   //   ]
   // );
 
+  // await query(
+  //   `UPDATE dt_settings
+  //    SET enabled = $1,
+  //        betting_seconds = $2,
+  //        reveal_seconds = $3,
+  //        result_seconds = $4,
+  //        chip_values = $5,
+  //        min_bet = $6,
+  //        max_bet_per_area = $7,
+  //        max_round_payout = $8,
+  //        commission_percent = $9,
+  //        difficulty = $10,
+  //        updated_by = $11,
+  //        updated_at = NOW()
+  //    WHERE id = 1`,
+  //   [
+  //     next.enabled,
+  //     next.betting_seconds,
+  //     next.reveal_seconds,
+  //     next.result_seconds,
+  //     next.chip_values,
+  //     next.min_bet,
+  //     next.max_bet_per_area,
+  //     next.max_round_payout,
+  //     next.commission_percent,
+  //     next.difficulty,           // <-- new
+  //     adminId,
+  //   ]
+  // );
+
   await query(
     `UPDATE dt_settings
      SET enabled = $1,
@@ -224,7 +271,9 @@ async function updateSettings(fields = {}, adminId = null) {
          max_round_payout = $8,
          commission_percent = $9,
          difficulty = $10,
-         updated_by = $11,
+         override_result = $11,
+         override_set_at = $12,
+         updated_by = $13,
          updated_at = NOW()
      WHERE id = 1`,
     [
@@ -237,12 +286,15 @@ async function updateSettings(fields = {}, adminId = null) {
       next.max_bet_per_area,
       next.max_round_payout,
       next.commission_percent,
-      next.difficulty,           // <-- new
+      next.difficulty,
+      next.override_result,     // null | 'dragon' | 'tiger' | 'tie'
+      next.override_set_at,     // timestamp or null
       adminId,
     ]
   );
   return loadSettings();
 }
+
 
 module.exports = {
   DEFAULTS,

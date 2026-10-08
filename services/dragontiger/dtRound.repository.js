@@ -403,6 +403,31 @@ async function getRoundDetailForAdmin(roundId) {
   };
 }
 
+async function clearOverride() {
+  await query(
+    `UPDATE dt_settings
+     SET override_result = NULL,
+         override_set_at = NULL,
+         updated_at = NOW()
+     WHERE id = 1 AND override_result IS NOT NULL`
+  );
+}
+
+async function getRoundTotals(roundId) {
+  const result = await query(
+    `SELECT dragon_total, tiger_total, tie_total
+     FROM dt_rounds WHERE id = $1`,
+    [roundId]
+  );
+  const row = result.rows[0];
+  if (!row) return { dragon: 0, tiger: 0, tie: 0 };
+  return {
+    dragon: Number(row.dragon_total) || 0,
+    tiger:  Number(row.tiger_total)  || 0,
+    tie:    Number(row.tie_total)    || 0,
+  };
+}
+
 module.exports = {
   OPEN_STATUSES,
   totalsFromRow,
@@ -421,4 +446,6 @@ module.exports = {
   listRoundsForAdmin,
   getAdminSummary,
   getRoundDetailForAdmin,
+  clearOverride,
+  getRoundTotals,
 };
