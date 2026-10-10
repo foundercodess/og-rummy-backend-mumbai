@@ -144,4 +144,14 @@ router.get('/teen-patti/overview', ...P('games.read'), teenPattiController.getOv
 router.get('/teen-patti/sessions', ...P('games.history.read'), teenPattiController.listSessions);
 router.get('/teen-patti/sessions/:sessionId', ...P('games.history.read'), teenPattiController.getSession);
 
+// Override queue
+router.get('/dragon-tiger/overrides',
+  ...P('games.read'), dragonTigerController.listOverrides);
+router.get('/dragon-tiger/overrides/upcoming',
+  ...P('games.read'), dragonTigerController.getUpcomingOverrides);
+router.post('/dragon-tiger/overrides',
+  ...P('games.write'), dragonTigerController.createOverride);
+router.delete('/dragon-tiger/overrides/:id', 
+  ...P('games.write'), dragonTigerController.cancelOverride);
+
 module.exports = router;

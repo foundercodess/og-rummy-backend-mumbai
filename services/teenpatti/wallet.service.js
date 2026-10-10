@@ -19,6 +19,16 @@ function insufficientError(required, available) {
   return err;
 }
 
+/** Read-only check used before a deal so nobody is charged for a round that cannot start. */
+async function canAfford(userId, amount) {
+  const stake = roundCurrency(amount);
+  if (!(stake > 0)) return true;
+  if (!pool) return false;
+  const res = await pool.query('SELECT * FROM wallets WHERE user_id = $1', [userId]);
+  if (!res.rows[0]) return false;
+  return computeWalletDebitSplit(res.rows[0], stake).available >= stake;
+}
+
 async function debitStake({ sessionId, userId, amount, reason, roundNo = null }) {
   const stake = roundCurrency(amount);
   if (!(stake > 0)) {
@@ -172,6 +182,7 @@ async function creditWin({ sessionId, userId, amount, reason, roundNo = null }) 
 
 module.exports = {
   shouldSettle,
+  canAfford,
   debitStake,
   creditWin,
   roundCurrency,

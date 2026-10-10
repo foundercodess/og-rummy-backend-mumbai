@@ -13,12 +13,13 @@ const { startProcessLeader } = require('../../services/processLeader.service');
 const settingsService = require('../../services/dragontiger/dtSettings.service');
 const repo = require('../../services/dragontiger/dtRound.repository');
 const { settleUserForRound } = require('../../services/dragontiger/dtWallet.service');
-const { decideOutcome } = require('../../services/dragontiger/dtRules.service');
+const { decideOutcome, periodNo } = require('../../services/dragontiger/dtRules.service');
 const { DragonTigerShoe } = require('../../services/dragontiger/dtShoe.service');
 const { buildSeats, rotateSeats } = require('../../services/dragontiger/dtBots.service');
 const { TABLE_ROOM, userRoom } = require('./rooms');
 const { INTERMISSION_MS } = require('./phase');
 const { decideTarget } = require('../../services/dragontiger/dtBias.service');
+const overrideRepo = require('../../services/dragontiger/dtOverride.repository');
 const PAUSE_POLL_MS = 3000;
 const ERROR_BACKOFF_MS = 2000;
 const SEAT_ROTATE_EVERY_ROUNDS = 6;
@@ -75,6 +76,7 @@ async function openNewRound(settings) {
   if (!round) return null;
   emitTable('dt:round', {
     round_id: Number(round.id),
+    period_no: periodNo(round.id),
     phase: 'betting',
     betting_ends_at: new Date(round.betting_ends_at).toISOString(),
     seats: roundSeats,
@@ -104,16 +106,74 @@ async function openNewRound(settings) {
 //   return locked;
 // }
 
+// async function lockRound(round, settings) {
+//   if (!shoe) shoe = new DragonTigerShoe();
+
+//   // Fresh totals from DB (previous fix).
+//   const totals = await repo.getRoundTotals(round.id);
+
+//   const { targetOutcome, difficulty, source } = decideTarget({
+//     totals,
+//     difficulty: settings.difficulty,
+//     overrideResult: settings.override_result || null,
+//   });
+
+//   const pair = shoe.drawPair({ targetOutcome });
+
+//   const locked = await repo.lockAndReveal(round.id, {
+//     dragonCard: pair.dragon,
+//     tigerCard: pair.tiger,
+//     result: pair.outcome,
+//     shoeId: pair.shoe_id,
+//     shoePosition: pair.shoe_position,
+//   });
+
+//   console.log(
+//     `[DT] round=${round.id} difficulty=${difficulty} ` +
+//     `override=${settings.override_result || 'none'} source=${source} ` +
+//     `totals=[D:${totals.dragon} T:${totals.tiger} Tie:${totals.tie}] ` +
+//     `target=${targetOutcome || 'random'} got=${pair.outcome} biased=${pair.biased}`
+//   );
+
+//   // Clear override AFTER the round is locked so a mid-round crash doesn't
+//   // reapply it to the next round.
+//   if (settings.override_result) {
+//     try {
+//       await repo.clearOverride();
+//       console.log(`[DT] override cleared (${settings.override_result} applied to round=${round.id})`);
+//     } catch (err) {
+//       console.error(`[DT] failed to clear override after round=${round.id}:`, err.message);
+//       // Non-fatal — next round's `getSettings({ fresh: true })` will retry.
+//     }
+//   }
+
+//   const revealEndsAt = toMs(locked.locked_at) + Number(locked.reveal_seconds) * 1000;
+//   emitTable('dt:reveal', {
+//     round_id: Number(locked.id),
+//     period_no: periodNo(locked.id),
+//     phase: 'reveal',
+//     dragon_card: locked.dragon_card,
+//     tiger_card: locked.tiger_card,
+//     result: locked.result,
+//     reveal_ends_at: new Date(revealEndsAt).toISOString(),
+//   });
+//   return locked;
+// }
+
+
 async function lockRound(round, settings) {
   if (!shoe) shoe = new DragonTigerShoe();
 
-  // Fresh totals from DB (previous fix).
   const totals = await repo.getRoundTotals(round.id);
+
+  // Look up a pending override for THIS round id.
+  const override = await overrideRepo.findForRound(round.id);
+  const overrideResult = override ? override.result : null;
 
   const { targetOutcome, difficulty, source } = decideTarget({
     totals,
     difficulty: settings.difficulty,
-    overrideResult: settings.override_result || null,
+    overrideResult,
   });
 
   const pair = shoe.drawPair({ targetOutcome });
@@ -128,26 +188,26 @@ async function lockRound(round, settings) {
 
   console.log(
     `[DT] round=${round.id} difficulty=${difficulty} ` +
-    `override=${settings.override_result || 'none'} source=${source} ` +
+    `override=${overrideResult || 'none'} source=${source} ` +
     `totals=[D:${totals.dragon} T:${totals.tiger} Tie:${totals.tie}] ` +
     `target=${targetOutcome || 'random'} got=${pair.outcome} biased=${pair.biased}`
   );
 
-  // Clear override AFTER the round is locked so a mid-round crash doesn't
-  // reapply it to the next round.
-  if (settings.override_result) {
+  // Mark the override applied AFTER the round is locked, so a crash mid-lock
+  // doesn't consume it prematurely.
+  if (override) {
     try {
-      await repo.clearOverride();
-      console.log(`[DT] override cleared (${settings.override_result} applied to round=${round.id})`);
+      await overrideRepo.markApplied({ overrideId: override.id, appliedRound: round.id });
+      console.log(`[DT] override applied: ${override.result} → round=${round.id}`);
     } catch (err) {
-      console.error(`[DT] failed to clear override after round=${round.id}:`, err.message);
-      // Non-fatal — next round's `getSettings({ fresh: true })` will retry.
+      console.error(`[DT] failed to mark override applied after round=${round.id}:`, err.message);
     }
   }
 
   const revealEndsAt = toMs(locked.locked_at) + Number(locked.reveal_seconds) * 1000;
   emitTable('dt:reveal', {
     round_id: Number(locked.id),
+    period_no: periodNo(locked.id),
     phase: 'reveal',
     dragon_card: locked.dragon_card,
     tiger_card: locked.tiger_card,
@@ -242,6 +302,7 @@ async function announceResult(round, settlements) {
   const resultEndsAt = Date.now() + Number(round.result_seconds) * 1000;
   emitTable('dt:result', {
     round_id: Number(round.id),
+    period_no: periodNo(round.id),
     phase: 'result',
     result: round.result,
     dragon_card: round.dragon_card,

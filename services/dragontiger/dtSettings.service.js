@@ -12,7 +12,7 @@ const DEFAULTS = Object.freeze({
   betting_seconds: 15,
   reveal_seconds: 5,
   result_seconds: 3,
-  chip_values: [10, 50, 100, 500, 1000],
+  chip_values: [10, 50, 100, 500, 1000, 2000, 5000, 10000],
   min_bet: 10,
   max_bet_per_area: 10000,
   max_round_payout: 500000,

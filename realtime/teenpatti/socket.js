@@ -3,12 +3,14 @@
 const gameplayService = require('../../services/gameplay.service');
 const { isTeenPattiSession } = require('../../services/gameFamily');
 const tableService = require('./table.service');
+const { startTeenPattiWatchdog } = require('./watchdog');
 
 function ack(callback, payload) {
   if (typeof callback === 'function') callback(payload);
 }
 
 function attachTeenPattiSocket(io, socket) {
+  startTeenPattiWatchdog(io);
   if (socket.user?.id) socket.join(`tp-user:${socket.user.id}`);
 
   const handleAction = (type) => async (payload = {}, callback = () => {}) => {

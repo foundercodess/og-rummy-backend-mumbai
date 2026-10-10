@@ -428,6 +428,15 @@ async function getRoundTotals(roundId) {
   };
 }
 
+async function getUpcomingRoundIds(count = 10) {
+  const n = Math.min(50, Math.max(1, Number(count) || 10));
+  const res = await query(
+    `SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM dt_rounds`
+  );
+  const next = Number(res.rows[0]?.next_id || 1);
+  return Array.from({ length: n }, (_, i) => next + i);
+}
+
 module.exports = {
   OPEN_STATUSES,
   totalsFromRow,
@@ -448,4 +457,5 @@ module.exports = {
   getRoundDetailForAdmin,
   clearOverride,
   getRoundTotals,
+  getUpcomingRoundIds,
 };

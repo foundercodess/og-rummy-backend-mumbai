@@ -134,6 +134,16 @@ function worstCasePayout(totals) {
   return Math.max(byOutcome.dragon, byOutcome.tiger, byOutcome.tie);
 }
 
+// Must match `dtPeriodNo` in Flutter (dragon_tiger_models.dart) and the admin panel.
+const PERIOD_NO_BASE = 1000000000;
+
+/** 10-digit display id for a round (round id 1234 → "1000001234"). */
+function periodNo(roundId) {
+  const id = Number(roundId);
+  if (!Number.isSafeInteger(id) || id <= 0) return null;
+  return String(PERIOD_NO_BASE + id);
+}
+
 module.exports = {
   AREAS,
   RANKS,
@@ -152,4 +162,5 @@ module.exports = {
   splitCredit,
   payoutByOutcome,
   worstCasePayout,
+  periodNo,
 };

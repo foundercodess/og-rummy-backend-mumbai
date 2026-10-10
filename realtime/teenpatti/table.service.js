@@ -17,8 +17,9 @@ const SUITS = ['H', 'D', 'C', 'S'];
 const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
 const TURN_SECONDS = Math.max(8, Number(process.env.TEENPATTI_TURN_SECONDS) || 15);
 const MAX_BLINDS = Math.max(1, Number(process.env.TEENPATTI_MAX_BLINDS) || 4);
-const TOSS_MS = Math.max(1600, Number(process.env.TEENPATTI_TOSS_MS) || 2000);
+const TOSS_MS = Math.max(1600, Number(process.env.TEENPATTI_TOSS_MS) || 3500);
 const DEAL_MS = Math.max(1600, Number(process.env.TEENPATTI_DEAL_MS) || 2200);
+const RESULT_MS = Math.max(3000, Number(process.env.TEENPATTI_RESULT_MS) || 7500);
 const SIDESHOW_SECONDS = Math.max(5, Number(process.env.TEENPATTI_SIDESHOW_SECONDS) || 8);
 const SIDESHOW_REVEAL_MS = Math.max(5000, Number(process.env.TEENPATTI_SIDESHOW_REVEAL_MS) || 5000);
 const SIDESHOW_BOT_MIN_MS = Math.max(2500, Number(process.env.TEENPATTI_SIDESHOW_BOT_MIN_MS) || 3200);
@@ -30,9 +31,47 @@ const tossTimers = new Map();
 const dealTimers = new Map();
 const sideShowTimers = new Map();
 const sideShowRevealTimers = new Map();
+const nextRoundTimers = new Map();
 
 function sessionRoom(sessionId) {
   return `game-session:${sessionId}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Serialises every state transition of one table (actions, deal, toss, timers,
+ * watchdog) across workers. Waits briefly instead of failing fast so a timer
+ * firing during a player action is not silently dropped.
+ */
+async function withTableLock(sessionId, label, fn, { attempts = 8, waitMs = 200 } = {}) {
+  const lockKey = `lock:tp:action:${sessionId}`;
+  const owner = `tp:${label}:${process.pid}:${Date.now()}:${crypto.randomInt(0, 1e9)}`;
+  for (let i = 0; i < attempts; i += 1) {
+    if (await redisLockService.acquireLock(lockKey, owner, 8)) {
+      try {
+        return await fn();
+      } finally {
+        await redisLockService.releaseLock(lockKey, owner);
+      }
+    }
+    await sleep(waitMs);
+  }
+  const err = new Error('Action in progress');
+  err.code = 'TP_BUSY';
+  throw err;
+}
+
+function runWithBusyRetry(sessionId, label, fn, attempts = 6) {
+  fn().catch((err) => {
+    if (err?.code === 'TP_BUSY' && attempts > 0) {
+      setTimeout(() => runWithBusyRetry(sessionId, label, fn, attempts - 1), 500);
+      return;
+    }
+    console.error(`[TP][${sessionId}] ${label} failed: ${err.message}`);
+  });
 }
 
 function shuffle(list) {
@@ -79,18 +118,24 @@ function seatedPlayers(session) {
   }).sort((a, b) => Number(a.seat_no) - Number(b.seat_no));
 }
 
-function aliveTpPlayers(tp) {
-  return (tp.players || []).filter((p) => p.state !== 'packed' && p.state !== 'show_lost');
+function isAliveTp(player) {
+  return Boolean(player) && player.state !== 'packed' && player.state !== 'show_lost';
 }
 
+function aliveTpPlayers(tp) {
+  return (tp.players || []).filter(isAliveTp);
+}
+
+/** Next alive seat after [fromUserId] in table order, even if that player just packed. */
 function nextAliveUserId(tp, fromUserId) {
-  const alive = aliveTpPlayers(tp);
-  if (alive.length === 0) return null;
-  const ids = alive.map((p) => Number(p.user_id));
-  const from = Number(fromUserId);
-  const start = ids.indexOf(from);
-  if (start < 0) return ids[0];
-  return ids[(start + 1) % ids.length];
+  const players = tp.players || [];
+  if (!players.some(isAliveTp)) return null;
+  const start = players.findIndex((p) => Number(p.user_id) === Number(fromUserId));
+  for (let step = 1; step <= players.length; step += 1) {
+    const candidate = players[((start < 0 ? -1 : start) + step) % players.length];
+    if (isAliveTp(candidate)) return Number(candidate.user_id);
+  }
+  return null;
 }
 
 function previousAlivePlayer(tp, fromUserId) {
@@ -164,10 +209,16 @@ async function completeSession(io, session, reason) {
   clearTossTimer(session.id);
   clearDealTimer(session.id);
   clearSideShowTimer(session.id);
+  clearSideShowRevealTimer(session.id);
+  clearNextRoundTimer(session.id);
   const tp = session.metadata?.teenpatti || {};
   tp.phase = 'completed';
   tp.ended_reason = reason;
   tp.current_turn_user_id = null;
+  tp.turn_ends_at = null;
+  tp.side_show = null;
+  tp.side_show_reveal = null;
+  tp.next_round_at = null;
   session.metadata = {
     ...(session.metadata || {}),
     game_family: 'teenpatti',
@@ -218,6 +269,12 @@ function clearSideShowRevealTimer(sessionId) {
   const handle = sideShowRevealTimers.get(Number(sessionId));
   if (handle) clearTimeout(handle);
   sideShowRevealTimers.delete(Number(sessionId));
+}
+
+function clearNextRoundTimer(sessionId) {
+  const handle = nextRoundTimers.get(Number(sessionId));
+  if (handle) clearTimeout(handle);
+  nextRoundTimers.delete(Number(sessionId));
 }
 
 function normalizeCard(card) {
@@ -348,6 +405,8 @@ function buildPublicState(session, viewerId) {
       }
       : null,
     result: tp.result || null,
+    next_round_at: phase === 'result' ? (tp.next_round_at || null) : null,
+    ended_reason: phase === 'completed' ? (tp.ended_reason || null) : null,
     wallet_balance: viewer?.wallet_balance == null ? null : Number(viewer.wallet_balance),
     toss: phase === 'toss' ? (tp.toss || null) : null,
     players: ((Array.isArray(tp.players) && tp.players.length)
@@ -416,9 +475,20 @@ function emitState(io, session) {
   });
 }
 
-async function startToss(io, sessionId) {
+const TOSS_FROM_PHASES = new Set(['waiting', 'countdown', '']);
+const DEAL_FROM_PHASES = new Set(['waiting', 'countdown', 'toss', 'result', '']);
+
+function startToss(io, sessionId) {
+  return withTableLock(sessionId, 'toss', () => startTossLocked(io, sessionId));
+}
+
+async function startTossLocked(io, sessionId) {
   const session = await gameplayService.getSessionState(sessionId);
   if (!session || !isTeenPattiSession(session)) return null;
+  if (['completed', 'cancelled'].includes(String(session.status || '').toLowerCase())) {
+    return session;
+  }
+  if (!TOSS_FROM_PHASES.has(String(session.metadata?.teenpatti?.phase || ''))) return session;
   const seats = seatedPlayers(session);
   if (seats.length < 2) return session;
 
@@ -458,6 +528,7 @@ async function startToss(io, sessionId) {
     turn_id: null,
     turn_ends_at: null,
     toss,
+    toss_ends_at: new Date(Date.now() + TOSS_MS).toISOString(),
     deal_order: [],
     players: waitingPlayers(session),
     result: null,
@@ -481,31 +552,58 @@ async function startToss(io, sessionId) {
   });
 
   const handle = setTimeout(() => {
-    dealNewRound(io, sessionId).catch((err) => {
-      console.error(`[TP][${sessionId}] deal after toss failed: ${err.message}`);
-    });
+    runWithBusyRetry(sessionId, 'deal after toss', () => dealNewRound(io, sessionId));
   }, TOSS_MS);
   tossTimers.set(Number(sessionId), handle);
   return fresh;
 }
 
-async function dealNewRound(io, sessionId) {
+function dealNewRound(io, sessionId) {
+  return withTableLock(sessionId, 'deal', () => dealNewRoundLocked(io, sessionId));
+}
+
+async function dealNewRoundLocked(io, sessionId) {
   const session = await gameplayService.getSessionState(sessionId);
   if (!session || !isTeenPattiSession(session)) return null;
   if (['completed', 'cancelled'].includes(String(session.status || '').toLowerCase())) {
     return session;
   }
+  // Already dealt by another timer / worker / the watchdog.
+  if (!DEAL_FROM_PHASES.has(String(session.metadata?.teenpatti?.phase || ''))) return session;
   if (humanSeated(session).length === 0) {
     return completeSession(io, session, 'no_human_seated');
   }
   const seats = seatedPlayers(session);
-  if (seats.length < 2) return session;
+  // Leaving the table in "result" with nobody to play against shows an empty felt forever.
+  if (seats.length < 2) {
+    return completeSession(io, session, 'not_enough_players');
+  }
+
+  const settleCash = tpWallet.shouldSettle(session);
+  const boot = bootAmount(session);
+  const canPay = new Map();
+  if (settleCash) {
+    for (const seat of seats) {
+      const userId = Number(seat.user_id);
+      if (isBotSeat(session, userId)) continue;
+      canPay.set(userId, await tpWallet.canAfford(userId, boot));
+    }
+  }
+  const affordableSeats = seats.filter((seat) => {
+    const userId = Number(seat.user_id);
+    return isBotSeat(session, userId) || canPay.get(userId) !== false;
+  });
+  const affordableHumans = affordableSeats.filter((seat) => !isBotSeat(session, seat.user_id));
+  if (affordableSeats.length < 2 || affordableHumans.length === 0) {
+    return completeSession(io, session, 'insufficient_balance');
+  }
 
   clearTossTimer(sessionId);
   clearDealTimer(sessionId);
   clearTurnTimer(sessionId);
   clearSideShowTimer(sessionId);
   clearSideShowRevealTimer(sessionId);
+  clearNextRoundTimer(sessionId);
 
   const prev = session.metadata?.teenpatti || {};
   let dealer = seats.find((seat) => Number(seat.user_id) === Number(prev.dealer_user_id)) || seats[0];
@@ -513,11 +611,9 @@ async function dealNewRound(io, sessionId) {
     dealer = playerAfter(seats, dealer.user_id) || seats[0];
   }
 
-  const boot = bootAmount(session);
   const roundNo = Number(prev.round_no || 0) + 1;
   const deck = buildDeck();
   const order = dealOrderFromDealer(seats, dealer.user_id);
-  const settleCash = tpWallet.shouldSettle(session);
   const tpPlayers = [];
   let pot = 0;
   for (const player of seats) {
@@ -526,7 +622,9 @@ async function dealNewRound(io, sessionId) {
     let invested = boot;
     let settled = 0;
     let walletBalance;
-    if (settleCash && !bot) {
+    if (settleCash && !bot && canPay.get(userId) === false) {
+      invested = 0;
+    } else if (settleCash && !bot) {
       try {
         const paid = await tpWallet.debitStake({
           sessionId,
@@ -564,6 +662,7 @@ async function dealNewRound(io, sessionId) {
 
   const tp = {
     phase: 'dealing',
+    deal_ends_at: new Date(Date.now() + DEAL_MS).toISOString(),
     boot,
     pot,
     pot_limit: potLimit(session),
@@ -593,6 +692,13 @@ async function dealNewRound(io, sessionId) {
     teenpatti: tp,
   };
 
+  // A balance changed between the pre-check and the debit: refund through the
+  // normal settle path instead of betting with a single live seat.
+  if (aliveIds.length < 2) {
+    if (aliveIds.length === 0) return completeSession(io, session, 'insufficient_balance');
+    return finishRound(io, session, aliveIds, 'insufficient_balance');
+  }
+
   await persist(session, {
     status: 'active',
     currentTurnUserId: null,
@@ -612,24 +718,35 @@ async function dealNewRound(io, sessionId) {
   });
 
   const handle = setTimeout(() => {
-    beginBetting(io, sessionId).catch((err) => {
-      console.error(`[TP][${sessionId}] begin betting failed: ${err.message}`);
-    });
+    runWithBusyRetry(sessionId, 'begin betting', () => beginBetting(io, sessionId));
   }, DEAL_MS);
   dealTimers.set(Number(sessionId), handle);
   return fresh;
 }
 
-async function beginBetting(io, sessionId) {
+function beginBetting(io, sessionId) {
+  return withTableLock(sessionId, 'betting', () => beginBettingLocked(io, sessionId));
+}
+
+async function beginBettingLocked(io, sessionId) {
   const session = await gameplayService.getSessionState(sessionId);
   if (!session || !isTeenPattiSession(session)) return null;
   const tp = session.metadata?.teenpatti;
   if (!tp || tp.phase !== 'dealing') return session;
 
-  const firstTurn = Number(tp.pending_first_turn_user_id)
-    || Number((tp.deal_order || [])[0])
-    || Number(tp.players?.[0]?.user_id);
+  // Someone may have left/disconnected during the deal animation.
+  const alive = aliveTpPlayers(tp);
+  if (alive.length < 2) {
+    return finishRound(io, session, alive.map((p) => p.user_id), 'leave');
+  }
+  const aliveIds = new Set(alive.map((p) => Number(p.user_id)));
+  const pending = Number(tp.pending_first_turn_user_id);
+  const firstTurn = aliveIds.has(pending)
+    ? pending
+    : (tp.deal_order || []).map(Number).find((id) => aliveIds.has(id))
+      || Number(alive[0].user_id);
   tp.phase = 'betting';
+  tp.deal_ends_at = null;
   tp.current_turn_user_id = firstTurn;
   tp.round_start_user_id = firstTurn;
   tp.orbit_acted = [];
@@ -653,9 +770,9 @@ function scheduleTurnTimeout(io, sessionId, turnId, userId, durationMs) {
   clearTurnTimer(sessionId);
   const wait = Math.max(800, Number(durationMs) || TURN_SECONDS * 1000);
   const handle = setTimeout(() => {
-    applyAction(io, sessionId, userId, { type: 'pack', reason: 'timeout' }).catch((err) => {
-      console.error(`[TP][${sessionId}] turn timeout pack failed: ${err.message}`);
-    });
+    runWithBusyRetry(sessionId, `turn timeout uid=${userId}`, () => (
+      applyAction(io, sessionId, userId, { type: 'timeout', turn_id: turnId })
+    ));
   }, wait + 400);
   turnTimers.set(Number(sessionId), handle);
 }
@@ -686,23 +803,23 @@ function scheduleBotIfNeeded(io, session, delayMs) {
   const tp = session?.metadata?.teenpatti;
   if (!tp || tp.phase !== 'betting' || tp.side_show || tp.side_show_reveal) return;
   const userId = Number(tp.current_turn_user_id);
+  const turnId = tp.turn_id;
   if (!isBotSeat(session, userId)) return;
   const delay = Math.max(
     1200,
     Number(delayMs) || (1600 + crypto.randomInt(0, 1800)),
   );
-  setTimeout(async () => {
-    try {
+  setTimeout(() => {
+    runWithBusyRetry(session.id, `bot action uid=${userId}`, async () => {
       const latest = await gameplayService.getSessionState(session.id);
       const live = latest?.metadata?.teenpatti;
       if (!live || live.side_show || live.side_show_reveal) return;
       if (Number(live.current_turn_user_id) !== userId) return;
+      if (turnId && live.turn_id !== turnId) return;
       if (live.phase !== 'betting') return;
       const action = await chooseBotAction(latest, userId);
       await applyAction(io, latest.id, userId, action);
-    } catch (err) {
-      console.error(`[TP][${session.id}] bot action failed uid=${userId}: ${err.message}`);
-    }
+    });
   }, delay);
 }
 
@@ -747,7 +864,10 @@ async function finishRound(io, session, winnerUserIds, reason) {
   });
   tp.phase = 'result';
   tp.current_turn_user_id = null;
+  tp.turn_ends_at = null;
+  tp.deal_ends_at = null;
   tp.side_show = null;
+  tp.next_round_at = new Date(Date.now() + RESULT_MS).toISOString();
   tp.result = {
     reason,
     pot: tp.pot,
@@ -802,22 +922,15 @@ async function finishRound(io, session, winnerUserIds, reason) {
     session_id: session.id,
     server_time: new Date().toISOString(),
     result: tp.result,
+    next_round_at: tp.next_round_at,
+    result_ms: RESULT_MS,
   });
-  setTimeout(async () => {
-    try {
-      const latest = await gameplayService.getSessionState(session.id);
-      if (!latest || ['completed', 'cancelled'].includes(String(latest.status || '').toLowerCase())) {
-        return;
-      }
-      if (humanSeated(latest).length === 0) {
-        await completeSession(io, latest, 'no_human_seated');
-        return;
-      }
-      await dealNewRound(io, session.id);
-    } catch (err) {
-      console.error(`[TP][${session.id}] next round failed: ${err.message}`);
-    }
-  }, 5000);
+  clearNextRoundTimer(session.id);
+  const handle = setTimeout(() => {
+    nextRoundTimers.delete(Number(session.id));
+    runWithBusyRetry(session.id, 'next round', () => dealNewRound(io, session.id));
+  }, RESULT_MS);
+  nextRoundTimers.set(Number(session.id), handle);
   return fresh;
 }
 
@@ -865,14 +978,12 @@ async function requestSideShow(io, session, fromUserId, targetUserId) {
 function scheduleSideShowTimeout(io, sessionId, requestId) {
   clearSideShowTimer(sessionId);
   const handle = setTimeout(() => {
-    applyAction(io, sessionId, 0, {
+    runWithBusyRetry(sessionId, 'side show timeout', () => applyAction(io, sessionId, 0, {
       type: 'side_show_reply',
       accept: false,
       timeout: true,
       request_id: requestId,
-    }).catch((err) => {
-      console.error(`[TP][${sessionId}] side show timeout failed: ${err.message}`);
-    });
+    }));
   }, SIDESHOW_SECONDS * 1000 + 250);
   sideShowTimers.set(Number(sessionId), handle);
 }
@@ -997,24 +1108,15 @@ async function resolveSideShow(io, session, userId, accept) {
 function scheduleSideShowReveal(io, sessionId, requestId) {
   clearSideShowRevealTimer(sessionId);
   const handle = setTimeout(() => {
-    finalizeSideShowReveal(io, sessionId, requestId).catch((err) => {
-      console.error(`[TP][${sessionId}] side show reveal finalize failed: ${err.message}`);
-    });
+    runWithBusyRetry(sessionId, 'side show reveal finalize', () => (
+      finalizeSideShowReveal(io, sessionId, requestId)
+    ));
   }, SIDESHOW_REVEAL_MS + 80);
   sideShowRevealTimers.set(Number(sessionId), handle);
 }
 
-async function finalizeSideShowReveal(io, sessionId, requestId) {
-  const lockKey = `lock:tp:action:${sessionId}`;
-  const lockOwner = `tp:reveal:${process.pid}:${Date.now()}`;
-  const acquired = await redisLockService.acquireLock(lockKey, lockOwner, 8);
-  if (!acquired) {
-    setTimeout(() => {
-      finalizeSideShowReveal(io, sessionId, requestId).catch(() => {});
-    }, 400);
-    return null;
-  }
-  try {
+function finalizeSideShowReveal(io, sessionId, requestId) {
+  return withTableLock(sessionId, 'reveal', async () => {
     const session = await gameplayService.getSessionState(sessionId);
     const tp = session?.metadata?.teenpatti;
     if (!session || !tp || !tp.side_show_reveal) return session;
@@ -1053,175 +1155,217 @@ async function finalizeSideShowReveal(io, sessionId, requestId) {
     scheduleTurnTimeout(io, sessionId, tp.turn_id, tp.current_turn_user_id);
     scheduleBotIfNeeded(io, fresh);
     return fresh;
-  } finally {
-    await redisLockService.releaseLock(lockKey, lockOwner);
-  }
+  });
 }
 
-async function applyAction(io, sessionId, userId, action = {}) {
-  const lockKey = `lock:tp:action:${sessionId}`;
-  const lockOwner = `tp:${userId}:${process.pid}:${Date.now()}`;
-  const acquired = await redisLockService.acquireLock(lockKey, lockOwner, 8);
-  if (!acquired) {
-    const err = new Error('Action in progress');
-    err.code = 'TP_BUSY';
+/** After a pack/chaal/timeout: end the round or hand the turn to the next live seat. */
+async function advanceTurn(io, session, actorUserId, endReason) {
+  const tp = session.metadata.teenpatti;
+  const stillAlive = aliveTpPlayers(tp);
+  if (stillAlive.length <= 1) {
+    session.metadata.teenpatti = tp;
+    return finishRound(io, session, stillAlive.map((p) => p.user_id), endReason);
+  }
+
+  tp.current_turn_user_id = nextAliveUserId(tp, actorUserId);
+  tp.turn_id = crypto.randomUUID();
+  tp.turn_ends_at = new Date(Date.now() + TURN_SECONDS * 1000).toISOString();
+  session.metadata.teenpatti = tp;
+  session.metadata.phase = 'betting';
+  await persist(session, { currentTurnUserId: tp.current_turn_user_id });
+  const fresh = await gameplayService.getSessionState(session.id);
+  emitState(io, fresh);
+  scheduleTurnTimeout(io, session.id, tp.turn_id, tp.current_turn_user_id);
+  scheduleBotIfNeeded(io, fresh);
+  return fresh;
+}
+
+function applyAction(io, sessionId, userId, action = {}) {
+  return withTableLock(sessionId, `act:${userId}`, () => applyActionLocked(io, sessionId, userId, action));
+}
+
+async function applyActionLocked(io, sessionId, userId, action) {
+  const session = await gameplayService.getSessionState(sessionId);
+  if (!session || !isTeenPattiSession(session)) {
+    const err = new Error('Teen Patti session not found');
+    err.code = 'SESSION_NOT_FOUND';
+    throw err;
+  }
+  const tp = session.metadata?.teenpatti;
+  const type = String(action.type || '').toLowerCase();
+
+  // Timer / watchdog expiry. Stale turn ids are ignored; a turn stuck on a
+  // seat that is already out (left mid-deal, etc.) is moved on instead of
+  // throwing TP_PACKED and leaving the table frozen.
+  if (type === 'timeout') {
+    if (!tp || tp.phase !== 'betting') return session;
+    if (action.turn_id && tp.turn_id && String(action.turn_id) !== String(tp.turn_id)) return session;
+    if (tp.side_show) return resolveSideShow(io, session, 0, false);
+    if (tp.side_show_reveal) return session;
+    const actorId = Number(tp.current_turn_user_id);
+    const current = findTpPlayer(tp, actorId);
+    if (isAliveTp(current)) {
+      current.state = 'packed';
+      noteOrbitAction(tp, actorId);
+    }
+    return advanceTurn(io, session, actorId, 'pack');
+  }
+
+  if (!tp || tp.phase !== 'betting') {
+    const err = new Error('Betting is not active');
+    err.code = 'TP_NOT_BETTING';
     throw err;
   }
 
-  try {
-    const session = await gameplayService.getSessionState(sessionId);
-    if (!session || !isTeenPattiSession(session)) {
-      const err = new Error('Teen Patti session not found');
-      err.code = 'SESSION_NOT_FOUND';
-      throw err;
+  const isTurnPlayer = Number(tp.current_turn_user_id) === Number(userId);
+  const pendingShow = tp.side_show || null;
+  const pendingExpired = pendingShow && Number.isFinite(Date.parse(pendingShow.expires_at))
+    && Date.parse(pendingShow.expires_at) < Date.now() - 200;
+
+  if (pendingExpired && type !== 'side_show_reply') {
+    return resolveSideShow(io, session, 0, false);
+  }
+
+  if (type === 'side_show_reply') {
+    if (action.request_id && tp.side_show && action.request_id !== tp.side_show.request_id) {
+      return session;
     }
-    const tp = session.metadata?.teenpatti;
-    if (!tp || tp.phase !== 'betting') {
-      const err = new Error('Betting is not active');
-      err.code = 'TP_NOT_BETTING';
-      throw err;
-    }
+    return resolveSideShow(io, session, userId, action.accept === true);
+  }
 
-    const type = String(action.type || '').toLowerCase();
-    const isTurnPlayer = Number(tp.current_turn_user_id) === Number(userId);
-    const pendingShow = tp.side_show || null;
-    const pendingExpired = pendingShow && Number.isFinite(Date.parse(pendingShow.expires_at))
-      && Date.parse(pendingShow.expires_at) < Date.now() - 200;
+  if (tp.side_show_reveal) {
+    throw Object.assign(new Error('Side show reveal in progress'), { code: 'TP_SIDESHOW_PENDING' });
+  }
 
-    if (pendingExpired && type !== 'side_show_reply') {
-      return resolveSideShow(io, session, 0, false);
-    }
+  if (pendingShow && type !== 'see') {
+    throw Object.assign(new Error('Side show pending'), { code: 'TP_SIDESHOW_PENDING' });
+  }
 
-    if (type === 'side_show_reply') {
-      if (action.request_id && tp.side_show && action.request_id !== tp.side_show.request_id) {
-        return session;
-      }
-      return resolveSideShow(io, session, userId, action.accept === true);
-    }
+  if (type !== 'see' && !isTurnPlayer) {
+    const err = new Error('Not your turn');
+    err.code = 'TP_NOT_TURN';
+    throw err;
+  }
 
-    if (tp.side_show_reveal) {
-      throw Object.assign(new Error('Side show reveal in progress'), { code: 'TP_SIDESHOW_PENDING' });
-    }
+  const player = findTpPlayer(tp, userId);
+  if (!player || player.state === 'packed' || player.state === 'show_lost') {
+    const err = new Error('Player is packed');
+    err.code = 'TP_PACKED';
+    throw err;
+  }
 
-    if (pendingShow && type !== 'see') {
-      throw Object.assign(new Error('Side show pending'), { code: 'TP_SIDESHOW_PENDING' });
-    }
+  const opponents = aliveTpPlayers(tp).filter((p) => Number(p.user_id) !== Number(userId));
+  const actions = legalActions({
+    player,
+    opponentsAlive: opponents,
+    lastBet: tp.last_bet,
+    boot: tp.boot,
+    pot: tp.pot,
+    potLimit: tp.pot_limit,
+    isTurn: isTurnPlayer,
+    bettingRound: tp.betting_round || 1,
+    previousOpponent: previousAlivePlayer(tp, userId),
+    sideShowPending: Boolean(tp.side_show),
+  });
 
-    if (type !== 'see' && !isTurnPlayer) {
-      const err = new Error('Not your turn');
-      err.code = 'TP_NOT_TURN';
-      throw err;
-    }
-
-    const player = findTpPlayer(tp, userId);
-    if (!player || player.state === 'packed' || player.state === 'show_lost') {
-      const err = new Error('Player is packed');
-      err.code = 'TP_PACKED';
-      throw err;
-    }
-
-    const opponents = aliveTpPlayers(tp).filter((p) => Number(p.user_id) !== Number(userId));
-    const actions = legalActions({
-      player,
-      opponentsAlive: opponents,
-      lastBet: tp.last_bet,
-      boot: tp.boot,
-      pot: tp.pot,
-      potLimit: tp.pot_limit,
-      isTurn: isTurnPlayer,
-      bettingRound: tp.betting_round || 1,
-      previousOpponent: previousAlivePlayer(tp, userId),
-      sideShowPending: Boolean(tp.side_show),
-    });
-
-    if (type === 'see') {
-      if (!actions.can_see) throw Object.assign(new Error('Cannot see'), { code: 'TP_ILLEGAL' });
-      player.state = 'seen';
-      session.metadata.teenpatti = tp;
-      await persist(session, { currentTurnUserId: tp.current_turn_user_id });
-      const fresh = await gameplayService.getSessionState(sessionId);
-      emitState(io, fresh);
-      if (isTurnPlayer) scheduleBotIfNeeded(io, fresh);
-      return fresh;
-    }
-
-    if (type === 'side_show') {
-      if (!actions.can_side_show) {
-        throw Object.assign(new Error('Cannot request side show'), { code: 'TP_ILLEGAL' });
-      }
-      return requestSideShow(io, session, userId, actions.side_show_target_user_id);
-    }
-
-    if (type === 'pack') {
-      if (!actions.can_pack) throw Object.assign(new Error('Cannot pack'), { code: 'TP_ILLEGAL' });
-      player.state = 'packed';
-      noteOrbitAction(tp, userId);
-    } else if (type === 'chaal' || type === 'blind') {
-      const allowed = type === 'blind' ? actions.can_blind : actions.can_chaal;
-      if (!allowed) throw Object.assign(new Error(`Cannot ${type}`), { code: 'TP_ILLEGAL' });
-      const min = actions.min_chaal;
-      const max = actions.max_chaal;
-      const amount = Number(action.amount);
-      const stake = Number.isFinite(amount) ? amount : min;
-      if (stake < min) throw Object.assign(new Error('Chaal too low'), { code: 'TP_CHAAL_LOW' });
-      if (stake > max) throw Object.assign(new Error('Chaal too high'), { code: 'TP_CHAAL_HIGH' });
-      if (tp.pot + stake > tp.pot_limit) {
-        throw Object.assign(new Error('Pot limit reached'), { code: 'TP_POT_LIMIT' });
-      }
-      if (!isBotSeat(session, userId) && tpWallet.shouldSettle(session)) {
-        const paid = await tpWallet.debitStake({
-          sessionId,
-          userId,
-          amount: stake,
-          reason: type === 'blind' ? 'teenpatti_blind' : 'teenpatti_chaal',
-          roundNo: tp.round_no,
-        });
-        player.wallet_settled = Number(player.wallet_settled || 0) + Number(paid.actualDebit || 0);
-        if (paid.total_balance != null) player.wallet_balance = paid.total_balance;
-      }
-      player.current_stake = stake;
-      player.total_invested += stake;
-      tp.pot += stake;
-      tp.last_bet = player.state === 'seen' ? Math.ceil(stake / 2) : stake;
-      tp.last_better_user_id = Number(userId);
-      if (player.state === 'blind') player.blind_count = (player.blind_count || 0) + 1;
-      if (player.state === 'blind' && player.blind_count >= MAX_BLINDS) {
-        player.state = 'seen';
-      }
-      noteOrbitAction(tp, userId);
-    } else if (type === 'show') {
-      if (!actions.can_show) throw Object.assign(new Error('Show only with 2 players'), { code: 'TP_ILLEGAL' });
-      const other = opponents[0];
-      const cmp = compareHands(player.cards, other.cards);
-      const winnerId = cmp >= 0 ? player.user_id : other.user_id;
-      const loser = cmp >= 0 ? other : player;
-      loser.state = 'show_lost';
-      session.metadata.teenpatti = tp;
-      return finishRound(io, session, [winnerId], 'show');
-    } else {
-      throw Object.assign(new Error('Unknown action'), { code: 'TP_UNKNOWN_ACTION' });
-    }
-
-    const stillAlive = aliveTpPlayers(tp);
-    if (stillAlive.length === 1) {
-      session.metadata.teenpatti = tp;
-      return finishRound(io, session, [stillAlive[0].user_id], type === 'pack' ? 'pack' : 'last_player');
-    }
-
-    tp.current_turn_user_id = nextAliveUserId(tp, userId);
-    tp.turn_id = crypto.randomUUID();
-    tp.turn_ends_at = new Date(Date.now() + TURN_SECONDS * 1000).toISOString();
+  if (type === 'see') {
+    if (!actions.can_see) throw Object.assign(new Error('Cannot see'), { code: 'TP_ILLEGAL' });
+    player.state = 'seen';
     session.metadata.teenpatti = tp;
-    session.metadata.phase = 'betting';
     await persist(session, { currentTurnUserId: tp.current_turn_user_id });
     const fresh = await gameplayService.getSessionState(sessionId);
     emitState(io, fresh);
-    scheduleTurnTimeout(io, sessionId, tp.turn_id, tp.current_turn_user_id);
-    scheduleBotIfNeeded(io, fresh);
+    if (isTurnPlayer) scheduleBotIfNeeded(io, fresh);
     return fresh;
-  } finally {
-    await redisLockService.releaseLock(lockKey, lockOwner);
   }
+
+  if (type === 'side_show') {
+    if (!actions.can_side_show) {
+      throw Object.assign(new Error('Cannot request side show'), { code: 'TP_ILLEGAL' });
+    }
+    return requestSideShow(io, session, userId, actions.side_show_target_user_id);
+  }
+
+  if (type === 'pack') {
+    if (!actions.can_pack) throw Object.assign(new Error('Cannot pack'), { code: 'TP_ILLEGAL' });
+    player.state = 'packed';
+    noteOrbitAction(tp, userId);
+  } else if (type === 'chaal' || type === 'blind') {
+    const allowed = type === 'blind' ? actions.can_blind : actions.can_chaal;
+    if (!allowed) throw Object.assign(new Error(`Cannot ${type}`), { code: 'TP_ILLEGAL' });
+    const min = actions.min_chaal;
+    const max = actions.max_chaal;
+    const amount = Number(action.amount);
+    const stake = Number.isFinite(amount) ? amount : min;
+    if (stake < min) throw Object.assign(new Error('Chaal too low'), { code: 'TP_CHAAL_LOW' });
+    if (stake > max) throw Object.assign(new Error('Chaal too high'), { code: 'TP_CHAAL_HIGH' });
+    if (tp.pot + stake > tp.pot_limit) {
+      throw Object.assign(new Error('Pot limit reached'), { code: 'TP_POT_LIMIT' });
+    }
+    if (!isBotSeat(session, userId) && tpWallet.shouldSettle(session)) {
+      const paid = await tpWallet.debitStake({
+        sessionId,
+        userId,
+        amount: stake,
+        reason: type === 'blind' ? 'teenpatti_blind' : 'teenpatti_chaal',
+        roundNo: tp.round_no,
+      });
+      player.wallet_settled = Number(player.wallet_settled || 0) + Number(paid.actualDebit || 0);
+      if (paid.total_balance != null) player.wallet_balance = paid.total_balance;
+    }
+    player.current_stake = stake;
+    player.total_invested += stake;
+    tp.pot += stake;
+    tp.last_bet = player.state === 'seen' ? Math.ceil(stake / 2) : stake;
+    tp.last_better_user_id = Number(userId);
+    if (player.state === 'blind') player.blind_count = (player.blind_count || 0) + 1;
+    if (player.state === 'blind' && player.blind_count >= MAX_BLINDS) {
+      player.state = 'seen';
+    }
+    noteOrbitAction(tp, userId);
+  } else if (type === 'show') {
+    if (!actions.can_show) throw Object.assign(new Error('Show only with 2 players'), { code: 'TP_ILLEGAL' });
+    const other = opponents[0];
+    const cmp = compareHands(player.cards, other.cards);
+    const winnerId = cmp >= 0 ? player.user_id : other.user_id;
+    const loser = cmp >= 0 ? other : player;
+    loser.state = 'show_lost';
+    session.metadata.teenpatti = tp;
+    return finishRound(io, session, [winnerId], 'show');
+  } else {
+    throw Object.assign(new Error('Unknown action'), { code: 'TP_UNKNOWN_ACTION' });
+  }
+
+  return advanceTurn(io, session, userId, type === 'pack' ? 'pack' : 'last_player');
+}
+
+/** Pack a leaving seat during deal or betting without racing other table writes. */
+function packLeavingSeat(io, sessionId, userId) {
+  return withTableLock(sessionId, `leave:${userId}`, async () => {
+    const session = await gameplayService.getSessionState(sessionId);
+    const tp = session?.metadata?.teenpatti;
+    if (!tp || !['dealing', 'betting'].includes(tp.phase)) return session;
+    const player = findTpPlayer(tp, userId);
+    if (!isAliveTp(player)) return session;
+    player.state = 'packed';
+    session.metadata.teenpatti = tp;
+
+    if (tp.phase === 'betting') {
+      if (Number(tp.current_turn_user_id) === Number(userId)) {
+        noteOrbitAction(tp, userId);
+        return advanceTurn(io, session, userId, 'leave');
+      }
+      const alive = aliveTpPlayers(tp);
+      if (alive.length <= 1) {
+        return finishRound(io, session, alive.map((p) => p.user_id), 'leave');
+      }
+    }
+    // Dealing: beginBetting skips packed seats / ends the round if needed.
+    await persist(session);
+    const fresh = await gameplayService.getSessionState(sessionId);
+    emitState(io, fresh);
+    return fresh;
+  });
 }
 
 async function leaveTable(io, session, userId) {
@@ -1241,21 +1385,7 @@ async function leaveTable(io, session, userId) {
     }
   }
   try {
-    if (tp && tp.phase === 'betting' && Number(tp.current_turn_user_id) === Number(userId)) {
-      await applyAction(io, session.id, userId, { type: 'pack', reason: 'leave' });
-    } else if (tp && tp.phase === 'betting') {
-      const player = findTpPlayer(tp, userId);
-      if (player && player.state !== 'packed') {
-        player.state = 'packed';
-        session.metadata.teenpatti = tp;
-        const alive = aliveTpPlayers(tp);
-        if (alive.length === 1) {
-          await finishRound(io, session, [alive[0].user_id], 'leave');
-        } else {
-          await persist(session);
-        }
-      }
-    }
+    await packLeavingSeat(io, session.id, userId);
   } catch (err) {
     console.warn(`[TP][${session.id}] pack-on-leave failed uid=${userId}: ${err.message}`);
   }
@@ -1287,6 +1417,7 @@ module.exports = {
   startToss,
   dealNewRound,
   beginBetting,
+  finalizeSideShowReveal,
   applyAction,
   leaveTable,
   sessionRoom,

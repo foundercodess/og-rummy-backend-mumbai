@@ -2,7 +2,7 @@
 
 const settingsService = require('../../services/dragontiger/dtSettings.service');
 const repo = require('../../services/dragontiger/dtRound.repository');
-const { emptyTotals } = require('../../services/dragontiger/dtRules.service');
+const { emptyTotals, periodNo } = require('../../services/dragontiger/dtRules.service');
 const { toMs, derivePhase } = require('./phase');
 
 const HISTORY_ON_JOIN = 60;
@@ -34,6 +34,7 @@ async function buildTableState(userId) {
     enabled,
     phase,
     round_id: roundId,
+    period_no: roundId ? periodNo(roundId) : null,
     phase_ends_at: iso(derived.phaseEndsAt),
     betting_ends_at: round ? iso(toMs(round.betting_ends_at)) : null,
     totals: round ? repo.totalsFromRow(round) : emptyTotals(),
